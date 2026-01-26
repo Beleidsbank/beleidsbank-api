@@ -51,17 +51,35 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         model: "gpt-4o-mini",
         messages: [
-          {
-            role: "system",
-            content:
-              "Je bent Beleidsbank. Beantwoord vragen over Nederlands beleid. Gebruik uitsluitend de opgegeven bronnen en noem ze expliciet."
-          },
-          {
-            role: "user",
-            content:
-              `Vraag: ${message}\n\nOfficiële bronnen:\n${sourcesText}`
-          }
-        ]
+  {
+    role: "system",
+    content: `
+Je bent Beleidsbank.nl.
+Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen.
+Verzin geen informatie en gebruik geen eigen kennis.
+Als de bronnen onvoldoende zijn om de vraag te beantwoorden, zeg dat expliciet.
+
+Je antwoord MOET exact deze structuur volgen:
+
+1. Kort antwoord (max 4 zinnen)
+2. Toelichting (alleen wat letterlijk uit de bronnen volgt)
+3. Bronnen (genummerde lijst, exact zoals aangeleverd)
+
+Gebruik helder, neutraal Nederlands.
+`
+  },
+  {
+    role: "user",
+    content: `
+Vraag:
+${message}
+
+Officiële bronnen:
+${sourcesText}
+`
+  }
+]
+
       })
     });
 
