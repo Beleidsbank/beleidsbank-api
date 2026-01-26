@@ -1,5 +1,5 @@
 export default async function handler(req, res) {
-  // CORS
+  // CORS (voor WordPress)
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -7,9 +7,9 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
 
-  const { message } = req.body;
+  const { message, debug } = req.body || {};
 
-  // simpele timeout helper (voorkomt “Bezig met laden…” eindeloos)
+  // timeout helper (voorkomt eindeloos “Bezig met laden…”)
   const fetchWithTimeout = async (url, options = {}, ms = 12000) => {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), ms);
@@ -36,69 +36,70 @@ export default async function handler(req, res) {
     const keywords = cleaned
       .split(" ")
       .filter(w => w.length >= 3 && !stopwords.has(w))
-      .slice(0, 5);
+      .slice(0, 6);
 
     const term = keywords.length ? keywords.join(" ") : cleaned;
 
-    // 2) SRU query voor OEP (Officiële bekendmakingen)
-    // Voorbeeld uit de praktijk gebruikt title=%...% met x-connection=oep :contentReference[oaicite:1]{index=1}
-    const like = `%${term}%`; // SRU wildcard-style via %...%
+    // 2) SRU – Officiële bekendmakingen (OEP)
+    // Voorbeeld: SRU met x-connection=oep werkt op zoek.officielebekendmakingen.nl :contentReference[oaicite:1]{index=1}
     const sruUrl =
       "https://zoek.officielebekendmakingen.nl/sru/Search" +
       "?version=1.2" +
       "&operation=searchRetrieve" +
       "&x-connection=oep" +
       "&recordSchema=dc" +
-      "&maximumRecords=3" +
+      "&maximumRecords=5" +
       "&startRecord=1" +
-      "&query=" + encodeURIComponent(`title=${like}`);
+      "&query=" + encodeURIComponent(`keyword all "${term}"`);
 
-    const sruResponse = await fetchWithTimeout(sruUrl, {}, 12000);
-    const sruText = await sruResponse.text();
+    const sruResp = await fetchWithTimeout(sruUrl, {}, 12000);
+    const sruText = await sruResp.text();
 
-    // 3) Parse DC velden
-    const titles = [...sruText.matchAll(/<dc:title>(.*?)<\/dc:title>/g)].map(m => m[1]).slice(0, 3);
-    const links  = [...sruText.matchAll(/<dc:identifier>(.*?)<\/dc:identifier>/g)].map(m => m[1]).slice(0, 3);
+    // 3) Parse titels/links uit zowel dc:* als dcterms:* (komt per collectie/recordschema voor)
+    const pick = (re) => [...sruText.matchAll(re)].map(m => m[1]);
 
-    // fallback: als title=... niks vindt, probeer keyword all "..."
-    if (titles.length === 0 || links.length === 0) {
-      const fallbackUrl =
-        "https://zoek.officielebekendmakingen.nl/sru/Search" +
-        "?version=1.2" +
-        "&operation=searchRetrieve" +
-        "&x-connection=oep" +
-        "&recordSchema=dc" +
-        "&maximumRecords=3" +
-        "&startRecord=1" +
-        "&query=" + encodeURIComponent(`keyword all "${term}"`);
+    const titles =
+      pick(/<dcterms:title>(.*?)<\/dcterms:title>/g)
+        .concat(pick(/<dc:title>(.*?)<\/dc:title>/g))
+        .slice(0, 5);
 
-      const fbResp = await fetchWithTimeout(fallbackUrl, {}, 12000);
-      const fbText = await fbResp.text();
+    const links =
+      pick(/<dcterms:identifier>(.*?)<\/dcterms:identifier>/g)
+        .concat(pick(/<dc:identifier>(.*?)<\/dc:identifier>/g))
+        .slice(0, 5);
 
-      const fbTitles = [...fbText.matchAll(/<dc:title>(.*?)<\/dc:title>/g)].map(m => m[1]).slice(0, 3);
-      const fbLinks  = [...fbText.matchAll(/<dc:identifier>(.*?)<\/dc:identifier>/g)].map(m => m[1]).slice(0, 3);
-
-      if (fbTitles.length === 0 || fbLinks.length === 0) {
-        return res.status(200).json({
-          answer:
-            "Ik kan dit niet betrouwbaar beantwoorden omdat ik geen officiële bronnen kon ophalen. Probeer een andere term (bijv. ‘passend onderwijs’, ‘zorgplicht’, ‘samenwerkingsverband’).",
-          sources: []
-        });
-      }
-
-      // overschrijf met fallback resultaten
-      titles.splice(0, titles.length, ...fbTitles);
-      links.splice(0, links.length, ...fbLinks);
+    // Debug: laat zien wat SRU terugstuurt (eerste stuk) + de URL die je gebruikt
+    if (debug) {
+      return res.status(200).json({
+        sruUrl,
+        httpStatus: sruResp.status,
+        foundTitles: titles.length,
+        foundLinks: links.length,
+        sample: sruText.slice(0, 1200) // eerste 1200 tekens
+      });
     }
 
-    // 4) Maak bronnenblok voor AI
-    let sourcesText = "";
-    titles.forEach((title, i) => {
-      sourcesText += `Bron ${i + 1}: ${title}\n${links[i] || ""}\n\n`;
-    });
+    if (!titles.length || !links.length) {
+      return res.status(200).json({
+        answer:
+          "Ik kan dit niet betrouwbaar beantwoorden omdat ik geen officiële bronnen kon uitlezen uit de zoekresultaten. (Technisch: SRU gaf wel antwoord, maar ik vond geen titel/links in het record.)",
+        sources: []
+      });
+    }
 
-    // 5) OpenAI (streng, bron-afhankelijk)
-    const aiResponse = await fetchWithTimeout(
+    // 4) Bronnenblok voor AI
+    const sources = titles.map((title, i) => ({
+      title,
+      link: links[i] || ""
+    })).filter(s => s.title && s.link);
+
+    const sourcesText = sources
+      .slice(0, 4)
+      .map((s, i) => `Bron ${i + 1}: ${s.title}\n${s.link}\n`)
+      .join("\n");
+
+    // 5) OpenAI – strikt bronnen-only
+    const aiResp = await fetchWithTimeout(
       "https://api.openai.com/v1/chat/completions",
       {
         method: "POST",
@@ -135,19 +136,11 @@ Structuur:
       20000
     );
 
-    const aiData = await aiResponse.json();
-    const answer =
-      aiData?.choices?.[0]?.message?.content ||
-      "Er ging iets mis bij het genereren van het antwoord.";
+    const aiData = await aiResp.json();
+    const answer = aiData?.choices?.[0]?.message?.content
+      || "Er ging iets mis bij het genereren van het antwoord.";
 
-    // 6) Return naar WP
-    return res.status(200).json({
-      answer,
-      sources: titles.map((title, i) => ({
-        title,
-        link: links[i] || ""
-      }))
-    });
+    return res.status(200).json({ answer, sources: sources.slice(0, 4) });
 
   } catch (e) {
     return res.status(500).json({ error: "Interne fout bij Beleidsbank" });
