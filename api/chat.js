@@ -18,14 +18,35 @@ export default async function handler(req, res) {
     // -------------------------------
     // 1. Zoek officiële publicaties (SRU)
     // -------------------------------
-    const sruUrl =
-      "https://zoekservice.overheid.nl/sru/Search" +
-      "?version=1.2" +
-      "&operation=searchRetrieve" +
-      "&recordSchema=dc" +
-      "&maximumRecords=3" +
-      "&query=" +
-      encodeURIComponent(message);
+   // Maak van de vraag een simpele zoekquery (keywords)
+const cleaned = (message || "")
+  .toLowerCase()
+  .replace(/[^\p{L}\p{N}\s]/gu, " ") // verwijder leestekens
+  .replace(/\s+/g, " ")
+  .trim();
+
+// haal wat stopwoorden weg (simpel, maar effectief)
+const stop = new Set(["wat","wanneer","is","de","het","een","rond","over","in","op","van","en","voor","ik","kan","kun","je","jij","beleid","wet"]);
+const keywords = cleaned
+  .split(" ")
+  .filter(w => w.length >= 3 && !stop.has(w))
+  .slice(0, 6); // max 6 woorden
+
+// als er niks overblijft, gebruik toch de originele tekst
+const searchTerms = keywords.length ? keywords.join(" ") : cleaned;
+
+// SRU CQL query
+const cql = `cql.anywhere all "${searchTerms}"`;
+
+const sruUrl =
+  "https://zoekservice.overheid.nl/sru/Search" +
+  "?version=1.2" +
+  "&operation=searchRetrieve" +
+  "&recordSchema=dc" +
+  "&maximumRecords=3" +
+  "&query=" +
+  encodeURIComponent(cql);
+
 
     const sruResponse = await fetch(sruUrl);
     const sruText = await sruResponse.text();
