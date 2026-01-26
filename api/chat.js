@@ -1,16 +1,68 @@
+// -----------------------------
+// Simple in-memory rate limiter (best effort on serverless)
+// -----------------------------
+const rateStore = new Map();
+/**
+ * limit: max requests per windowMs per IP
+ */
+function rateLimit(ip, limit = 10, windowMs = 60_000) {
+  const now = Date.now();
+  const item = rateStore.get(ip) || { count: 0, resetAt: now + windowMs };
+
+  // reset window
+  if (now > item.resetAt) {
+    item.count = 0;
+    item.resetAt = now + windowMs;
+  }
+
+  item.count += 1;
+  rateStore.set(ip, item);
+
+  const remaining = Math.max(0, limit - item.count);
+  return { ok: item.count <= limit, remaining, resetAt: item.resetAt };
+}
+
 export default async function handler(req, res) {
-  // CORS (voor WordPress)
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  // -----------------------------
+  // CORS: alleen jouw site toestaan
+  // -----------------------------
+  const allowedOrigins = new Set([
+    "https://beleidsbank.nl",
+    "https://www.beleidsbank.nl"
+  ]);
+
+  const origin = req.headers.origin || "";
+  if (allowedOrigins.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-KEY");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
 
-  // API key protectie
-  const clientKey = req.headers["x-api-key"];
-  if (!clientKey || clientKey !== process.env.BELEIDSBANK_API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
+  // Als request niet vanaf jouw site komt, blokkeren (basic anti-abuse)
+  // (Let op: curl/postman heeft geen Origin -> die blokken we ook)
+  if (!allowedOrigins.has(origin)) {
+    return res.status(403).json({ error: "Forbidden (origin not allowed)" });
+  }
+
+  // -----------------------------
+  // Rate limit per IP
+  // -----------------------------
+  const ip =
+    (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
+    req.socket?.remoteAddress ||
+    "unknown";
+
+  const rl = rateLimit(ip, 10, 60_000); // 10 per minuut
+  res.setHeader("X-RateLimit-Limit", "10");
+  res.setHeader("X-RateLimit-Remaining", String(rl.remaining));
+  res.setHeader("X-RateLimit-Reset", String(Math.ceil(rl.resetAt / 1000)));
+
+  if (!rl.ok) {
+    return res.status(429).json({ error: "Too many requests. Try again in a minute." });
   }
 
   const { message } = req.body || {};
@@ -26,7 +78,6 @@ export default async function handler(req, res) {
     }
   };
 
-  // Helpers om XML velden te pakken
   const pickAll = (text, re) => [...text.matchAll(re)].map(m => m[1]);
 
   try {
@@ -90,7 +141,7 @@ export default async function handler(req, res) {
       return { sources: uniq };
     };
 
-    // 2) OEP fallback (officiële bekendmakingen) – als BWB niets vindt
+    // 2) OEP fallback
     const oepSearch = async () => {
       const sruQuery = `keyword all "${term}"`;
 
@@ -145,7 +196,6 @@ export default async function handler(req, res) {
       return { sources };
     };
 
-    // 3) Kies bronnen (BWB eerst)
     let picked = await bwbSearch();
     if (!picked) picked = await oepSearch();
 
@@ -157,7 +207,6 @@ export default async function handler(req, res) {
       });
     }
 
-    // 4) AI antwoord op basis van bronnen
     const sourcesText = picked.sources
       .map((s, i) => `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}\n`)
       .join("\n");
@@ -202,12 +251,7 @@ Structuur:
       aiData?.choices?.[0]?.message?.content ||
       "Er ging iets mis bij het genereren van het antwoord.";
 
-    // 5) Minimal logging (privacy-vriendelijk)
-    const ip =
-      (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
-      req.socket?.remoteAddress ||
-      "unknown";
-
+    // Minimal logging
     console.log(JSON.stringify({
       t: new Date().toISOString(),
       ip,
@@ -215,10 +259,7 @@ Structuur:
       sources: picked.sources.map(s => s.link).slice(0, 4)
     }));
 
-    return res.status(200).json({
-      answer,
-      sources: picked.sources
-    });
+    return res.status(200).json({ answer, sources: picked.sources });
 
   } catch (e) {
     return res.status(500).json({ error: "Interne fout bij Beleidsbank" });
