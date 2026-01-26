@@ -1,5 +1,7 @@
 export default async function handler(req, res) {
-  // CORS
+  // -----------------------------
+  // CORS (nodig voor WordPress)
+  // -----------------------------
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -15,45 +17,48 @@ export default async function handler(req, res) {
   const { message } = req.body;
 
   try {
-    // -------------------------------
-    // 1. Zoek officiële publicaties (SRU)
-    // -------------------------------
-   // Maak van de vraag een simpele zoekquery (keywords)
-const cleaned = (message || "")
-  .toLowerCase()
-  .replace(/[^\p{L}\p{N}\s]/gu, " ") // verwijder leestekens
-  .replace(/\s+/g, " ")
-  .trim();
+    // -----------------------------
+    // 1. Maak simpele zoekwoorden
+    // -----------------------------
+    const cleaned = (message || "")
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
-// haal wat stopwoorden weg (simpel, maar effectief)
-const stop = new Set(["wat","wanneer","is","de","het","een","rond","over","in","op","van","en","voor","ik","kan","kun","je","jij","beleid","wet"]);
-const keywords = cleaned
-  .split(" ")
-  .filter(w => w.length >= 3 && !stop.has(w))
-  .slice(0, 6); // max 6 woorden
+    const stopwords = new Set([
+      "wat","wanneer","is","de","het","een","rond","over","in","op",
+      "van","en","voor","beleid","wet","wordt","zijn","met"
+    ]);
 
-// als er niks overblijft, gebruik toch de originele tekst
-const searchTerms = keywords.length ? keywords.join(" ") : cleaned;
+    const keywords = cleaned
+      .split(" ")
+      .filter(w => w.length >= 3 && !stopwords.has(w))
+      .slice(0, 6);
 
-// SRU CQL query
-const cql = `cql.anywhere all "${searchTerms}"`;
+    const searchTerms = keywords.length ? keywords.join(" ") : cleaned;
 
-const sruUrl =
-  "https://zoekservice.overheid.nl/sru/Search" +
-  "?version=1.2" +
-  "&operation=searchRetrieve" +
-  "&recordSchema=dc" +
-  "&maximumRecords=3" +
-  "&query=" +
-  encodeURIComponent(cql);
+    // -----------------------------
+    // 2. SRU zoekopdracht (OEP)
+    // -----------------------------
+    const sruQuery = `keyword all "${searchTerms}"`;
 
+    const sruUrl =
+      "https://zoekdienst.overheid.nl/sru/Search" +
+      "?version=1.2" +
+      "&operation=searchRetrieve" +
+      "&x-connection=oep" +
+      "&recordSchema=dc" +
+      "&maximumRecords=3" +
+      "&query=" +
+      encodeURIComponent(sruQuery);
 
     const sruResponse = await fetch(sruUrl);
     const sruText = await sruResponse.text();
 
-    // -------------------------------
-    // 2. Haal TITELS en LINKS uit XML
-    // -------------------------------
+    // -----------------------------
+    // 3. Titels en links uit XML
+    // -----------------------------
     const titles = [...sruText.matchAll(/<dc:title>(.*?)<\/dc:title>/g)]
       .map(m => m[1])
       .slice(0, 3);
@@ -62,28 +67,28 @@ const sruUrl =
       .map(m => m[1])
       .slice(0, 3);
 
-    // -------------------------------
-    // 3. STOP als er geen bronnen zijn
-    // -------------------------------
+    // -----------------------------
+    // 4. Stop als er geen bronnen zijn
+    // -----------------------------
     if (titles.length === 0 || links.length === 0) {
       return res.status(200).json({
         answer:
-          "Ik kan deze vraag niet betrouwbaar beantwoorden omdat er geen officiële bronnen zijn gevonden. Probeer een concretere beleidsvraag.",
+          "Ik kan deze vraag niet betrouwbaar beantwoorden omdat er geen officiële bronnen zijn gevonden in de landelijke publicaties. Probeer een concretere beleidsvraag (bijv. met wet- of regelingnaam).",
         sources: []
       });
     }
 
-    // -------------------------------
-    // 4. Bouw bron-tekst voor AI
-    // -------------------------------
+    // -----------------------------
+    // 5. Bouw bron-tekst voor AI
+    // -----------------------------
     let sourcesText = "";
     titles.forEach((title, i) => {
       sourcesText += `Bron ${i + 1}: ${title}\n${links[i]}\n\n`;
     });
 
-    // -------------------------------
-    // 5. AI antwoord (streng)
-    // -------------------------------
+    // -----------------------------
+    // 6. OpenAI (streng, bron-afhankelijk)
+    // -----------------------------
     const aiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -100,8 +105,8 @@ const sruUrl =
             content: `
 Je bent Beleidsbank.nl.
 Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen.
-Verzin geen informatie.
-Als de bronnen onvoldoende zijn, zeg dat expliciet.
+Gebruik geen eigen kennis en verzin niets.
+Als de bronnen onvoldoende zijn, moet je dat expliciet zeggen.
 
 Je antwoord MOET exact deze structuur volgen:
 1. Kort antwoord
@@ -118,11 +123,12 @@ Je antwoord MOET exact deze structuur volgen:
     });
 
     const aiData = await aiResponse.json();
-    const answer = aiData.choices[0].message.content;
+    const answer = aiData.choices?.[0]?.message?.content
+      || "Er ging iets mis bij het genereren van het antwoord.";
 
-    // -------------------------------
-    // 6. Terug naar WordPress
-    // -------------------------------
+    // -----------------------------
+    // 7. Terug naar WordPress
+    // -----------------------------
     res.status(200).json({
       answer,
       sources: titles.map((title, i) => ({
@@ -133,7 +139,7 @@ Je antwoord MOET exact deze structuur volgen:
 
   } catch (error) {
     res.status(500).json({
-      error: "Interne fout bij beleidsbank"
+      error: "Interne fout bij Beleidsbank"
     });
   }
 }
