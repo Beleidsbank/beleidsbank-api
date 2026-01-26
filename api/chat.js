@@ -15,11 +15,14 @@ export default async function handler(req, res) {
   const { message } = req.body;
 
   try {
-    // 1. SRU zoekopdracht
+    // -------------------------------
+    // 1. Zoek officiële publicaties (SRU)
+    // -------------------------------
     const sruUrl =
       "https://zoekservice.overheid.nl/sru/Search" +
       "?version=1.2" +
       "&operation=searchRetrieve" +
+      "&recordSchema=dc" +
       "&maximumRecords=3" +
       "&query=" +
       encodeURIComponent(message);
@@ -27,7 +30,9 @@ export default async function handler(req, res) {
     const sruResponse = await fetch(sruUrl);
     const sruText = await sruResponse.text();
 
-    // 2. Simpel titels + links uit XML halen
+    // -------------------------------
+    // 2. Haal TITELS en LINKS uit XML
+    // -------------------------------
     const titles = [...sruText.matchAll(/<dc:title>(.*?)<\/dc:title>/g)]
       .map(m => m[1])
       .slice(0, 3);
@@ -36,12 +41,28 @@ export default async function handler(req, res) {
       .map(m => m[1])
       .slice(0, 3);
 
+    // -------------------------------
+    // 3. STOP als er geen bronnen zijn
+    // -------------------------------
+    if (titles.length === 0 || links.length === 0) {
+      return res.status(200).json({
+        answer:
+          "Ik kan deze vraag niet betrouwbaar beantwoorden omdat er geen officiële bronnen zijn gevonden. Probeer een concretere beleidsvraag.",
+        sources: []
+      });
+    }
+
+    // -------------------------------
+    // 4. Bouw bron-tekst voor AI
+    // -------------------------------
     let sourcesText = "";
     titles.forEach((title, i) => {
-      sourcesText += `Bron ${i + 1}: ${title}\n${links[i] || ""}\n\n`;
+      sourcesText += `Bron ${i + 1}: ${title}\n${links[i]}\n\n`;
     });
 
-    // 3. AI antwoord laten maken op basis van bronnen
+    // -------------------------------
+    // 5. AI antwoord (streng)
+    // -------------------------------
     const aiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -50,51 +71,48 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
+        temperature: 0.2,
+        max_tokens: 400,
         messages: [
-  {
-    role: "system",
-    content: `
+          {
+            role: "system",
+            content: `
 Je bent Beleidsbank.nl.
 Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen.
-Verzin geen informatie en gebruik geen eigen kennis.
-Als de bronnen onvoldoende zijn om de vraag te beantwoorden, zeg dat expliciet.
+Verzin geen informatie.
+Als de bronnen onvoldoende zijn, zeg dat expliciet.
 
 Je antwoord MOET exact deze structuur volgen:
-
-1. Kort antwoord (max 4 zinnen)
-2. Toelichting (alleen wat letterlijk uit de bronnen volgt)
-3. Bronnen (genummerde lijst, exact zoals aangeleverd)
-
-Gebruik helder, neutraal Nederlands.
+1. Kort antwoord
+2. Toelichting (alleen uit bronnen)
+3. Bronnen (genummerd)
 `
-  },
-  {
-    role: "user",
-    content: `
-Vraag:
-${message}
-
-Officiële bronnen:
-${sourcesText}
-`
-  }
-]
-
+          },
+          {
+            role: "user",
+            content: `Vraag:\n${message}\n\nOfficiële bronnen:\n${sourcesText}`
+          }
+        ]
       })
     });
 
     const aiData = await aiResponse.json();
     const answer = aiData.choices[0].message.content;
 
+    // -------------------------------
+    // 6. Terug naar WordPress
+    // -------------------------------
     res.status(200).json({
       answer,
       sources: titles.map((title, i) => ({
         title,
-        link: links[i] || ""
+        link: links[i]
       }))
     });
 
   } catch (error) {
-    res.status(500).json({ error: "Fout bij ophalen beleid" });
+    res.status(500).json({
+      error: "Interne fout bij beleidsbank"
+    });
   }
 }
