@@ -20,7 +20,7 @@ export default async function handler(req, res) {
       "https://zoekservice.overheid.nl/sru/Search" +
       "?version=1.2" +
       "&operation=searchRetrieve" +
-      "&maximumRecords=5" +
+      "&maximumRecords=3" +
       "&query=" +
       encodeURIComponent(message);
 
@@ -30,11 +30,11 @@ export default async function handler(req, res) {
     // 2. Simpel titels + links uit XML halen
     const titles = [...sruText.matchAll(/<dc:title>(.*?)<\/dc:title>/g)]
       .map(m => m[1])
-      .slice(0, 5);
+      .slice(0, 3);
 
     const links = [...sruText.matchAll(/<dc:identifier>(.*?)<\/dc:identifier>/g)]
       .map(m => m[1])
-      .slice(0, 5);
+      .slice(0, 3);
 
     let sourcesText = "";
     titles.forEach((title, i) => {
