@@ -19,6 +19,11 @@ export default async function handler(req, res) {
     }
   };
 
+const clientKey = req.headers["x-api-key"];
+if (!clientKey || clientKey !== process.env.BELEIDSBANK_API_KEY) {
+  return res.status(401).json({ error: "Unauthorized" });
+}
+  
   // Maak zoekwoorden
   const cleaned = (message || "")
     .toLowerCase()
