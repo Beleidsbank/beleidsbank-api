@@ -64,11 +64,25 @@ export default async function handler(req, res) {
     if (!ids.length) return null;
 
     // Maak wetten.nl links
-    const sources = ids.slice(0, 3).map((id, i) => ({
-      title: titles[i] || `Regeling ${id}`,
-      link: `https://wetten.overheid.nl/${id}`,
-      type: "BWB (wet/regeling)"
-    }));
+    const uniq = [];
+const seen = new Set();
+
+for (let i = 0; i < ids.length; i++) {
+  const id = ids[i];
+  if (seen.has(id)) continue;
+  seen.add(id);
+
+  uniq.push({
+    title: titles[i] || `Regeling ${id}`,
+    link: `https://wetten.overheid.nl/${id}`,
+    type: "BWB (wet/regeling)"
+  });
+
+  if (uniq.length >= 3) break;
+}
+
+const sources = uniq;
+
 
     return { sources };
   };
