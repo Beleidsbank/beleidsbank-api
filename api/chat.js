@@ -47,9 +47,9 @@ export default async function handler(req, res) {
       "&operation=searchRetrieve" +
       "&x-connection=oep" +
       "&recordSchema=dc" +
-      "&maximumRecords=10" +
+      "&maximumRecords=25" +
       "&startRecord=1" +
-      "&query=" + encodeURIComponent(`keyword all "${term}"`);
+      "&query=" + encodeURIComponent(`(keyword all "${term}") and (dcterms.type = Staatscourant or dcterms.type = Staatsblad)`);
 
     const sruResp = await fetchWithTimeout(sruUrl, {}, 12000);
     const sruText = await sruResp.text();
