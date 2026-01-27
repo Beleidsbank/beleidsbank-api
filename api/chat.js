@@ -42,8 +42,7 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
 
-  // Als request niet vanaf jouw site komt, blokkeren (basic anti-abuse)
-  // (Let op: curl/postman heeft geen Origin -> die blokken we ook)
+  // Als request niet vanaf jouw site komt, blokkeren
   if (!allowedOrigins.has(origin)) {
     return res.status(403).json({ error: "Forbidden (origin not allowed)" });
   }
@@ -66,6 +65,11 @@ export default async function handler(req, res) {
   }
 
   const { message } = req.body || {};
+  const q = (message || "").toString().trim();
+
+  if (!q) {
+    return res.status(400).json({ error: "Missing 'message'." });
+  }
 
   // timeout helper
   const fetchWithTimeout = async (url, options = {}, ms = 12000) => {
@@ -82,7 +86,7 @@ export default async function handler(req, res) {
 
   try {
     // Maak zoekwoorden
-    const cleaned = (message || "")
+    const cleaned = q
       .toLowerCase()
       .replace(/[^\p{L}\p{N}\s]/gu, " ")
       .replace(/\s+/g, " ")
@@ -211,6 +215,17 @@ export default async function handler(req, res) {
       .map((s, i) => `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}\n`)
       .join("\n");
 
+    // -----------------------------
+    // OpenAI call (met harde error handling)
+    // -----------------------------
+    if (!process.env.OPENAI_API_KEY) {
+      console.log("CONFIG_ERROR: OPENAI_API_KEY missing");
+      return res.status(500).json({
+        error: "Server configuratie: OPENAI_API_KEY ontbreekt.",
+        sources: picked.sources
+      });
+    }
+
     const aiResp = await fetchWithTimeout(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -239,29 +254,51 @@ Structuur:
 3) Bronnen (genummerd, met link)
 `
             },
-            { role: "user", content: `Vraag:\n${message}\n\nOfficiële bronnen:\n${sourcesText}` }
+            { role: "user", content: `Vraag:\n${q}\n\nOfficiële bronnen:\n${sourcesText}` }
           ]
         })
       },
       20000
     );
 
-    const aiData = await aiResp.json();
-    const answer =
-      aiData?.choices?.[0]?.message?.content ||
-      "Er ging iets mis bij het genereren van het antwoord.";
+    const aiRaw = await aiResp.text();
+    let aiData = {};
+    try { aiData = JSON.parse(aiRaw); } catch(e) {}
+
+    if (!aiResp.ok) {
+      const msg = aiData?.error?.message || aiRaw || "Unknown OpenAI error";
+      console.log("OPENAI_ERROR", { status: aiResp.status, message: msg });
+
+      // Geef nette fout terug, maar mét bronnen
+      return res.status(502).json({
+        error: `AI provider error (${aiResp.status}).`,
+        details: msg,
+        sources: picked.sources
+      });
+    }
+
+    const answer = aiData?.choices?.[0]?.message?.content?.trim();
+
+    if (!answer) {
+      console.log("OPENAI_EMPTY_RESPONSE", { body: aiData });
+      return res.status(502).json({
+        error: "AI gaf geen bruikbaar antwoord terug.",
+        sources: picked.sources
+      });
+    }
 
     // Minimal logging
     console.log(JSON.stringify({
       t: new Date().toISOString(),
       ip,
-      q_len: (message || "").length,
+      q_len: q.length,
       sources: picked.sources.map(s => s.link).slice(0, 4)
     }));
 
     return res.status(200).json({ answer, sources: picked.sources });
 
   } catch (e) {
+    console.log("SERVER_ERROR", String(e?.message || e));
     return res.status(500).json({ error: "Interne fout bij Beleidsbank" });
   }
 }
