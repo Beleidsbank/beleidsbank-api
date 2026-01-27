@@ -64,7 +64,7 @@ export default async function handler(req, res) {
     return res.status(429).json({ error: "Too many requests. Try again in a minute." });
   }
 
-  const { message } = req.body || {};
+  const { message, municipality } = req.body || {};
   const q = (message || "").toString().trim();
 
   if (!q) {
@@ -166,7 +166,7 @@ export default async function handler(req, res) {
       const idsAll = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
       const typesAll = pickAll(xml, /<dcterms:type[^>]*scheme="overheidop:([^"]+)"[^>]*>.*?<\/dcterms:type>/g);
 
-      const blockedTypes = new Set(["Gemeenteblad", "Provinciaalblad", "Waterschapsblad"]);
+      const blockedTypes = new Set(["Provinciaalblad", "Waterschapsblad"]);
 
       const records = [];
       const n = Math.min(titlesAll.length, idsAll.length);
@@ -180,6 +180,13 @@ export default async function handler(req, res) {
         const hit = keywords.some(k => titleLc.includes(k));
         const score = hit ? 1 : 0;
 
+if (municipality) {
+  const m = municipality.toLowerCase();
+  const idLc = (id || "").toLowerCase();
+  if (!idLc.includes(m)) continue;
+}
+
+        
         records.push({
           title,
           link: `https://zoek.officielebekendmakingen.nl/${id}.html`,
@@ -295,7 +302,11 @@ Structuur:
       sources: picked.sources.map(s => s.link).slice(0, 4)
     }));
 
-    return res.status(200).json({ answer, sources: picked.sources });
+    return res.status(200).json({
+  answer: (municipality ? `Scope: Gemeente ${municipality}\n\n` : "Scope: Landelijk\n\n") + answer,
+  sources: picked.sources
+});
+
 
   } catch (e) {
     console.log("SERVER_ERROR", String(e?.message || e));
