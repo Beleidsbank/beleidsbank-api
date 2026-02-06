@@ -15,8 +15,7 @@ function rateLimit(ip, limit = 10, windowMs = 60_000) {
 export default async function handler(req, res) {
   // CORS: alleen jouw site toestaan
   const allowedOrigins = new Set([
-    "https://beleidsbank.nl",
-    "https://www.beleidsbank.nl"
+    "https://app.beleidsbank.nl"
   ]);
 
   const origin = req.headers.origin || "";
