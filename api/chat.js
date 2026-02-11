@@ -103,7 +103,7 @@ export default async function handler(req, res) {
 
     const term = keywords.length ? keywords.join(" ") : cleaned;
 
-    // 1) BWB (wetten) – eerst proberen
+    // 1) BWB (wetten) – landelijke wetgeving
     const bwbSearch = async () => {
       const bwbQuery = `overheidbwb.titel any "${term}"`;
 
@@ -144,9 +144,66 @@ export default async function handler(req, res) {
       return { sources: uniq };
     };
 
-    // 2) OEP fallback
+    // 2) CVDR (decentrale regelgeving: APV/verordeningen/beleidsregels, etc.)
+    //    Alleen zinvol als er een municipality is meegegeven.
+    const cvdrSearch = async () => {
+      if (!municipality) return null;
+
+      // Let op: CVDR is via zoekservice.overheid.nl met x-connection=CVDR
+      // We zoeken op term + creator (gemeente).
+      const cvdrQuery = `(keyword all "${term}") AND (dcterms.creator all "${municipality}")`;
+
+      const cvdrUrl =
+        "https://zoekservice.overheid.nl/sru/Search" +
+        "?version=1.2" +
+        "&operation=searchRetrieve" +
+        "&x-connection=CVDR" +
+        "&maximumRecords=8" +
+        "&startRecord=1" +
+        "&query=" + encodeURIComponent(cvdrQuery);
+
+      const resp = await fetchWithTimeout(cvdrUrl, {}, 12000);
+      const xml = await resp.text();
+
+      // CVDR records gebruiken doorgaans dcterms:title + dcterms:identifier
+      const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
+      const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
+
+      if (!ids.length) return null;
+
+      const sources = [];
+      const seen = new Set();
+
+      for (let i = 0; i < ids.length; i++) {
+        const id = (ids[i] || "").trim();
+        if (!id) continue;
+        if (seen.has(id)) continue;
+        seen.add(id);
+
+        sources.push({
+          title: titles[i] || `Regeling ${id}`,
+          link: `https://lokaleregelgeving.overheid.nl/${id}`,
+          type: "CVDR (gemeentelijke regeling)"
+        });
+
+        if (sources.length >= 3) break;
+      }
+
+      if (!sources.length) return null;
+      return { sources };
+    };
+
+    // 3) OEP (officiële bekendmakingen) – voor besluiten/kennisgevingen etc.
     const oepSearch = async () => {
-      const sruQuery = `keyword all "${term}"`;
+      let sruQuery = `keyword all "${term}"`;
+
+      // Als municipality is meegegeven, proberen we gericht Gemeenteblad + creator te pakken.
+      // (De precieze veldnamen/filters kunnen per recordSchema verschillen; dit is een goede V1-start.)
+      if (municipality) {
+        sruQuery += ` AND (dcterms.creator all "${municipality}")`;
+        // probeer Gemeenteblad te forceren (werkt in veel OEP SRU queries)
+        sruQuery += ` AND (overheid.publicatieNaam="Gemeenteblad")`;
+      }
 
       const oepUrl =
         "https://zoek.officielebekendmakingen.nl/sru/Search" +
@@ -165,6 +222,8 @@ export default async function handler(req, res) {
       const idsAll = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
       const typesAll = pickAll(xml, /<dcterms:type[^>]*scheme="overheidop:([^"]+)"[^>]*>.*?<\/dcterms:type>/g);
 
+      // In jouw oude code blokkeerde je Provinciaalblad/Waterschapsblad.
+      // Als municipality meegegeven is, wil je juist Gemeenteblad; dit blijft OK.
       const blockedTypes = new Set(["Provinciaalblad", "Waterschapsblad"]);
 
       const records = [];
@@ -179,13 +238,8 @@ export default async function handler(req, res) {
         const hit = keywords.some(k => titleLc.includes(k));
         const score = hit ? 1 : 0;
 
-if (municipality) {
-  const m = municipality.toLowerCase();
-  const idLc = (id || "").toLowerCase();
-  if (!idLc.includes(m)) continue;
-}
-
-        
+        // Oude hacky filter op "id includes municipality" is verwijderd,
+        // omdat we nu in de query al filteren op creator + publicatieNaam.
         records.push({
           title,
           link: `https://zoek.officielebekendmakingen.nl/${id}.html`,
@@ -206,8 +260,21 @@ if (municipality) {
       return { sources };
     };
 
-    let picked = await bwbSearch();
-    if (!picked) picked = await oepSearch();
+    // -----------------------------
+    // Routing: welke bron eerst?
+    // -----------------------------
+    let picked = null;
+
+    if (municipality) {
+      // Gemeentelijke volgorde: eerst regelgeving (CVDR), dan bekendmakingen (OEP), dan landelijk (BWB)
+      picked = await cvdrSearch();
+      if (!picked) picked = await oepSearch();
+      if (!picked) picked = await bwbSearch();
+    } else {
+      // Landelijke volgorde: eerst BWB, dan OEP
+      picked = await bwbSearch();
+      if (!picked) picked = await oepSearch();
+    }
 
     if (!picked || !picked.sources || picked.sources.length === 0) {
       return res.status(200).json({
@@ -248,7 +315,7 @@ if (municipality) {
             {
               role: "system",
               content: `
-Je bent Beleidsbank.nl (v1 landelijk).
+Je bent Beleidsbank.nl (v1 landelijk + gemeentelijk).
 Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen.
 Noem waar mogelijk artikel/hoofdstuk/paragraaf als dat in de bron zichtbaar is; anders zeg je dat het niet zichtbaar is.
 Verzin niets en gebruik geen eigen kennis.
@@ -302,10 +369,9 @@ Structuur:
     }));
 
     return res.status(200).json({
-  answer: (municipality ? `Scope: Gemeente ${municipality}\n\n` : "Scope: Landelijk\n\n") + answer,
-  sources: picked.sources
-});
-
+      answer: (municipality ? `Scope: Gemeente ${municipality}\n\n` : "Scope: Landelijk\n\n") + answer,
+      sources: picked.sources
+    });
 
   } catch (e) {
     console.log("SERVER_ERROR", String(e?.message || e));
