@@ -1,5 +1,5 @@
 const rateStore = new Map();
-const pendingStore = new Map(); // sessionId -> { question, createdAt }
+const pendingStore = new Map();
 
 function rateLimit(ip, limit = 10, windowMs = 60000) {
   const now = Date.now();
@@ -13,15 +13,14 @@ function rateLimit(ip, limit = 10, windowMs = 60000) {
   return item.count <= limit;
 }
 
-function looksLikeMunicipality(text) {
-  const t = (text || "").trim();
-  if (!t) return false;
-  if (t.length > 40) return false;
-  return /^[\p{L}\s.'-]+$/u.test(t);
-}
-
 function normalize(s) {
   return (s || "").toLowerCase();
+}
+
+function looksLikeMunicipality(text) {
+  if (!text) return false;
+  if (text.length > 40) return false;
+  return /^[\p{L}\s.'-]+$/u.test(text);
 }
 
 function dedupe(arr) {
@@ -71,7 +70,7 @@ export default async function handler(req, res) {
   try {
 
     // -------------------------
-    // Pending gemeente flow
+    // Gemeente flow
     // -------------------------
 
     const pending = sessionId ? pendingStore.get(sessionId) : null;
@@ -85,7 +84,6 @@ export default async function handler(req, res) {
       pendingStore.delete(sessionId);
     }
 
-    // Als terras-vraag zonder gemeente
     if (!municipality && normalize(q).includes("terras")) {
       if (sessionId) {
         pendingStore.set(sessionId, {
@@ -99,44 +97,43 @@ export default async function handler(req, res) {
       });
     }
 
-    // -------------------------
-    // GEMEENTELIJKE SEARCH
-    // -------------------------
-
     let sources = [];
+
+    // -------------------------
+    // CVDR SEARCH (APV)
+    // -------------------------
 
     if (municipality) {
 
+      const cvdrQuery =
+        `dcterms.title any "Algemene plaatselijke verordening"`;
+
       const url =
-        "https://zoek.officielebekendmakingen.nl/sru/Search" +
-        "?version=1.2&operation=searchRetrieve&x-connection=oep&recordSchema=dc" +
-        "&maximumRecords=50&startRecord=1" +
-        "&query=" + encodeURIComponent(`publicatieNaam="Gemeenteblad"`);
+        "https://zoekservice.overheid.nl/sru/Search" +
+        "?version=1.2" +
+        "&operation=searchRetrieve" +
+        "&x-connection=CVDR" +
+        "&maximumRecords=50" +
+        "&startRecord=1" +
+        "&query=" + encodeURIComponent(cvdrQuery);
 
       const resp = await fetchWithTimeout(url);
       const xml = await resp.text();
 
-      const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
+      const ids = pickAll(xml, /<dcterms:identifier>(CVDR[0-9_]+)<\/dcterms:identifier>/g);
       const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
 
       const munLc = normalize(municipality);
 
       sources = ids.map((id, i) => ({
         title: titles[i] || id,
-        link: `https://zoek.officielebekendmakingen.nl/${id}.html`,
-        type: "Gemeenteblad"
+        link: `https://lokaleregelgeving.overheid.nl/${id}`,
+        type: "CVDR"
       }))
-      .filter(s =>
-        normalize(s.title).includes(munLc) &&
-        (
-          normalize(s.title).includes("terras") ||
-          normalize(s.title).includes("horeca") ||
-          normalize(s.title).includes("verordening")
-        )
-      );
+      .filter(s => normalize(s.title).includes(munLc));
     }
 
-    sources = dedupe(sources).slice(0, 4);
+    sources = dedupe(sources).slice(0, 3);
 
     if (!sources.length) {
       return res.status(200).json({
@@ -150,7 +147,7 @@ export default async function handler(req, res) {
       .join("\n\n");
 
     // -------------------------
-    // AI ANTWOORD
+    // AI
     // -------------------------
 
     const aiResp = await fetchWithTimeout(
