@@ -2,6 +2,9 @@ const rateStore = new Map();
 const pendingStore = new Map();
 // sessionId -> { originalQuestion, missingSlots:[], collected:{}, createdAt, attempts }
 
+/* ================================
+   Rate limiting
+================================ */
 function rateLimit(ip, limit = 10, windowMs = 60000) {
   const now = Date.now();
   const item = rateStore.get(ip) || { count: 0, resetAt: now + windowMs };
@@ -14,6 +17,9 @@ function rateLimit(ip, limit = 10, windowMs = 60000) {
   return item.count <= limit;
 }
 
+/* ================================
+   Utils
+================================ */
 function normalize(s) {
   return (s || "").toLowerCase().trim();
 }
@@ -69,53 +75,58 @@ function buildCqlFromTerms(terms = []) {
 }
 
 /* ================================
-   ABSOLUTE BAN: WABO + WRO (nooit tonen)
+   ABSOLUTE BAN (WABO must never show)
+   - User requirement: Wabo mag absoluut niet.
+   - We ban on ID and on title.
 ================================ */
-function isBannedLaw(item) {
-  const title = normalize(item?.title || "");
-  const id = normalize(item?.id || "");
+const BANNED_BWBR_IDS = new Set([
+  "BWBR0047270" // Wabo (as observed in your outputs)
+]);
 
-  // WABO
+function isBannedSource(item) {
+  const id = (item?.id || "").toString().trim().toUpperCase();
+  const title = normalize(item?.title || "");
+
+  if (id && BANNED_BWBR_IDS.has(id)) return true;
+
+  // Title-based catch-all
   if (title.includes("wabo")) return true;
   if (title.includes("wet algemene bepalingen omgevingsrecht")) return true;
   if (title.includes("algemene bepalingen omgevingsrecht")) return true;
-
-  // WRO (Wet ruimtelijke ordening) — user requirement: nooit tonen
-  if (title.includes("wro")) return true;
-  if (title.includes("wet ruimtelijke ordening")) return true;
-  if (title.includes("ruimtelijke ordening (wro)")) return true;
-
-  if (id.includes("wabo")) return true;
-  if (id.includes("wro")) return true;
 
   return false;
 }
 
 function removeBanned(items) {
-  return (items || []).filter(x => !isBannedLaw(x));
+  return (items || []).filter(x => !isBannedSource(x));
 }
 
 /* ================================
-   Actualiteitsboost (Omgevingswet stelsel)
+   Actuality boost: prefer Omgevingswet-stelsel
 ================================ */
 function actualLawBoostByTitle(title) {
   const t = normalize(title || "");
   let boost = 0;
+
+  // Highest priority
   if (t.includes("omgevingswet")) boost += 10;
-  if (t.includes("invoeringswet omgevingswet")) boost += 7;
-  if (t.includes("omgevingsbesluit")) boost += 7;
   if (t.includes("besluit bouwwerken leefomgeving")) boost += 9; // Bbl
   if (t.includes("besluit kwaliteit leefomgeving")) boost += 9;  // Bkl
-  if (t.includes("besluit activiteiten leefomgeving")) boost += 7; // Bal
+  if (t.includes("besluit activiteiten leefomgeving")) boost += 8; // Bal
+  if (t.includes("omgevingsbesluit")) boost += 8;
+  if (t.includes("invoeringswet omgevingswet")) boost += 6;
+
+  // Helpful keywords
   if (t.includes("omgevingsplan")) boost += 3;
   if (t.includes("buitenplanse")) boost += 3;
   if (t.includes("bouwactiviteit")) boost += 2;
   if (t.includes("omgevingsvergunning")) boost += 2;
+
   return boost;
 }
 
 /* ================================
-   Follow-up prompts (geen vage "context"-loop)
+   Follow-up prompts (no vague "context")
 ================================ */
 function questionForSlot(slot) {
   if (slot === "municipality") return "Voor welke gemeente geldt dit?";
@@ -164,7 +175,7 @@ Geef JSON met:
 - clarification_questions: array<string> (max 2)
 
 Belangrijk:
-- Gebruik het actuele stelsel (Omgevingswet). Noem Wabo/Wro NIET.
+- Gebruik het actuele stelsel (Omgevingswet). Noem Wabo niet.
 - Als municipality al bekend is: zet missing_slots NIET op municipality.
 - Stel missing_slots alleen als echt nodig voor bronselectie.
 
@@ -276,7 +287,7 @@ Antwoord:
 }
 
 /* ================================
-   Scoring (incl. actualiteit + ban)
+   Scoring / ranking
 ================================ */
 function scoreSources({ sources, q, queryTerms, includeTerms, excludeTerms, scope }) {
   const qLc = normalize(q);
@@ -296,7 +307,7 @@ function scoreSources({ sources, q, queryTerms, includeTerms, excludeTerms, scop
   };
 
   function scoreOne(s) {
-    if (isBannedLaw(s)) return -9999;
+    if (isBannedSource(s)) return -9999;
 
     const title = normalize(s?.title || "");
     let score = 0;
@@ -399,37 +410,20 @@ async function oepSearch({ municipalityName, cqlTopic, fetchWithTimeout }) {
 }
 
 /* ================================
-   SRU search: BWB (GELDEND + NOT WABO/WRO + fallback)
-   - Stap 1: status="geldend" (als ondersteund)
-   - Stap 2: fallback zonder statusfilter
-   - In beide: NOT op titel om Wabo/Wro te blokkeren op search-layer
-   - Daarna: hard filter opnieuw (double safety)
+   SRU search: BWB (ACTUAL-FIRST, HARD EXCLUDE WABO)
+   Strategy:
+   - If question smells like Omgevingswet: first pull Omgevingswet/Bbl/Bkl/Bal/Omgevingsbesluit
+   - Always exclude WABO by identifier at search-layer AND by hard filter after parse.
 ================================ */
-async function bwbSearch({ q, cqlTopic, fetchWithTimeout }) {
+async function bwbSearchPreferred({ q, fetchWithTimeout }) {
   const base = "https://zoekservice.overheid.nl/sru/Search";
 
-  const contentQuery = cqlTopic
-    ? `(overheidbwb.titel any "${q}") OR (overheidbwb.titel any "${cqlTopic}")`
-    : `overheidbwb.titel any "${q}"`;
-
-  const notOldLaws = `
-AND NOT overheidbwb.titel any "Wabo"
-AND NOT overheidbwb.titel any "Wet algemene bepalingen omgevingsrecht"
-AND NOT overheidbwb.titel any "Wro"
-AND NOT overheidbwb.titel any "Wet ruimtelijke ordening"
-`;
-
-  const queriesToTry = [
-    `(${contentQuery}) AND (overheidbwb.status="geldend" OR overheidbwb.status="Geldend") ${notOldLaws}`,
-    `(${contentQuery}) ${notOldLaws}`,
-    `(${contentQuery})` // last resort (still hard-filtered afterwards)
-  ];
-
-  for (const query of queriesToTry) {
+  // Helper: run BWB SRU query and parse
+  const run = async (cql) => {
     const url =
       `${base}?version=1.2&operation=searchRetrieve&x-connection=BWB` +
       `&maximumRecords=20&startRecord=1` +
-      `&query=${encodeURIComponent(query)}`;
+      `&query=${encodeURIComponent(cql)}`;
 
     const resp = await fetchWithTimeout(url, {}, 15000);
     const xml = await resp.text();
@@ -444,9 +438,49 @@ AND NOT overheidbwb.titel any "Wet ruimtelijke ordening"
       type: "BWB"
     })));
 
-    items = removeBanned(items);
+    return removeBanned(items);
+  };
 
-    if (items.length) return items;
+  // Always exclude WABO (by identifier) at query-level too
+  const NOT_WABO_ID = `NOT dcterms.identifier="BWBR0047270"`;
+
+  const qLc = normalize(q);
+  const likelyOmgevingswet =
+    qLc.includes("omgevingsplan") ||
+    qLc.includes("buitenplanse") ||
+    qLc.includes("bouwactiviteit") ||
+    qLc.includes("omgevingsvergunning") ||
+    qLc.includes("bopa") ||
+    qLc.includes("tijdelijk afwijken");
+
+  // Pass 1: preferred set (title-driven, current stelsel)
+  if (likelyOmgevingswet) {
+    const preferredTitles = [
+      "Omgevingswet",
+      "Omgevingsbesluit",
+      "Besluit bouwwerken leefomgeving",
+      "Besluit kwaliteit leefomgeving",
+      "Besluit activiteiten leefomgeving",
+      "Invoeringswet Omgevingswet"
+    ];
+
+    const preferredCql =
+      `(${preferredTitles.map(t => `overheidbwb.titel any "${t}"`).join(" OR ")}) AND ${NOT_WABO_ID}`;
+
+    const preferred = await run(preferredCql);
+    if (preferred.length) return preferred;
+  }
+
+  // Pass 2: generic search but still hard-excluding WABO id
+  const genericCql = `(overheidbwb.titel any "${q}") AND ${NOT_WABO_ID}`;
+  const generic = await run(genericCql);
+  if (generic.length) return generic;
+
+  // Pass 3: fallback broader (titel any on key words extracted from q)
+  const words = qLc.split(/\s+/).filter(w => w.length >= 5).slice(0, 6);
+  if (words.length) {
+    const broader = await run(`(${words.map(w => `overheidbwb.titel any "${w}"`).join(" OR ")}) AND ${NOT_WABO_ID}`);
+    if (broader.length) return broader;
   }
 
   return [];
@@ -456,6 +490,7 @@ AND NOT overheidbwb.titel any "Wet ruimtelijke ordening"
    MAIN HANDLER
 ================================ */
 export default async function handler(req, res) {
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "https://app.beleidsbank.nl");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -556,12 +591,12 @@ export default async function handler(req, res) {
     const municipality = analysis.municipality || known.municipality || null;
 
     // -----------------------------
-    // 2) Missing slots (robust)
+    // 2) Missing slots (robust for terraces only)
     // -----------------------------
     const qLc = normalize(q);
     const mentionsTerras = qLc.includes("terras") || qLc.includes("terrassen");
-
     let missingSlots = [];
+
     if (scope === "municipal" && !municipality) missingSlots.push("municipality");
 
     const terraceTypeKnown = !!(known.terrace_type && hasMeaningfulDetail(known.terrace_type));
@@ -574,10 +609,7 @@ export default async function handler(req, res) {
     }
 
     const haveEnoughForTerras =
-      scope === "municipal" &&
-      mentionsTerras &&
-      municipality &&
-      (terraceTypeKnown || hasMeaningfulDetail(q));
+      scope === "municipal" && mentionsTerras && municipality && (terraceTypeKnown || hasMeaningfulDetail(q));
 
     if (!haveEnoughForTerras && missingSlots.length) {
       if (sessionId) {
@@ -593,14 +625,14 @@ export default async function handler(req, res) {
     }
 
     // -----------------------------
-    // 3) Terms building (inject Omgevingswet stelsel)
+    // 3) Build terms
     // -----------------------------
     const terms = [...analysis.query_terms, ...analysis.include_terms];
-
     if (known.terrace_type && hasMeaningfulDetail(known.terrace_type)) terms.push(known.terrace_type);
     if (known.location_hint && hasMeaningfulDetail(known.location_hint)) terms.push(known.location_hint);
     if (municipality) terms.push(municipality);
 
+    // Push current-stelsel keywords for better retrieval
     const likelyOmgevingswet =
       qLc.includes("omgevingsplan") ||
       qLc.includes("buitenplanse") ||
@@ -624,19 +656,24 @@ export default async function handler(req, res) {
     // 4) Search
     // -----------------------------
     let sources = [];
+
     if (scope === "municipal" && municipality) {
       sources = await cvdrSearch({ municipalityName: municipality, cqlTopic, fetchWithTimeout });
       if (!sources.length) sources = await oepSearch({ municipalityName: municipality, cqlTopic, fetchWithTimeout });
+      sources = removeBanned(dedupeByLink(sources));
     } else {
-      sources = await bwbSearch({ q, cqlTopic: analysis.query_terms.join(" "), fetchWithTimeout });
+      // National: use ACTUAL-FIRST and hard-exclude WABO at query + filter level
+      sources = await bwbSearchPreferred({ q, fetchWithTimeout });
+      sources = removeBanned(dedupeByLink(sources));
     }
 
-    sources = removeBanned(dedupeByLink(sources));
+    // Absolute guarantee: never return banned sources
+    sources = removeBanned(sources);
 
     if (!sources.length) {
       return res.status(200).json({
         answer:
-          "Geen officiële bronnen gevonden na filtering op actuele wetgeving. Probeer andere kernbegrippen (bijv. ‘Omgevingswet’, ‘buitenplanse omgevingsplanactiviteit’, ‘omgevingsvergunning’).",
+          "Geen officiële bronnen gevonden (na filtering op actuele wetgeving). Probeer kernbegrippen zoals ‘Omgevingswet’, ‘omgevingsplan’, ‘buitenplanse omgevingsplanactiviteit’.",
         sources: []
       });
     }
@@ -646,7 +683,7 @@ export default async function handler(req, res) {
     // -----------------------------
     const scored = scoreSources({
       sources,
-      q: `${q}\n${known.terrace_type || ""}\n${known.location_hint || ""}`,
+      q,
       queryTerms: analysis.query_terms,
       includeTerms: terms,
       excludeTerms: analysis.exclude_terms,
@@ -661,7 +698,7 @@ export default async function handler(req, res) {
     }
 
     // -----------------------------
-    // 6) Final answer (ONLY sources, NO WABO/WRO, NO HALLUCINATIONS)
+    // 6) Final answer (ONLY sources; NEVER speculate)
     // -----------------------------
     const sourcesText = topSources
       .map((s, i) => `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}`)
@@ -674,7 +711,7 @@ export default async function handler(req, res) {
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
           model: "gpt-4o-mini",
-          temperature: 0.2,
+          temperature: 0.1,
           max_tokens: 560,
           messages: [
             {
@@ -682,25 +719,23 @@ export default async function handler(req, res) {
               content: `
 Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen.
 
-STRICTE REGELS (juridisch):
-- Gebruik uitsluitend geldende regelgeving. Negeer vervallen of vervangen wetgeving.
-- NOOIT Wabo of Wro gebruiken of noemen.
-- Noem GEEN wet/regeling (titel of afkorting) als die NIET letterlijk voorkomt in de aangeleverde bronvermelding.
-- Noem GEEN artikelnummer/bepaling als het artikelnummer NIET letterlijk in de aangeleverde bronvermelding staat.
-- Als de vraag vraagt naar een bepaling maar die niet in de bronvermelding staat: zeg dat expliciet en doe geen aannames.
+STRICT (juridisch):
+- Gebruik uitsluitend geldende regelgeving.
+- NOOIT Wabo gebruiken of noemen.
+- Noem GEEN wet/regeling als die titel/naam niet in de bronvermelding staat.
+- Noem GEEN artikelnummer/bepaling als het artikelnummer niet letterlijk in de bronvermelding staat.
+- Als de vraag vraagt naar een bepaling maar die niet in de bronvermelding staat:
+  * Zeg dat expliciet.
+  * Geef geen aannames zoals “gebruikelijk is” of “waarschijnlijk”.
 
 Format:
-1) Kort antwoord (max 4 zinnen)
-2) Toelichting (alleen wat je echt uit de bronvermelding kunt afleiden)
-Geen aparte bronnenlijst.
+1) Antwoord: (max 3 zinnen)
+2) Wat ik wél kan onderbouwen uit de bronvermelding: (korte opsomming)
 `
             },
             {
               role: "user",
-              content:
-                `Vraag:\n${q}\n` +
-                (municipality ? `Gemeente: ${municipality}\n` : "") +
-                `\nOfficiële bronnen:\n${sourcesText}`
+              content: `Vraag:\n${q}\n\nOfficiële bronnen:\n${sourcesText}`
             }
           ]
         })
@@ -715,7 +750,16 @@ Geen aparte bronnenlijst.
     let answer = aiData?.choices?.[0]?.message?.content?.trim() || "Geen antwoord gegenereerd.";
     answer = stripSourcesFromAnswer(answer);
 
-    return res.status(200).json({ answer, sources: topSources });
+    // Extra safeguard: if model somehow mentions Wabo, override
+    if (normalize(answer).includes("wabo") || normalize(answer).includes("wet algemene bepalingen omgevingsrecht")) {
+      answer =
+        "Ik kan dit niet beantwoorden op basis van de aangeleverde bronnen, omdat (verouderde) Wabo-verwijzingen niet zijn toegestaan en er geen expliciete actuele bepaling in de bronvermelding staat.";
+    }
+
+    // Absolute guarantee: never return banned sources to client
+    const safeSources = removeBanned(topSources).slice(0, 4);
+
+    return res.status(200).json({ answer, sources: safeSources });
 
   } catch (e) {
     return res.status(500).json({ error: "Interne fout" });
