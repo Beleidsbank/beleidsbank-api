@@ -1,12 +1,6 @@
 const rateStore = new Map();
 const pendingStore = new Map();
-// sessionId -> {
-//   originalQuestion: string,
-//   missingSlots: string[],         // ["municipality","terrace_type","location_hint"] (alleen waar nodig)
-//   collected: { municipality?, terrace_type?, location_hint? },
-//   createdAt: number,
-//   attempts: number
-// }
+// sessionId -> { originalQuestion, missingSlots:[], collected:{}, createdAt, attempts }
 
 function rateLimit(ip, limit = 10, windowMs = 60000) {
   const now = Date.now();
@@ -75,6 +69,43 @@ function buildCqlFromTerms(terms = []) {
 }
 
 /* ================================
+   WABO: ABSOLUTE BAN (nooit tonen)
+   - filter op TITLE (betrouwbaar), plus vangnet op id.
+================================ */
+function isWaboBanned(item) {
+  const title = normalize(item?.title || "");
+  const id = normalize(item?.id || "");
+  if (title.includes("wabo")) return true;
+  if (title.includes("wet algemene bepalingen omgevingsrecht")) return true;
+  if (title.includes("algemene bepalingen omgevingsrecht")) return true;
+  if (id.includes("wabo")) return true;
+  return false;
+}
+
+function removeBanned(sources) {
+  return (sources || []).filter(s => !isWaboBanned(s));
+}
+
+/* ================================
+   Actualiteitsboost (Omgevingswet stelsel)
+================================ */
+function actualLawBoostByTitle(title) {
+  const t = normalize(title || "");
+  let boost = 0;
+  if (t.includes("omgevingswet")) boost += 9;
+  if (t.includes("invoeringswet omgevingswet")) boost += 6;
+  if (t.includes("omgevingsbesluit")) boost += 6;
+  if (t.includes("besluit bouwwerken leefomgeving")) boost += 8; // Bbl
+  if (t.includes("besluit kwaliteit leefomgeving")) boost += 8;  // Bkl
+  if (t.includes("besluit activiteiten leefomgeving")) boost += 6; // Bal
+  if (t.includes("omgevingsplan")) boost += 3;
+  if (t.includes("buitenplanse")) boost += 3;
+  if (t.includes("bouwactiviteit")) boost += 2;
+  if (t.includes("omgevingsvergunning")) boost += 2;
+  return boost;
+}
+
+/* ================================
    Follow-up prompts (geen "context"-loop)
 ================================ */
 function questionForSlot(slot) {
@@ -100,48 +131,7 @@ function hasMeaningfulDetail(s) {
   const badExact = new Set(["?", "??", "geen idee", "weet ik niet", "idk", "organisatie?", "organisatie", "context", "wat is dit", "geen"]);
   if (badExact.has(lc)) return false;
   if (lc.includes("geen idee") || lc.includes("weet ik niet")) return false;
-  if (lc === "?" || lc === "??") return false;
   return true;
-}
-
-/* ================================
-   ABSOLUTE BAN: WABO (nooit tonen)
-   - We bannen op titel en op identifier patroon
-   - Je hoeft geen BWBR-id te kennen: Wabo komt er niet doorheen.
-================================ */
-function isBannedWaboLike(item) {
-  const title = normalize(item?.title || "");
-  const id = normalize(item?.id || "");
-  if (title.includes("wabo")) return true;
-  if (title.includes("wet algemene bepalingen omgevingsrecht")) return true;
-  // extra vangnet (soms staat Wabo in metadata/titelvariant)
-  if (title.includes("algemene bepalingen omgevingsrecht")) return true;
-  if (id.includes("wabo")) return true;
-  return false;
-}
-
-/* ================================
-   Actualiteit/voorkeur (Omgevingswet-stelsel)
-   - Boost op TITEL (want IDs kunnen wijzigen/unknown)
-================================ */
-function actualLawBoostByTitle(title) {
-  const t = normalize(title || "");
-  let boost = 0;
-
-  // Omgevingswet-stelsel (hoogste prioriteit)
-  if (t.includes("omgevingswet")) boost += 7;
-  if (t.includes("invoeringswet omgevingswet")) boost += 5;
-  if (t.includes("omgevingsbesluit")) boost += 5;
-  if (t.includes("besluit bouwwerken leefomgeving")) boost += 6; // Bbl
-  if (t.includes("besluit kwaliteit leefomgeving")) boost += 6;  // Bkl
-  if (t.includes("besluit activiteiten leefomgeving")) boost += 5; // Bal
-
-  // Minder maar relevant
-  if (t.includes("omgevingsplan")) boost += 2;
-  if (t.includes("buitenplanse")) boost += 2;
-  if (t.includes("bouwactiviteit")) boost += 1;
-
-  return boost;
 }
 
 /* ================================
@@ -151,7 +141,7 @@ async function analyzeQuestionWithAI({ q, known, apiKey, fetchWithTimeout }) {
   const prompt = `
 Analyseer een vraag over Nederlandse wet- en regelgeving. Geef GEEN inhoudelijk antwoord.
 
-Bekende context (kan leeg zijn):
+Bekende context:
 ${JSON.stringify(known || {}, null, 2)}
 
 Geef JSON met:
@@ -165,9 +155,9 @@ Geef JSON met:
 - clarification_questions: array<string> (max 2)
 
 Belangrijk:
+- Gebruik het actuele stelsel (Omgevingswet). Noem Wabo NIET.
 - Als municipality al bekend is: zet missing_slots NIET op municipality.
 - Stel missing_slots alleen als echt nodig voor bronselectie.
-- Noem Wabo NIET als relevante wetgeving (Omgevingswet is het actuele stelsel).
 
 Vraag:
 """${q}"""
@@ -177,10 +167,7 @@ Vraag:
     "https://api.openai.com/v1/chat/completions",
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`
-      },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0.1,
@@ -233,7 +220,7 @@ Vraag:
 }
 
 /* ================================
-   AI: extract slots from user follow-up answer
+   AI: extract slots from follow-up answer
 ================================ */
 async function extractSlotsWithAI({ userText, missingSlots, apiKey, fetchWithTimeout }) {
   const prompt = `
@@ -255,10 +242,7 @@ Antwoord:
     "https://api.openai.com/v1/chat/completions",
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`
-      },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0,
@@ -288,7 +272,6 @@ Antwoord:
 function scoreSources({ sources, q, queryTerms, includeTerms, excludeTerms, scope }) {
   const qLc = normalize(q);
   const pos = [...new Set([...queryTerms, ...includeTerms].map(normalize).filter(Boolean))];
-  // penalty alleen als term NIET in user vraag staat
   const neg = [...new Set((excludeTerms || []).map(normalize).filter(Boolean))].filter(t => t && !qLc.includes(t));
   const genericNoise = ["jaarverslag", "jaarrekening", "aanbested", "subsidieplafond", "inspraakreactie"];
 
@@ -304,8 +287,7 @@ function scoreSources({ sources, q, queryTerms, includeTerms, excludeTerms, scop
   };
 
   function scoreOne(s) {
-    // ABSOLUTE BAN
-    if (isBannedWaboLike(s)) return -9999;
+    if (isWaboBanned(s)) return -9999;
 
     const title = normalize(s?.title || "");
     let score = 0;
@@ -319,16 +301,13 @@ function scoreSources({ sources, q, queryTerms, includeTerms, excludeTerms, scop
 
     for (const n of genericNoise) if (title.includes(n) && !qLc.includes(n)) score -= 1.2;
 
-    // Actualiteit: Omgevingswet-stelsel naar boven
     score += actualLawBoostByTitle(s.title);
-
     score += typeBoost(s.type);
     return score;
   }
 
   const scored = (sources || []).map(s => ({ ...s, _score: scoreOne(s) }));
   scored.sort((a, b) => (b._score || 0) - (a._score || 0));
-  // filter Wabo er echt uit
   return scored.filter(x => x._score > -9990);
 }
 
@@ -388,12 +367,12 @@ async function oepSearch({ municipalityName, cqlTopic, fetchWithTimeout }) {
 
   const url =
     `${base}?version=1.2` +
-    `&operation=searchRetrieve` +
-    `&x-connection=oep` +
-    `&recordSchema=dc` +
-    `&maximumRecords=25` +
-    `&startRecord=1` +
-    `&query=${encodeURIComponent(cql)}`;
+      `&operation=searchRetrieve` +
+      `&x-connection=oep` +
+      `&recordSchema=dc` +
+      `&maximumRecords=25` +
+      `&startRecord=1` +
+      `&query=${encodeURIComponent(cql)}`;
 
   const resp = await fetchWithTimeout(url, {}, 15000);
   const xml = await resp.text();
@@ -412,32 +391,27 @@ async function oepSearch({ municipalityName, cqlTopic, fetchWithTimeout }) {
 }
 
 /* ================================
-   SRU search: BWB (ACTUEEL + fallback)
-   - Eerst proberen met status=geldend (als SRU dit accepteert)
-   - Als dat 0 oplevert: fallback zonder statusfilter
-   - Altijd: Wabo hard-banned + Omgevingswet-stelsel boosted in scoring
+   SRU search: BWB (GELDEND + fallback)
+   - Stap 1: probeer status="geldend"
+   - Stap 2: fallback zonder statusfilter
+   - ALTIJD: hard filter Wabo eruit
 ================================ */
 async function bwbSearch({ q, cqlTopic, fetchWithTimeout }) {
   const base = "https://zoekservice.overheid.nl/sru/Search";
 
-  // query-deel voor inhoud
   const contentQuery = cqlTopic
     ? `(overheidbwb.titel any "${q}") OR (overheidbwb.titel any "${cqlTopic}")`
     : `overheidbwb.titel any "${q}"`;
 
-  // poging 1: met "status geldend" (als ondersteund)
-  const tryQueries = [
-    // Let op: als dit veld niet wordt ondersteund, kan het 0 resultaten geven; daarom fallback hieronder.
+  const queriesToTry = [
     `(${contentQuery}) AND (overheidbwb.status="geldend" OR overheidbwb.status="Geldend")`,
     `(${contentQuery})`
   ];
 
-  let allItems = [];
-
-  for (const query of tryQueries) {
+  for (const query of queriesToTry) {
     const url =
       `${base}?version=1.2&operation=searchRetrieve&x-connection=BWB` +
-      `&maximumRecords=18&startRecord=1` +
+      `&maximumRecords=20&startRecord=1` +
       `&query=${encodeURIComponent(query)}`;
 
     const resp = await fetchWithTimeout(url, {}, 15000);
@@ -446,24 +420,20 @@ async function bwbSearch({ q, cqlTopic, fetchWithTimeout }) {
     const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
     const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
 
-    const items = ids.map((id, i) => ({
+    let items = dedupeByLink(ids.map((id, i) => ({
       id,
       title: titles[i] || id,
       link: `https://wetten.overheid.nl/${id}`,
       type: "BWB"
-    }));
+    })));
 
-    const uniq = dedupeByLink(items);
-    // wabo eruit
-    const cleaned = uniq.filter(x => !isBannedWaboLike(x));
+    // HARD FILTER: Wabo eruit vóór ranking
+    items = removeBanned(items);
 
-    if (cleaned.length) {
-      allItems = cleaned;
-      break;
-    }
+    if (items.length) return items;
   }
 
-  return allItems;
+  return [];
 }
 
 /* ================================
@@ -504,9 +474,9 @@ export default async function handler(req, res) {
 
   try {
     // -----------------------------
-    // 0) Slot filling (stop loops)
+    // 0) Slot filling
     // -----------------------------
-    let known = {}; // municipality/terrace_type/location_hint
+    let known = {};
 
     const pending = sessionId ? pendingStore.get(sessionId) : null;
     const fresh = pending && (Date.now() - pending.createdAt) < 7 * 60 * 1000;
@@ -524,7 +494,6 @@ export default async function handler(req, res) {
         fetchWithTimeout
       });
 
-      // Fallbacks
       if (missingSlots.includes("municipality") && !extracted?.municipality && looksLikeMunicipality(q)) {
         extracted.municipality = q.trim();
       }
@@ -549,21 +518,16 @@ export default async function handler(req, res) {
         pending.collected = collected;
         pending.attempts = attempts + 1;
         pendingStore.set(sessionId, pending);
-
-        return res.status(200).json({
-          answer: askForMissing(stillMissing),
-          sources: []
-        });
+        return res.status(200).json({ answer: askForMissing(stillMissing), sources: [] });
       }
 
-      // compleet óf te veel pogingen: proceed best-effort
       known = { ...collected };
       q = pending.originalQuestion;
       pendingStore.delete(sessionId);
     }
 
     // -----------------------------
-    // 1) AI analysis (with known)
+    // 1) AI analysis
     // -----------------------------
     const analysis = await analyzeQuestionWithAI({
       q,
@@ -576,7 +540,7 @@ export default async function handler(req, res) {
     const municipality = analysis.municipality || known.municipality || null;
 
     // -----------------------------
-    // 2) Determine missing slots (robust)
+    // 2) Missing slots (robust)
     // -----------------------------
     const qLc = normalize(q);
     const mentionsTerras = qLc.includes("terras") || qLc.includes("terrassen");
@@ -610,17 +574,14 @@ export default async function handler(req, res) {
     }
 
     // -----------------------------
-    // 3) Build search terms
-    //   - extra injection: Omgevingswet-stelsel bij omgevingsplan/bouwactiviteit
+    // 3) Terms building (inject Omgevingswet stelsel)
     // -----------------------------
     const terms = [...analysis.query_terms, ...analysis.include_terms];
 
-    // context injecties
     if (known.terrace_type && hasMeaningfulDetail(known.terrace_type)) terms.push(known.terrace_type);
     if (known.location_hint && hasMeaningfulDetail(known.location_hint)) terms.push(known.location_hint);
     if (municipality) terms.push(municipality);
 
-    // omgevingswet boost injectie (zonder Wabo!)
     const likelyOmgevingswet =
       qLc.includes("omgevingsplan") ||
       qLc.includes("buitenplanse") ||
@@ -634,6 +595,7 @@ export default async function handler(req, res) {
       terms.push("Besluit bouwwerken leefomgeving");
       terms.push("Besluit kwaliteit leefomgeving");
       terms.push("Besluit activiteiten leefomgeving");
+      terms.push("buitenplanse omgevingsplanactiviteit");
     }
 
     const cqlTopic = buildCqlFromTerms(terms);
@@ -649,11 +611,11 @@ export default async function handler(req, res) {
       sources = await bwbSearch({ q, cqlTopic: analysis.query_terms.join(" "), fetchWithTimeout });
     }
 
-    sources = dedupeByLink(sources).filter(s => !isBannedWaboLike(s));
+    sources = removeBanned(dedupeByLink(sources));
 
     if (!sources.length) {
       return res.status(200).json({
-        answer: "Geen officiële bronnen gevonden. Probeer iets concreter te formuleren (kernbegrippen/onderwerp).",
+        answer: "Geen officiële bronnen gevonden na filtering (mogelijk door verouderde regelingen). Probeer andere kernbegrippen.",
         sources: []
       });
     }
@@ -675,30 +637,13 @@ export default async function handler(req, res) {
 
     if (!topSources.length) {
       return res.status(200).json({
-        answer: "Geen officiële bronnen gevonden na filtering (mogelijk door verouderde regelingen). Probeer een andere formulering.",
+        answer: "Geen officiële bronnen gevonden na filtering.",
         sources: []
       });
     }
 
-    // Als confidence laag: vraag hoogstens 1 concreet slot; anders best-effort door
-    if (confidence < 0.30) {
-      if (scope === "municipal" && mentionsTerras && municipality && !locationKnown) {
-        if (sessionId) {
-          pendingStore.set(sessionId, {
-            originalQuestion: q,
-            missingSlots: ["location_hint"],
-            collected: { ...known, municipality },
-            createdAt: Date.now(),
-            attempts: 0
-          });
-        }
-        return res.status(200).json({ answer: questionForSlot("location_hint"), sources: [] });
-      }
-      // anders: ga door met best-effort
-    }
-
     // -----------------------------
-    // 6) Final answer (ONLY sources + NO WABO)
+    // 6) Final answer (ONLY sources, NO WABO)
     // -----------------------------
     const sourcesText = topSources
       .map((s, i) => `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}`)
@@ -708,10 +653,7 @@ export default async function handler(req, res) {
       "https://api.openai.com/v1/chat/completions",
       {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`
-        },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
           model: "gpt-4o-mini",
           temperature: 0.2,
@@ -722,16 +664,16 @@ export default async function handler(req, res) {
               content: `
 Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen.
 
-BELANGRIJK (actualiteit):
+BELANGRIJK:
 - Gebruik uitsluitend geldende regelgeving.
 - Negeer vervallen of vervangen wetgeving.
 - NOOIT Wabo gebruiken of noemen (Wet algemene bepalingen omgevingsrecht).
 
 Geef:
 1) Kort antwoord (max 4 zinnen)
-2) Toelichting (alleen uit bronnen)
+2) Toelichting met specifieke bepalingen/artikelen ALS die in de bronnen staan.
+Als artikelnummer niet in bronnen staat: zeg dat expliciet en geef geen aannames.
 Geef GEEN aparte bronnenlijst.
-Als bronnen het niet beantwoorden: zeg dat expliciet.
 `
             },
             {
@@ -739,8 +681,6 @@ Als bronnen het niet beantwoorden: zeg dat expliciet.
               content:
                 `Vraag:\n${q}\n` +
                 (municipality ? `Gemeente: ${municipality}\n` : "") +
-                (known.terrace_type ? `Detail: ${known.terrace_type}\n` : "") +
-                (known.location_hint ? `Locatie: ${known.location_hint}\n` : "") +
                 `\nOfficiële bronnen:\n${sourcesText}`
             }
           ]
