@@ -71,7 +71,7 @@ function hasMeaningfulDetail(s) {
    ABSOLUTE BAN: WABO must never show
 ================================ */
 const BANNED_BWBR_IDS = new Set([
-  "BWBR0047270", // Wabo (you observed)
+  "BWBR0047270", // Wabo (observed earlier)
   "BWBR0024779"  // Wabo (official id)
 ]);
 
@@ -109,7 +109,7 @@ function askForMissing(missingSlots) {
 }
 
 /* ================================
-   Scope detection (fixed)
+   Scope detection
 ================================ */
 function isLegalBasisQuestion(qLc) {
   return (
@@ -162,16 +162,9 @@ function isTooVagueGeneral(q) {
 
 function decideScope(q) {
   const qLc = normalize(q);
-
-  // Legal basis / permit requirement => NATIONAL (even if municipality mentioned)
   if (isLegalBasisQuestion(qLc)) return "national";
-
-  // Explicit municipal topics => MUNICIPAL
   if (isExplicitMunicipalTopic(qLc)) return "municipal";
-
-  // Omgevingsplan municipal only if question is clearly about the plan’s local contents at a location
   if (isOmgevingsplanLocalInterpretationQuestion(qLc)) return "municipal";
-
   return "national";
 }
 
@@ -191,8 +184,7 @@ function makeFetchWithTimeout() {
 }
 
 /* ================================
-   Extract snippet from wetten.overheid.nl
-   - We do this ONLY for Omgevingswet article 5.1 area to enable accurate “which provision”
+   Extract snippet from wetten.overheid.nl (Omgevingswet art. 5.1 context)
 ================================ */
 function htmlToTextLite(html) {
   return (html || "")
@@ -211,7 +203,7 @@ function htmlToTextLite(html) {
     .trim();
 }
 
-function extractAround(text, needle, radius = 1200) {
+function extractAround(text, needle, radius = 1600) {
   const idx = text.toLowerCase().indexOf(needle.toLowerCase());
   if (idx === -1) return null;
   const start = Math.max(0, idx - radius);
@@ -225,15 +217,11 @@ async function wettenSnippetOmgevingswetArt51(fetchWithTimeout) {
   const html = await resp.text();
   const text = htmlToTextLite(html);
 
-  // Try “Artikel 5.1” first
-  let snip = extractAround(text, "Artikel 5.1", 1500);
-  if (!snip) snip = extractAround(text, "5.1", 1500);
+  let snip = extractAround(text, "Artikel 5.1", 1800);
+  if (!snip) snip = extractAround(text, "5.1", 1800);
 
-  // If still nothing, return a small beginning (fallback)
-  if (!snip) return text.slice(0, 2000);
-
-  // Keep it small for tokens, but enough for model to cite lid/onderdeel if present
-  return snip.slice(0, 2400);
+  if (!snip) return text.slice(0, 2600);
+  return snip.slice(0, 3000);
 }
 
 /* ================================
@@ -312,9 +300,6 @@ async function oepSearch({ municipalityName, topicWords, fetchWithTimeout }) {
 
 /* ================================
    SRU search: BWB (improved for legal-basis questions)
-   - If question is about permit requirement / legal basis for omgevingsplan deviation:
-     ALWAYS include Omgevingswet BWBR0037885 as top candidate + snippet.
-   - Avoid amendment/noise by prioritizing primary titles.
 ================================ */
 const OMGEVINGSWET_ID = "BWBR0037885";
 
@@ -348,7 +333,6 @@ async function bwbSearch({ q, fetchWithTimeout, forceOmgevingswet }) {
     return items;
   };
 
-  // 1) Force primary Omgevingswet and core decrees FIRST (reduces amendments)
   const coreTitles = [
     `overheidbwb.titel any "Omgevingswet"`,
     `overheidbwb.titel any "Omgevingsbesluit"`,
@@ -360,7 +344,6 @@ async function bwbSearch({ q, fetchWithTimeout, forceOmgevingswet }) {
 
   const resCore = await run(`(${coreTitles})`);
   if (resCore.length) {
-    // If forceOmgevingswet, ensure the Omgevingswet itself is present even if SRU missed it.
     if (forceOmgevingswet && !resCore.some(x => (x.id || "").toUpperCase() === OMGEVINGSWET_ID)) {
       resCore.unshift({
         id: OMGEVINGSWET_ID,
@@ -372,11 +355,9 @@ async function bwbSearch({ q, fetchWithTimeout, forceOmgevingswet }) {
     return resCore;
   }
 
-  // 2) Generic fallback: title any question (still filter Wabo later)
   const res2 = await run(`overheidbwb.titel any "${safeQ}"`);
   if (res2.length) return res2;
 
-  // 3) Broad fallback: keyword splits
   const words = normalize(q).split(/\s+/).filter(w => w.length >= 6).slice(0, 6);
   if (words.length) {
     const cql3 = words.map(w => `overheidbwb.titel any "${w}"`).join(" OR ");
@@ -384,7 +365,6 @@ async function bwbSearch({ q, fetchWithTimeout, forceOmgevingswet }) {
     if (res3.length) return res3;
   }
 
-  // 4) Final: return at least Omgevingswet if forced
   if (forceOmgevingswet) {
     return removeBanned([{
       id: OMGEVINGSWET_ID,
@@ -405,19 +385,16 @@ function scoreSource({ s, qLc, scope }) {
   const t = normalize(s?.title || "");
   let score = 0;
 
-  // Strongly prefer primary Omgevingswet for legal-basis questions
   if ((s.id || "").toUpperCase() === OMGEVINGSWET_ID) score += 50;
 
-  if (t === "omgevingswet" || t.includes("omgevingswet")) score += 20;
+  if (t.includes("omgevingswet")) score += 20;
   if (t.includes("omgevingsbesluit")) score += 10;
   if (t.includes("besluit bouwwerken leefomgeving")) score += 12;
   if (t.includes("besluit kwaliteit leefomgeving")) score += 12;
   if (t.includes("besluit activiteiten leefomgeving")) score += 11;
 
-  // Deprioritize amendment-y titles a bit
   if (t.includes("wijzig") || t.includes("aanvullings") || t.includes("verzamel")) score -= 4;
 
-  // Match question keywords
   const kw = qLc.split(/\s+/).filter(w => w.length >= 5).slice(0, 12);
   for (const w of kw) if (t.includes(w)) score += 0.7;
 
@@ -536,7 +513,6 @@ export default async function handler(req, res) {
     // -----------------------------
     const scope = decideScope(q);
 
-    // Ask municipality only if scope is municipal and municipality missing
     if (scope === "municipal" && !municipality) {
       const need = ["municipality", ...(isTerraceQuestion(qLc) ? ["terrace_type"] : [])];
 
@@ -553,7 +529,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ answer: askForMissing(need), sources: [] });
     }
 
-    // If national scope but too vague, ask topic hint
     if (scope === "national" && isTooVagueGeneral(q) && !collected.topic_hint) {
       if (sessionId) {
         pendingStore.set(sessionId, {
@@ -604,8 +579,11 @@ export default async function handler(req, res) {
         ? `${q} ${collected.topic_hint}`
         : q;
 
-      // Force Omgevingswet for this category of question
-      const forceOw = !!isOmgevingsplanDeviationLegalBasis || isLegalBasisQuestion(qLc) || qLc.includes("omgevingsplanactiviteit") || qLc.includes("bopa");
+      const forceOw =
+        !!isOmgevingsplanDeviationLegalBasis ||
+        isLegalBasisQuestion(qLc) ||
+        qLc.includes("omgevingsplanactiviteit") ||
+        qLc.includes("bopa");
 
       sources = await bwbSearch({ q: q2, fetchWithTimeout, forceOmgevingswet: forceOw });
     }
@@ -622,7 +600,7 @@ export default async function handler(req, res) {
     }
 
     // -----------------------------
-    // 3) Build sourcesText + (critical) include Omgevingswet art. 5.1 snippet if relevant
+    // 3) Include snippet for legal-basis questions (and require quotes)
     // -----------------------------
     const needOwSnippet =
       scope === "national" &&
@@ -662,7 +640,7 @@ export default async function handler(req, res) {
         body: JSON.stringify({
           model: "gpt-4o-mini",
           temperature: 0.1,
-          max_tokens: 650,
+          max_tokens: 700,
           messages: [
             {
               role: "system",
@@ -672,13 +650,15 @@ Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen (incl. 
 STRICT:
 - Noem GEEN wet/regeling als die naam/titel niet in de bronvermelding staat.
 - Noem GEEN artikelnummer/bepaling als die niet letterlijk in de brontekst/uittreksel staat.
+- Als je een bepaling noemt: noem ook lid/onderdeel ALS dat letterlijk in de tekst staat. Staat het er niet: zeg "lid/onderdeel niet zichtbaar in aangeleverde tekst".
+- Voeg 1 korte quote toe (max 25 woorden) uit het uittreksel rond de vergunningplicht (als er uittreksel is). Geen quote mogelijk => zeg dat expliciet.
 - NOOIT Wabo (Wet algemene bepalingen omgevingsrecht) noemen of gebruiken.
-- Als de vraag vraagt naar een bepaling maar die staat niet letterlijk in de bronvermelding/uittreksel: zeg dat expliciet (geen aannames).
 
-Geef:
-1) Kort antwoord (max 3 zinnen)
-2) Grondslag (exacte bepaling/ artikel/ lid/ onderdeel als die letterlijk in de bron staat)
-3) Toelichting (bulletpoints) — alleen uit bron
+Format:
+1) Antwoord: (max 3 zinnen)
+2) Grondslag: (artikel + evt. lid/onderdeel, anders melden dat dit niet zichtbaar is)
+3) Bewijsquote: (max 25 woorden, alleen uit uittreksel)
+4) Toelichting: (bulletpoints) — alleen uit bron
 Geen aparte bronnenlijst.
 `
             },
@@ -707,7 +687,6 @@ Geen aparte bronnenlijst.
       answer = "Ik kan dit niet beantwoorden op basis van de aangeleverde bronnen (Wabo is niet toegestaan) en er staat geen expliciete actuele bepaling in de bronvermelding/uittreksel.";
     }
 
-    // Never return banned sources
     sources = removeBanned(sources);
 
     return res.status(200).json({ answer, sources });
