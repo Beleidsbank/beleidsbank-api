@@ -20,25 +20,27 @@ function rateLimit(ip, limit = 10, windowMs = 60_000) {
 
 export default async function handler(req, res) {
 
-  const allowedOrigins = new Set([
-    "https://app.beleidsbank.nl"
-  ]);
+  // -----------------------------
+  // CORS (Correct & Stable)
+  // -----------------------------
+  const allowedOrigin = "https://app.beleidsbank.nl";
 
-  const origin = req.headers.origin || "";
-  if (allowedOrigins.has(origin)) {
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  }
+  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Vary", "Origin");
+
   if (req.method === "OPTIONS") {
-  return res.status(200).end();
-}
-
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
-  if (!allowedOrigins.has(origin)) {
-    return res.status(403).json({ error: "Forbidden" });
+    return res.status(200).end();
   }
 
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Only POST allowed" });
+  }
+
+  // -----------------------------
+  // Rate limit
+  // -----------------------------
   const ip =
     (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
     req.socket?.remoteAddress ||
@@ -71,121 +73,123 @@ res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
     const term = keywords.length ? keywords.join(" ") : cleaned;
 
     // -----------------------------
-    // CVDR (gemeentelijke regelingen)
+    // CVDR
     // -----------------------------
     const cvdrSearch = async () => {
-      const query = `keyword all "${term}"`;
+      try {
+        const query = `keyword all "${term}"`;
 
-      const url =
-        "https://zoekservice.overheid.nl/sru/Search" +
-        "?version=1.2&operation=searchRetrieve" +
-        "&x-connection=CVDR" +
-        "&maximumRecords=6&startRecord=1" +
-        "&query=" + encodeURIComponent(query);
+        const url =
+          "https://zoekservice.overheid.nl/sru/Search" +
+          "?version=1.2&operation=searchRetrieve" +
+          "&x-connection=CVDR" +
+          "&maximumRecords=6&startRecord=1" +
+          "&query=" + encodeURIComponent(query);
 
-      const resp = await fetchWithTimeout(url);
-      const xml = await resp.text();
+        const resp = await fetchWithTimeout(url);
+        const xml = await resp.text();
 
-      const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
-      const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
+        const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
+        const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
 
-      if (!ids.length) return null;
+        if (!ids.length) return null;
 
-      const sources = [];
-      const seen = new Set();
+        const sources = [];
 
-      for (let i = 0; i < ids.length; i++) {
-        if (seen.has(ids[i])) continue;
-        seen.add(ids[i]);
+        for (let i = 0; i < Math.min(3, ids.length); i++) {
+          sources.push({
+            title: titles[i] || ids[i],
+            link: `https://lokaleregelgeving.overheid.nl/${ids[i]}`,
+            type: "CVDR"
+          });
+        }
 
-        sources.push({
-          title: titles[i] || ids[i],
-          link: `https://lokaleregelgeving.overheid.nl/${ids[i]}`,
-          type: "CVDR"
-        });
-
-        if (sources.length >= 3) break;
+        return sources.length ? { sources } : null;
+      } catch {
+        return null;
       }
-
-      return sources.length ? { sources } : null;
     };
 
     // -----------------------------
-    // OEP (Gemeenteblad etc.)
+    // OEP
     // -----------------------------
     const oepSearch = async () => {
+      try {
+        const query = `keyword all "${term}"`;
 
-      const query = `keyword all "${term}"`;
+        const url =
+          "https://zoek.officielebekendmakingen.nl/sru/Search" +
+          "?version=1.2&operation=searchRetrieve" +
+          "&x-connection=oep&recordSchema=dc" +
+          "&maximumRecords=8&startRecord=1" +
+          "&query=" + encodeURIComponent(query);
 
-      const url =
-        "https://zoek.officielebekendmakingen.nl/sru/Search" +
-        "?version=1.2&operation=searchRetrieve" +
-        "&x-connection=oep&recordSchema=dc" +
-        "&maximumRecords=8&startRecord=1" +
-        "&query=" + encodeURIComponent(query);
+        const resp = await fetchWithTimeout(url);
+        const xml = await resp.text();
 
-      const resp = await fetchWithTimeout(url);
-      const xml = await resp.text();
+        const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
+        const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
 
-      const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
-      const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
+        if (!ids.length) return null;
 
-      if (!ids.length) return null;
+        const sources = [];
 
-      const sources = [];
+        for (let i = 0; i < Math.min(4, ids.length); i++) {
+          sources.push({
+            title: titles[i] || ids[i],
+            link: `https://zoek.officielebekendmakingen.nl/${ids[i]}.html`,
+            type: "OEP"
+          });
+        }
 
-      for (let i = 0; i < Math.min(4, ids.length); i++) {
-        sources.push({
-          title: titles[i] || ids[i],
-          link: `https://zoek.officielebekendmakingen.nl/${ids[i]}.html`,
-          type: "OEP"
-        });
+        return sources.length ? { sources } : null;
+      } catch {
+        return null;
       }
-
-      return sources.length ? { sources } : null;
     };
 
     // -----------------------------
-    // BWB (landelijke wetgeving)
+    // BWB
     // -----------------------------
     const bwbSearch = async () => {
+      try {
+        const query = `overheidbwb.titel any "${term}"`;
 
-      const query = `overheidbwb.titel any "${term}"`;
+        const url =
+          "https://zoekservice.overheid.nl/sru/Search" +
+          "?version=1.2&operation=searchRetrieve" +
+          "&x-connection=BWB" +
+          "&maximumRecords=6&startRecord=1" +
+          "&query=" + encodeURIComponent(query);
 
-      const url =
-        "https://zoekservice.overheid.nl/sru/Search" +
-        "?version=1.2&operation=searchRetrieve" +
-        "&x-connection=BWB" +
-        "&maximumRecords=6&startRecord=1" +
-        "&query=" + encodeURIComponent(query);
+        const resp = await fetchWithTimeout(url);
+        const xml = await resp.text();
 
-      const resp = await fetchWithTimeout(url);
-      const xml = await resp.text();
+        const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
+        const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
 
-      const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
-      const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
+        if (!ids.length) return null;
 
-      if (!ids.length) return null;
+        const sources = [];
 
-      const sources = [];
+        for (let i = 0; i < Math.min(3, ids.length); i++) {
+          sources.push({
+            title: titles[i] || ids[i],
+            link: `https://wetten.overheid.nl/${ids[i]}`,
+            type: "BWB"
+          });
+        }
 
-      for (let i = 0; i < Math.min(3, ids.length); i++) {
-        sources.push({
-          title: titles[i] || ids[i],
-          link: `https://wetten.overheid.nl/${ids[i]}`,
-          type: "BWB"
-        });
+        return sources.length ? { sources } : null;
+      } catch {
+        return null;
       }
-
-      return sources.length ? { sources } : null;
     };
 
-    // -----------------------------
     // Zoekvolgorde
-    // -----------------------------
-    let picked = await oepSearch();
-if (!picked) picked = await bwbSearch();
-
+    let picked = await cvdrSearch();
+    if (!picked) picked = await oepSearch();
+    if (!picked) picked = await bwbSearch();
 
     if (!picked) {
       return res.status(200).json({
@@ -198,9 +202,6 @@ if (!picked) picked = await bwbSearch();
       .map((s, i) => `Bron ${i + 1}: ${s.title}\n${s.link}`)
       .join("\n\n");
 
-    // -----------------------------
-    // OpenAI
-    // -----------------------------
     const aiResp = await fetchWithTimeout(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -217,7 +218,7 @@ if (!picked) picked = await bwbSearch();
               role: "system",
               content: `
 Je bent Beleidsbank.nl.
-Je antwoordt uitsluitend op basis van de aangeleverde officiële bronnen.
+Je antwoordt uitsluitend op basis van officiële bronnen.
 Structuur:
 1. Kort antwoord
 2. Toelichting
