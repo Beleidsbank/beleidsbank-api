@@ -8,6 +8,26 @@ Kort wat er gebeurt en wat ik doe:
      En: **Wabo wordt onvoorwaardelijk geblokkeerd** (ID + titel), zodat die nooit kan terugkomen.
 
 Hier is de volledige `chat.js` (drop-in) met die fix:
+export default async function handler(req, res) {
+
+  // --- CORS ---
+  const origin = req.headers.origin || "";
+
+  if (origin === "https://app.beleidsbank.nl") {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Max-Age", "86400");
+  res.setHeader("Vary", "Origin");
+
+  // 🚨 THIS MUST BE FIRST EXIT
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
+  // ---- rest of your code below ----
 
 ```js
 const rateStore = new Map();
