@@ -53,7 +53,7 @@ export default async function handler(req, res) {
   try {
 
     // =====================================================
-    // 1️⃣ AI ROUTER (ALLEEN CLASSIFICATIE)
+    // 1️⃣ AI ROUTER + MUNICIPALITY DETECTION
     // =====================================================
 
     const routerResp = await fetchWithTimeout(
@@ -71,14 +71,15 @@ export default async function handler(req, res) {
             {
               role: "system",
               content: `
-Classificeer deze vraag in één categorie:
+Analyseer de vraag.
 
-- national
-- municipal_regulation
-- municipal_decision
+Geef JSON terug:
+{
+  "type": "national | municipal_regulation | municipal_decision",
+  "municipality": "naam of null"
+}
 
-Geef alleen JSON terug:
-{ "type": "..." }
+Als er geen gemeente wordt genoemd, zet municipality op null.
 `
             },
             { role: "user", content: q }
@@ -88,22 +89,40 @@ Geef alleen JSON terug:
     );
 
     let routeType = "national";
+    let municipality = null;
+
     try {
       const routerData = await routerResp.json();
-      routeType = JSON.parse(routerData.choices[0].message.content).type;
+      const parsed = JSON.parse(routerData.choices[0].message.content);
+      routeType = parsed.type;
+      municipality = parsed.municipality;
     } catch {
       routeType = "national";
+      municipality = null;
     }
 
-    const cleaned = q.toLowerCase();
+    // =====================================================
+    // 2️⃣ ALS GEMEENTE NODIG IS MAAR ONTBREEKT → VRAAG TERUG
+    // =====================================================
+
+    if (
+      (routeType === "municipal_regulation" ||
+        routeType === "municipal_decision") &&
+      !municipality
+    ) {
+      return res.status(200).json({
+        answer: "Voor welke gemeente geldt dit?",
+        sources: []
+      });
+    }
 
     // =====================================================
-    // 2️⃣ GERichte ZOEK PER TYPE
+    // 3️⃣ GERichte ZOEK
     // =====================================================
 
     let results = [];
 
-    // -------- NATIONAL (BWB) --------
+    // -------- NATIONAL --------
     if (routeType === "national") {
 
       const query = `overheidbwb.titel any "${q}"`;
@@ -127,10 +146,10 @@ Geef alleen JSON terug:
       }));
     }
 
-    // -------- MUNICIPAL REGULATION (CVDR) --------
+    // -------- MUNICIPAL REGULATION --------
     if (routeType === "municipal_regulation") {
 
-      const query = `dcterms.title any "${q}"`;
+      const query = `dcterms.title any "${q}" AND overheid.organisatie = "${municipality}"`;
 
       const url =
         "https://zoekservice.overheid.nl/sru/Search" +
@@ -151,10 +170,10 @@ Geef alleen JSON terug:
       }));
     }
 
-    // -------- MUNICIPAL DECISION (OEP - Gemeenteblad) --------
+    // -------- MUNICIPAL DECISION --------
     if (routeType === "municipal_decision") {
 
-      const query = `publicatieNaam="Gemeenteblad" AND titel any "${q}"`;
+      const query = `publicatieNaam="Gemeenteblad" AND titel any "${q}" AND gemeente="${municipality}"`;
 
       const url =
         "https://zoek.officielebekendmakingen.nl/sru/Search" +
@@ -175,7 +194,6 @@ Geef alleen JSON terug:
       }));
     }
 
-    // Fallback
     if (!results.length) {
       return res.status(200).json({
         answer: "Geen officiële bronnen gevonden.",
@@ -183,7 +201,7 @@ Geef alleen JSON terug:
       });
     }
 
-    // Deduplicatie
+    // Deduplicate
     const unique = [];
     const seen = new Set();
 
@@ -201,7 +219,7 @@ Geef alleen JSON terug:
       .join("\n\n");
 
     // =====================================================
-    // 3️⃣ ANTWOORD GENEREREN
+    // 4️⃣ ANTWOORD GENEREREN
     // =====================================================
 
     const aiResp = await fetchWithTimeout(
@@ -243,7 +261,7 @@ Geef GEEN aparte bronnenlijst.
       sources: topSources
     });
 
-  } catch (e) {
+  } catch {
     return res.status(500).json({ error: "Interne fout" });
   }
 }
