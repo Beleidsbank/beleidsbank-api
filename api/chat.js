@@ -38,11 +38,11 @@ export default async function handler(req, res) {
   const q = (message || "").trim();
   if (!q) return res.status(400).json({ error: "Missing message" });
 
-  const fetchWithTimeout = async (url, ms = 12000) => {
+  const fetchWithTimeout = async (url, options = {}, ms = 12000) => {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), ms);
     try {
-      return await fetch(url, { signal: controller.signal });
+      return await fetch(url, { ...options, signal: controller.signal });
     } finally {
       clearTimeout(id);
     }
@@ -51,6 +51,53 @@ export default async function handler(req, res) {
   const pickAll = (text, re) => [...text.matchAll(re)].map(m => m[1]);
 
   try {
+
+    // =========================================================
+    // 1️⃣ AI ROUTER (CLASSIFICATIE)
+    // =========================================================
+
+    const routerResp = await fetchWithTimeout(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          temperature: 0,
+          messages: [
+            {
+              role: "system",
+              content: `
+Classificeer de vraag in één van de volgende categorieën:
+- national
+- municipal_regulation
+- municipal_decision
+
+Geef alleen JSON terug:
+{ "type": "..." }
+`
+            },
+            { role: "user", content: q }
+          ]
+        })
+      }
+    );
+
+    const routerData = await routerResp.json();
+    let routeType = "national";
+
+    try {
+      routeType = JSON.parse(routerData.choices[0].message.content).type;
+    } catch {
+      routeType = "national";
+    }
+
+    // =========================================================
+    // 2️⃣ GERichte ZOEK
+    // =========================================================
 
     const cleaned = q.toLowerCase();
     const keywords = cleaned.split(/\s+/).filter(w => w.length >= 4).slice(0, 6);
@@ -64,19 +111,15 @@ export default async function handler(req, res) {
         if (lower.includes(k)) score += 2;
       });
 
-      if (cleaned.includes("apv") && lower.includes("apv")) score += 3;
-      if (cleaned.includes("wet") && lower.includes("wet")) score += 3;
-
-      const yearMatch = cleaned.match(/\b(20\d{2})\b/);
-      if (yearMatch && lower.includes(yearMatch[1])) score += 2;
+      if (cleaned.includes("apv") && lower.includes("apv")) score += 5;
+      if (cleaned.includes("wet") && lower.includes("wet")) score += 5;
 
       return score;
     };
 
-    const search = async (urlBuilder, type, linkBuilder) => {
+    const search = async (urlBuilder, linkBuilder) => {
       try {
-        const url = urlBuilder(term);
-        const resp = await fetchWithTimeout(url);
+        const resp = await fetchWithTimeout(urlBuilder(term));
         const xml = await resp.text();
 
         const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
@@ -84,44 +127,52 @@ export default async function handler(req, res) {
 
         return ids.map((id, i) => ({
           title: titles[i] || id,
-          link: linkBuilder(id),
-          type
+          link: linkBuilder(id)
         }));
       } catch {
         return [];
       }
     };
 
-    const [bwb, cvdr, oep] = await Promise.all([
+    let results = [];
 
-      search(
+    if (routeType === "national") {
+      results = await search(
         term => `https://zoekservice.overheid.nl/sru/Search?version=1.2&operation=searchRetrieve&x-connection=BWB&maximumRecords=5&query=${encodeURIComponent(`overheidbwb.titel any "${term}"`)}`,
-        "BWB",
         id => `https://wetten.overheid.nl/${id}`
-      ),
+      );
+    }
 
-      search(
+    if (routeType === "municipal_regulation") {
+      results = await search(
         term => `https://zoekservice.overheid.nl/sru/Search?version=1.2&operation=searchRetrieve&x-connection=CVDR&maximumRecords=5&query=${encodeURIComponent(`keyword all "${term}"`)}`,
-        "CVDR",
         id => `https://lokaleregelgeving.overheid.nl/${id}`
-      ),
+      );
+    }
 
-      search(
+    if (routeType === "municipal_decision") {
+      results = await search(
         term => `https://zoek.officielebekendmakingen.nl/sru/Search?version=1.2&operation=searchRetrieve&x-connection=oep&recordSchema=dc&maximumRecords=5&query=${encodeURIComponent(`keyword all "${term}"`)}`,
-        "OEP",
         id => `https://zoek.officielebekendmakingen.nl/${id}.html`
-      )
-    ]);
+      );
+    }
 
-    // Combine + deduplicate
-    const all = [...bwb, ...cvdr, ...oep];
+    // fallback als niets gevonden
+    if (!results.length) {
+      results = await search(
+        term => `https://zoekservice.overheid.nl/sru/Search?version=1.2&operation=searchRetrieve&x-connection=BWB&maximumRecords=5&query=${encodeURIComponent(`keyword all "${term}"`)}`,
+        id => `https://wetten.overheid.nl/${id}`
+      );
+    }
+
+    // deduplicate
     const unique = [];
     const seen = new Set();
 
-    for (const s of all) {
-      if (!seen.has(s.link)) {
-        seen.add(s.link);
-        unique.push({ ...s, score: scoreSource(s.title) });
+    for (const r of results) {
+      if (!seen.has(r.link)) {
+        seen.add(r.link);
+        unique.push({ ...r, score: scoreSource(r.title) });
       }
     }
 
@@ -139,34 +190,40 @@ export default async function handler(req, res) {
       .map((s, i) => `Bron ${i + 1}: ${s.title}\n${s.link}`)
       .join("\n\n");
 
-    const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        temperature: 0.2,
-        messages: [
-          {
-            role: "system",
-            content: `
-Je bent Beleidsbank.nl.
-Gebruik uitsluitend de aangeleverde bronnen.
+    // =========================================================
+    // 3️⃣ ANTWOORD GENEREREN
+    // =========================================================
+
+    const aiResp = await fetchWithTimeout(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          temperature: 0.2,
+          messages: [
+            {
+              role: "system",
+              content: `
+Gebruik uitsluitend de aangeleverde officiële bronnen.
 Geef:
 1. Kort antwoord
 2. Toelichting
 Geef GEEN aparte bronnenlijst.
 `
-          },
-          {
-            role: "user",
-            content: `Vraag:\n${q}\n\nBronnen:\n${sourcesText}`
-          }
-        ]
-      })
-    });
+            },
+            {
+              role: "user",
+              content: `Vraag:\n${q}\n\nBronnen:\n${sourcesText}`
+            }
+          ]
+        })
+      }
+    );
 
     const aiData = await aiResp.json();
     const answer = aiData?.choices?.[0]?.message?.content?.trim();
