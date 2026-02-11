@@ -1,5 +1,5 @@
 const rateStore = new Map();
-const pendingStore = new Map(); // sessionId -> { question, type, createdAt }
+const pendingStore = new Map(); // sessionId -> { question, createdAt }
 
 function rateLimit(ip, limit = 10, windowMs = 60000) {
   const now = Date.now();
@@ -22,12 +22,6 @@ function looksLikeMunicipality(text) {
 
 function normalize(s) {
   return (s || "").toLowerCase();
-}
-
-function extractKeywords(q) {
-  const cleaned = normalize(q).replace(/[^\p{L}\p{N}\s]/gu, " ");
-  const words = cleaned.split(/\s+/).filter(w => w.length >= 4);
-  return words.slice(0, 5).join(" ") || cleaned;
 }
 
 function dedupe(arr) {
@@ -84,30 +78,18 @@ export default async function handler(req, res) {
     const fresh = pending && (Date.now() - pending.createdAt) < 5 * 60 * 1000;
 
     let municipality = null;
-    let routeType = "national";
 
     if (fresh && looksLikeMunicipality(q)) {
       municipality = q.trim();
-      routeType = pending.type;
       q = pending.question;
       pendingStore.delete(sessionId);
-    } else {
-      // simpele detectie: als "gemeente" of plaatsnaam in vraag voorkomt
-      if (normalize(q).includes("amsterdam") ||
-          normalize(q).includes("utrecht") ||
-          normalize(q).includes("rotterdam")) {
-        routeType = "municipal";
-        municipality = q.match(/(amsterdam|utrecht|rotterdam)/i)?.[0];
-      } else if (normalize(q).includes("terras")) {
-        routeType = "municipal";
-      }
     }
 
-    if (routeType === "municipal" && !municipality) {
+    // Als terras-vraag zonder gemeente
+    if (!municipality && normalize(q).includes("terras")) {
       if (sessionId) {
         pendingStore.set(sessionId, {
           question: q,
-          type: "municipal",
           createdAt: Date.now()
         });
       }
@@ -118,22 +100,18 @@ export default async function handler(req, res) {
     }
 
     // -------------------------
-    // SEARCH
+    // GEMEENTELIJKE SEARCH
     // -------------------------
 
     let sources = [];
 
-    if (routeType === "municipal" && municipality) {
-
-      const keywords = extractKeywords(q);
-      const searchQuery =
-        `publicatieNaam="Gemeenteblad" AND "${municipality}" AND "${keywords}"`;
+    if (municipality) {
 
       const url =
         "https://zoek.officielebekendmakingen.nl/sru/Search" +
         "?version=1.2&operation=searchRetrieve&x-connection=oep&recordSchema=dc" +
-        "&maximumRecords=20&startRecord=1" +
-        "&query=" + encodeURIComponent(searchQuery);
+        "&maximumRecords=50&startRecord=1" +
+        "&query=" + encodeURIComponent(`publicatieNaam="Gemeenteblad"`);
 
       const resp = await fetchWithTimeout(url);
       const xml = await resp.text();
@@ -141,33 +119,21 @@ export default async function handler(req, res) {
       const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
       const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
 
+      const munLc = normalize(municipality);
+
       sources = ids.map((id, i) => ({
         title: titles[i] || id,
         link: `https://zoek.officielebekendmakingen.nl/${id}.html`,
         type: "Gemeenteblad"
-      }));
-
-    } else {
-      // landelijke fallback
-      const bwbQuery = `overheidbwb.titel any "${q}"`;
-
-      const url =
-        "https://zoekservice.overheid.nl/sru/Search" +
-        "?version=1.2&operation=searchRetrieve&x-connection=BWB" +
-        "&maximumRecords=8&startRecord=1" +
-        "&query=" + encodeURIComponent(bwbQuery);
-
-      const resp = await fetchWithTimeout(url);
-      const xml = await resp.text();
-
-      const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
-      const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
-
-      sources = ids.map((id, i) => ({
-        title: titles[i] || id,
-        link: `https://wetten.overheid.nl/${id}`,
-        type: "BWB"
-      }));
+      }))
+      .filter(s =>
+        normalize(s.title).includes(munLc) &&
+        (
+          normalize(s.title).includes("terras") ||
+          normalize(s.title).includes("horeca") ||
+          normalize(s.title).includes("verordening")
+        )
+      );
     }
 
     sources = dedupe(sources).slice(0, 4);
