@@ -2,10 +2,10 @@ const rateStore = new Map();
 const pendingStore = new Map();
 // sessionId -> {
 //   originalQuestion: string,
-//   missingSlots: string[],         // e.g. ["municipality","terrace_type","location_hint"]
+//   missingSlots: string[],         // ["municipality","terrace_type","location_hint"] (alleen waar nodig)
 //   collected: { municipality?, terrace_type?, location_hint? },
 //   createdAt: number,
-//   attempts: number                // how many times we've asked follow-ups
+//   attempts: number
 // }
 
 function rateLimit(ip, limit = 10, windowMs = 60000) {
@@ -71,13 +71,11 @@ function buildCqlFromTerms(terms = []) {
     .slice(0, 10);
 
   if (!clean.length) return `keyword all ""`;
-
-  // (keyword all "x") OR (keyword all "y") ...
   return clean.map(t => `keyword all "${t.replaceAll('"', "")}"`).join(" OR ");
 }
 
 /* ================================
-   Follow-up prompts (NO "context" loop)
+   Follow-up prompts (geen "context"-loop)
 ================================ */
 function questionForSlot(slot) {
   if (slot === "municipality") return "Voor welke gemeente geldt dit?";
@@ -90,20 +88,60 @@ function askForMissing(missingSlots) {
   const slots = (missingSlots || []).filter(Boolean);
   if (!slots.length) return null;
   if (slots.length === 1) return questionForSlot(slots[0]);
-  // max 2 vragen tegelijk
   const two = slots.slice(0, 2).map(questionForSlot);
-  return `Ik heb nog ${two.length} korte vraag${two.length === 1 ? "" : "en"}:\n- ${two.join("\n- ")}`;
+  return `Ik heb nog ${two.length} korte vragen:\n- ${two.join("\n- ")}`;
 }
 
 function hasMeaningfulDetail(s) {
   const t = (s || "").trim();
   if (!t) return false;
   if (t.length < 3) return false;
-  // antwoorden zoals "?" of "geen idee" of "organisatie?" tellen niet
-  const bad = ["?", "geen idee", "weet ik niet", "idk", "organisatie?", "organisatie", "context", "wat is dit"];
   const lc = normalize(t);
-  if (bad.some(b => lc === b || lc.includes(b))) return false;
+  const badExact = new Set(["?", "??", "geen idee", "weet ik niet", "idk", "organisatie?", "organisatie", "context", "wat is dit", "geen"]);
+  if (badExact.has(lc)) return false;
+  if (lc.includes("geen idee") || lc.includes("weet ik niet")) return false;
+  if (lc === "?" || lc === "??") return false;
   return true;
+}
+
+/* ================================
+   ABSOLUTE BAN: WABO (nooit tonen)
+   - We bannen op titel en op identifier patroon
+   - Je hoeft geen BWBR-id te kennen: Wabo komt er niet doorheen.
+================================ */
+function isBannedWaboLike(item) {
+  const title = normalize(item?.title || "");
+  const id = normalize(item?.id || "");
+  if (title.includes("wabo")) return true;
+  if (title.includes("wet algemene bepalingen omgevingsrecht")) return true;
+  // extra vangnet (soms staat Wabo in metadata/titelvariant)
+  if (title.includes("algemene bepalingen omgevingsrecht")) return true;
+  if (id.includes("wabo")) return true;
+  return false;
+}
+
+/* ================================
+   Actualiteit/voorkeur (Omgevingswet-stelsel)
+   - Boost op TITEL (want IDs kunnen wijzigen/unknown)
+================================ */
+function actualLawBoostByTitle(title) {
+  const t = normalize(title || "");
+  let boost = 0;
+
+  // Omgevingswet-stelsel (hoogste prioriteit)
+  if (t.includes("omgevingswet")) boost += 7;
+  if (t.includes("invoeringswet omgevingswet")) boost += 5;
+  if (t.includes("omgevingsbesluit")) boost += 5;
+  if (t.includes("besluit bouwwerken leefomgeving")) boost += 6; // Bbl
+  if (t.includes("besluit kwaliteit leefomgeving")) boost += 6;  // Bkl
+  if (t.includes("besluit activiteiten leefomgeving")) boost += 5; // Bal
+
+  // Minder maar relevant
+  if (t.includes("omgevingsplan")) boost += 2;
+  if (t.includes("buitenplanse")) boost += 2;
+  if (t.includes("bouwactiviteit")) boost += 1;
+
+  return boost;
 }
 
 /* ================================
@@ -118,18 +156,18 @@ ${JSON.stringify(known || {}, null, 2)}
 
 Geef JSON met:
 - scope: "municipal" | "national" | "unknown"
-- municipality: string|null (mag ook uit bekende context komen)
+- municipality: string|null (mag uit bekende context komen)
 - query_terms: array<string> (3-10)
 - include_terms: array<string> (0-10)
 - exclude_terms: array<string> (0-15) -> alleen ruis t.o.v. deze vraag; NIET als gebruiker het expliciet noemt
 - is_too_vague: boolean
-- missing_slots: array<string> (alleen uit deze set: ["municipality","terrace_type","location_hint"])
+- missing_slots: array<string> (alleen uit: ["municipality","terrace_type","location_hint"])
 - clarification_questions: array<string> (max 2)
 
-Regels:
+Belangrijk:
 - Als municipality al bekend is: zet missing_slots NIET op municipality.
 - Stel missing_slots alleen als echt nodig voor bronselectie.
-- Als de vraag "terras" bevat en scope is municipal: missing_slots mag terrace_type/location_hint bevatten, maar alleen als vraag te vaag is.
+- Noem Wabo NIET als relevante wetgeving (Omgevingswet is het actuele stelsel).
 
 Vraag:
 """${q}"""
@@ -166,10 +204,8 @@ Vraag:
     const scope = ["municipal", "national", "unknown"].includes(data.scope) ? data.scope : "unknown";
     const municipality = data.municipality ? String(data.municipality).trim() : (known?.municipality || null);
 
-    // only allow these slots
     const allowedSlots = new Set(["municipality", "terrace_type", "location_hint"]);
     let missing = arr(data.missing_slots).filter(s => allowedSlots.has(s));
-
     if (municipality) missing = missing.filter(s => s !== "municipality");
 
     return {
@@ -247,14 +283,13 @@ Antwoord:
 }
 
 /* ================================
-   Scoring
+   Scoring (incl. actualiteit + Wabo-ban)
 ================================ */
 function scoreSources({ sources, q, queryTerms, includeTerms, excludeTerms, scope }) {
   const qLc = normalize(q);
   const pos = [...new Set([...queryTerms, ...includeTerms].map(normalize).filter(Boolean))];
-  // penalties only if term NOT mentioned in user question
+  // penalty alleen als term NIET in user vraag staat
   const neg = [...new Set((excludeTerms || []).map(normalize).filter(Boolean))].filter(t => t && !qLc.includes(t));
-
   const genericNoise = ["jaarverslag", "jaarrekening", "aanbested", "subsidieplafond", "inspraakreactie"];
 
   const typeBoost = (type) => {
@@ -269,6 +304,9 @@ function scoreSources({ sources, q, queryTerms, includeTerms, excludeTerms, scop
   };
 
   function scoreOne(s) {
+    // ABSOLUTE BAN
+    if (isBannedWaboLike(s)) return -9999;
+
     const title = normalize(s?.title || "");
     let score = 0;
 
@@ -281,13 +319,17 @@ function scoreSources({ sources, q, queryTerms, includeTerms, excludeTerms, scop
 
     for (const n of genericNoise) if (title.includes(n) && !qLc.includes(n)) score -= 1.2;
 
+    // Actualiteit: Omgevingswet-stelsel naar boven
+    score += actualLawBoostByTitle(s.title);
+
     score += typeBoost(s.type);
     return score;
   }
 
   const scored = (sources || []).map(s => ({ ...s, _score: scoreOne(s) }));
   scored.sort((a, b) => (b._score || 0) - (a._score || 0));
-  return scored;
+  // filter Wabo er echt uit
+  return scored.filter(x => x._score > -9990);
 }
 
 function computeConfidence(scoredSources) {
@@ -299,7 +341,7 @@ function computeConfidence(scoredSources) {
 }
 
 /* ================================
-   SRU search
+   SRU search: CVDR / OEP
 ================================ */
 async function cvdrSearch({ municipalityName, cqlTopic, fetchWithTimeout }) {
   const base = "https://zoekdienst.overheid.nl/sru/Search";
@@ -328,6 +370,7 @@ async function cvdrSearch({ municipalityName, cqlTopic, fetchWithTimeout }) {
     const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
 
     const items = ids.map((id, i) => ({
+      id,
       title: titles[i] || id,
       link: `https://lokaleregelgeving.overheid.nl/${id}`,
       type: "CVDR"
@@ -359,6 +402,7 @@ async function oepSearch({ municipalityName, cqlTopic, fetchWithTimeout }) {
   const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
 
   const items = ids.map((id, i) => ({
+    id,
     title: titles[i] || id,
     link: `https://zoek.officielebekendmakingen.nl/${id}.html`,
     type: "OEP (Gemeenteblad)"
@@ -367,32 +411,63 @@ async function oepSearch({ municipalityName, cqlTopic, fetchWithTimeout }) {
   return dedupeByLink(items);
 }
 
+/* ================================
+   SRU search: BWB (ACTUEEL + fallback)
+   - Eerst proberen met status=geldend (als SRU dit accepteert)
+   - Als dat 0 oplevert: fallback zonder statusfilter
+   - Altijd: Wabo hard-banned + Omgevingswet-stelsel boosted in scoring
+================================ */
 async function bwbSearch({ q, cqlTopic, fetchWithTimeout }) {
   const base = "https://zoekservice.overheid.nl/sru/Search";
-  const query = cqlTopic
+
+  // query-deel voor inhoud
+  const contentQuery = cqlTopic
     ? `(overheidbwb.titel any "${q}") OR (overheidbwb.titel any "${cqlTopic}")`
     : `overheidbwb.titel any "${q}"`;
 
-  const url =
-    `${base}?version=1.2&operation=searchRetrieve&x-connection=BWB` +
-    `&maximumRecords=12&startRecord=1` +
-    `&query=${encodeURIComponent(query)}`;
+  // poging 1: met "status geldend" (als ondersteund)
+  const tryQueries = [
+    // Let op: als dit veld niet wordt ondersteund, kan het 0 resultaten geven; daarom fallback hieronder.
+    `(${contentQuery}) AND (overheidbwb.status="geldend" OR overheidbwb.status="Geldend")`,
+    `(${contentQuery})`
+  ];
 
-  const resp = await fetchWithTimeout(url, {}, 15000);
-  const xml = await resp.text();
+  let allItems = [];
 
-  const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
-  const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
+  for (const query of tryQueries) {
+    const url =
+      `${base}?version=1.2&operation=searchRetrieve&x-connection=BWB` +
+      `&maximumRecords=18&startRecord=1` +
+      `&query=${encodeURIComponent(query)}`;
 
-  return dedupeByLink(ids.map((id, i) => ({
-    title: titles[i] || id,
-    link: `https://wetten.overheid.nl/${id}`,
-    type: "BWB"
-  })));
+    const resp = await fetchWithTimeout(url, {}, 15000);
+    const xml = await resp.text();
+
+    const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
+    const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
+
+    const items = ids.map((id, i) => ({
+      id,
+      title: titles[i] || id,
+      link: `https://wetten.overheid.nl/${id}`,
+      type: "BWB"
+    }));
+
+    const uniq = dedupeByLink(items);
+    // wabo eruit
+    const cleaned = uniq.filter(x => !isBannedWaboLike(x));
+
+    if (cleaned.length) {
+      allItems = cleaned;
+      break;
+    }
+  }
+
+  return allItems;
 }
 
 /* ================================
-   Handler
+   MAIN HANDLER
 ================================ */
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "https://app.beleidsbank.nl");
@@ -429,7 +504,7 @@ export default async function handler(req, res) {
 
   try {
     // -----------------------------
-    // 0) Slot filling (stop loops + stop "context")
+    // 0) Slot filling (stop loops)
     // -----------------------------
     let known = {}; // municipality/terrace_type/location_hint
 
@@ -440,8 +515,6 @@ export default async function handler(req, res) {
       const missingSlots = pending.missingSlots || [];
       const collected = pending.collected || {};
       const attempts = Number.isFinite(pending.attempts) ? pending.attempts : 0;
-
-      // If user keeps replying unhelpfully, stop asking and proceed best-effort after 3 asks
       const MAX_ATTEMPTS = 3;
 
       const extracted = await extractSlotsWithAI({
@@ -451,15 +524,13 @@ export default async function handler(req, res) {
         fetchWithTimeout
       });
 
-      // Strong fallbacks
+      // Fallbacks
       if (missingSlots.includes("municipality") && !extracted?.municipality && looksLikeMunicipality(q)) {
         extracted.municipality = q.trim();
       }
-      // If we asked for terrace_type and user says "Restaurant" or similar, accept as terrace_type
       if (missingSlots.includes("terrace_type") && !extracted?.terrace_type && hasMeaningfulDetail(q)) {
         extracted.terrace_type = q.trim();
       }
-      // If we asked for location_hint and user says "openbare ruimte" / "eigen terrein" / straat, accept as location_hint
       if (missingSlots.includes("location_hint") && !extracted?.location_hint && hasMeaningfulDetail(q)) {
         extracted.location_hint = q.trim();
       }
@@ -485,14 +556,14 @@ export default async function handler(req, res) {
         });
       }
 
-      // Either complete OR too many attempts: proceed best-effort with what we have
+      // compleet óf te veel pogingen: proceed best-effort
       known = { ...collected };
       q = pending.originalQuestion;
       pendingStore.delete(sessionId);
     }
 
     // -----------------------------
-    // 1) AI analysis (with known context)
+    // 1) AI analysis (with known)
     // -----------------------------
     const analysis = await analyzeQuestionWithAI({
       q,
@@ -505,32 +576,24 @@ export default async function handler(req, res) {
     const municipality = analysis.municipality || known.municipality || null;
 
     // -----------------------------
-    // 2) Decide if we must ask follow-ups
-    //    Key change: do NOT ask generic "context"; ask only concrete slots,
-    //    and do not loop if user already gave terrace_type.
+    // 2) Determine missing slots (robust)
     // -----------------------------
     const qLc = normalize(q);
     const mentionsTerras = qLc.includes("terras") || qLc.includes("terrassen");
 
-    // Determine missing slots ourselves (robust, avoids AI re-asking)
     let missingSlots = [];
 
     if (scope === "municipal" && !municipality) missingSlots.push("municipality");
 
-    // Only ask terrace_type/location_hint if the question is about terraces AND truly needed.
-    // If user already provided terrace_type earlier, don't ask again.
     const terraceTypeKnown = !!(known.terrace_type && hasMeaningfulDetail(known.terrace_type));
     const locationKnown = !!(known.location_hint && hasMeaningfulDetail(known.location_hint));
 
     if (scope === "municipal" && mentionsTerras) {
       if (!terraceTypeKnown) missingSlots.push("terrace_type");
-      // location is helpful but not mandatory; ask only if we still have room (and question is vague)
-      // We interpret vague as: very short question + no terrace_type known
       const veryShort = q.trim().split(/\s+/).filter(Boolean).length <= 4;
       if (veryShort && !locationKnown) missingSlots.push("location_hint");
     }
 
-    // If we have at least municipality + terrace_type, proceed without more questions
     const haveEnoughForTerras = scope === "municipal" && mentionsTerras && municipality && (terraceTypeKnown || hasMeaningfulDetail(q));
 
     if (!haveEnoughForTerras && missingSlots.length) {
@@ -548,16 +611,30 @@ export default async function handler(req, res) {
 
     // -----------------------------
     // 3) Build search terms
-    //    If we have known terrace_type/location_hint, inject them into terms to improve retrieval.
+    //   - extra injection: Omgevingswet-stelsel bij omgevingsplan/bouwactiviteit
     // -----------------------------
-    const terms = [
-      ...analysis.query_terms,
-      ...analysis.include_terms
-    ];
+    const terms = [...analysis.query_terms, ...analysis.include_terms];
 
+    // context injecties
     if (known.terrace_type && hasMeaningfulDetail(known.terrace_type)) terms.push(known.terrace_type);
     if (known.location_hint && hasMeaningfulDetail(known.location_hint)) terms.push(known.location_hint);
     if (municipality) terms.push(municipality);
+
+    // omgevingswet boost injectie (zonder Wabo!)
+    const likelyOmgevingswet =
+      qLc.includes("omgevingsplan") ||
+      qLc.includes("buitenplanse") ||
+      qLc.includes("bouwactiviteit") ||
+      qLc.includes("omgevingsvergunning") ||
+      qLc.includes("bopa");
+
+    if (likelyOmgevingswet) {
+      terms.push("Omgevingswet");
+      terms.push("Omgevingsbesluit");
+      terms.push("Besluit bouwwerken leefomgeving");
+      terms.push("Besluit kwaliteit leefomgeving");
+      terms.push("Besluit activiteiten leefomgeving");
+    }
 
     const cqlTopic = buildCqlFromTerms(terms);
 
@@ -572,7 +649,7 @@ export default async function handler(req, res) {
       sources = await bwbSearch({ q, cqlTopic: analysis.query_terms.join(" "), fetchWithTimeout });
     }
 
-    sources = dedupeByLink(sources);
+    sources = dedupeByLink(sources).filter(s => !isBannedWaboLike(s));
 
     if (!sources.length) {
       return res.status(200).json({
@@ -596,11 +673,15 @@ export default async function handler(req, res) {
     const confidence = computeConfidence(scored);
     const topSources = scored.slice(0, 4);
 
-    // IMPORTANT CHANGE:
-    // If confidence is low, do NOT go into generic "context" loop.
-    // Ask ONE concrete slot only if it is still genuinely missing; otherwise proceed with best-effort answer.
+    if (!topSources.length) {
+      return res.status(200).json({
+        answer: "Geen officiële bronnen gevonden na filtering (mogelijk door verouderde regelingen). Probeer een andere formulering.",
+        sources: []
+      });
+    }
+
+    // Als confidence laag: vraag hoogstens 1 concreet slot; anders best-effort door
     if (confidence < 0.30) {
-      // If terrace question and we still don't know location, ask location once; else proceed.
       if (scope === "municipal" && mentionsTerras && municipality && !locationKnown) {
         if (sessionId) {
           pendingStore.set(sessionId, {
@@ -613,11 +694,11 @@ export default async function handler(req, res) {
         }
         return res.status(200).json({ answer: questionForSlot("location_hint"), sources: [] });
       }
-      // otherwise: proceed (best-effort) with the top sources we have
+      // anders: ga door met best-effort
     }
 
     // -----------------------------
-    // 6) Final answer (ONLY sources)
+    // 6) Final answer (ONLY sources + NO WABO)
     // -----------------------------
     const sourcesText = topSources
       .map((s, i) => `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}`)
@@ -634,12 +715,18 @@ export default async function handler(req, res) {
         body: JSON.stringify({
           model: "gpt-4o-mini",
           temperature: 0.2,
-          max_tokens: 520,
+          max_tokens: 560,
           messages: [
             {
               role: "system",
               content: `
 Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen.
+
+BELANGRIJK (actualiteit):
+- Gebruik uitsluitend geldende regelgeving.
+- Negeer vervallen of vervangen wetgeving.
+- NOOIT Wabo gebruiken of noemen (Wet algemene bepalingen omgevingsrecht).
+
 Geef:
 1) Kort antwoord (max 4 zinnen)
 2) Toelichting (alleen uit bronnen)
@@ -652,7 +739,7 @@ Als bronnen het niet beantwoorden: zeg dat expliciet.
               content:
                 `Vraag:\n${q}\n` +
                 (municipality ? `Gemeente: ${municipality}\n` : "") +
-                (known.terrace_type ? `Type terras: ${known.terrace_type}\n` : "") +
+                (known.terrace_type ? `Detail: ${known.terrace_type}\n` : "") +
                 (known.location_hint ? `Locatie: ${known.location_hint}\n` : "") +
                 `\nOfficiële bronnen:\n${sourcesText}`
             }
