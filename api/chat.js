@@ -1,7 +1,7 @@
 // /api/chat.js
 
 const rateStore = new Map();
-const pendingStore = new Map(); 
+const pendingStore = new Map();
 // sessionId -> { originalQuestion, missingSlots:[], collected:{}, createdAt, attempts }
 
 function rateLimit(ip, limit = 10, windowMs = 60000) {
@@ -61,7 +61,7 @@ function hasMeaningfulDetail(s) {
   if (!t) return false;
   if (t.length < 3) return false;
   const lc = normalize(t);
-  const badExact = new Set(["?", "??", "geen idee", "weet ik niet", "idk", "geen", "nvt"]);
+  const badExact = new Set(["?", "??", "geen idee", "weet ik niet", "idk", "geen", "nvt", "organisatie?", "context"]);
   if (badExact.has(lc)) return false;
   if (lc.includes("geen idee") || lc.includes("weet ik niet")) return false;
   return true;
@@ -86,11 +86,14 @@ function removeBanned(items) {
   return (items || []).filter(x => !isBannedSource(x));
 }
 
+/* ================================
+   Follow-up prompts
+================================ */
 function questionForSlot(slot) {
   if (slot === "municipality") return "Voor welke gemeente geldt dit?";
   if (slot === "terrace_type") return "Wat voor soort terras bedoelt u? (bijv. bij restaurant, tijdelijk, op stoep/plein, op eigen terrein)";
   if (slot === "location_hint") return "Gaat het om openbare ruimte of eigen terrein? (eventueel straat/gebied)";
-  if (slot === "topic_hint") return "Over welk onderwerp gaat het precies? (bijv. bouwen, milieu, APV/handhaving, subsidies, onderwijs, verkeer)";
+  if (slot === "topic_hint") return "Waar gaat uw vraag precies over? (bv. bouwen, milieu, handhaving, subsidies, onderwijs, verkeer)";
   return "Kunt u dit iets specifieker maken?";
 }
 
@@ -103,20 +106,45 @@ function askForMissing(missingSlots) {
 }
 
 /* ================================
-   Heuristics: when to ask follow-ups
+   Scope detection (fixed)
 ================================ */
-function isLikelyMunicipalQuestion(qLc) {
+function isLegalBasisQuestion(qLc) {
+  return (
+    qLc.includes("op grond van welke") ||
+    qLc.includes("welke bepaling") ||
+    qLc.includes("welk artikel") ||
+    qLc.includes("juridische grondslag") ||
+    qLc.includes("bevoegdheid") ||
+    qLc.includes("grondslag") ||
+    qLc.includes("vereist") && (qLc.includes("omgevingsvergunning") || qLc.includes("vergunning")) ||
+    qLc.includes("vergunningplicht")
+  );
+}
+
+function isExplicitMunicipalTopic(qLc) {
   return (
     qLc.includes("apv") ||
+    qLc.includes("algemene plaatselijke verordening") ||
     qLc.includes("terras") ||
+    qLc.includes("terrassen") ||
     qLc.includes("standplaats") ||
-    qLc.includes("evenement") ||
+    qLc.includes("evenementenvergunning") ||
     qLc.includes("parkeervergunning") ||
     qLc.includes("horeca") ||
-    qLc.includes("omgevingsvergunning") ||
-    qLc.includes("omgevingsplan") ||
-    qLc.includes("bouw") ||
-    qLc.includes("handhaving")
+    qLc.includes("sluitingstijden") ||
+    qLc.includes("handhaving") && qLc.includes("gemeente") ||
+    qLc.includes("gemeentelijke verordening") ||
+    qLc.includes("beleidsregel") && qLc.includes("gemeente")
+  );
+}
+
+function isOmgevingsplanLocalInterpretationQuestion(qLc) {
+  // Local interpretation questions about what the municipal plan says in a place/area.
+  return (
+    (qLc.includes("wat staat er in") && qLc.includes("omgevingsplan")) ||
+    (qLc.includes("regels") && qLc.includes("omgevingsplan") && (qLc.includes("amsterdam") || qLc.includes("gemeente"))) ||
+    (qLc.includes("omgevingsplan") && (qLc.includes("locatie") || qLc.includes("adres") || qLc.includes("gebied") || qLc.includes("perceel"))) ||
+    (qLc.includes("omgevingsplan") && qLc.includes("van de gemeente"))
   );
 }
 
@@ -129,6 +157,22 @@ function isTooVagueGeneral(q) {
   if (words.length <= 3) return true;
   if ((q || "").trim().length < 18) return true;
   return false;
+}
+
+function decideScope(q, municipalityKnown) {
+  const qLc = normalize(q);
+
+  // If it asks for legal basis / permit requirement / which provision => NATIONAL (even if a municipality is mentioned)
+  if (isLegalBasisQuestion(qLc)) return "national";
+
+  // Explicit municipal topics => MUNICIPAL (ask municipality if missing)
+  if (isExplicitMunicipalTopic(qLc)) return "municipal";
+
+  // Omgevingsplan can be municipal only when it is clearly about local plan contents at a location/area
+  if (isOmgevingsplanLocalInterpretationQuestion(qLc)) return "municipal";
+
+  // Otherwise default to national (covers "wet/regeling" type questions)
+  return "national";
 }
 
 /* ================================
@@ -158,8 +202,8 @@ async function cvdrSearch({ municipalityName, topicWords, fetchWithTimeout }) {
   ];
 
   for (const creator of creatorsToTry) {
-    // Keep it simple: keyword all supports OR inside quoted query poorly; we use separate OR groups.
-    const cql = `(dcterms.creator="${creator}") AND (keyword all "${topicWords.replaceAll('"', "")}")`;
+    const safeTopic = topicWords.replaceAll('"', "");
+    const cql = `(dcterms.creator="${creator}") AND (keyword all "${safeTopic}")`;
 
     const url =
       `${base}?version=1.2` +
@@ -221,8 +265,8 @@ async function oepSearch({ municipalityName, topicWords, fetchWithTimeout }) {
 }
 
 /* ================================
-   SRU search: BWB (robust, not over-strict)
-   - Pass 1: prefer Omgevingswet-stelsel titles (for omgevingsplan/vergunning questions)
+   SRU search: BWB (robust)
+   - Pass 1: prefer Omgevingswet-stelsel titles for omgevingsplan/vergunning questions
    - Pass 2: generic title search on question
    - Always hard-filter Wabo afterwards
 ================================ */
@@ -241,7 +285,6 @@ async function bwbSearch({ q, preferOmgevingsStelsel, fetchWithTimeout }) {
 
     const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
 
-    // Some SRU responses use dcterms:title, others overheidbwb:titel. Try both.
     const titlesA = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
     const titlesB = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
     const titles = titlesA.length ? titlesA : titlesB;
@@ -257,9 +300,6 @@ async function bwbSearch({ q, preferOmgevingsStelsel, fetchWithTimeout }) {
     return items;
   };
 
-  // NOTE: Do NOT rely on uncertain SRU fields like geldigheidsdatum here; that was causing 0 results in practice.
-  // We will enforce "no Wabo" via hard filter + prompt, and prefer Omgevingswet-stelsel via pass 1.
-
   if (preferOmgevingsStelsel) {
     const preferred = [
       `overheidbwb.titel any "Omgevingswet"`,
@@ -270,7 +310,6 @@ async function bwbSearch({ q, preferOmgevingsStelsel, fetchWithTimeout }) {
       `overheidbwb.titel any "Invoeringswet Omgevingswet"`
     ].join(" OR ");
 
-    // Also allow “titel any” matches on key words from question
     const qPart = safeQ ? ` OR (overheidbwb.titel any "${safeQ}")` : "";
     const cql1 = `(${preferred}${qPart})`;
 
@@ -278,12 +317,10 @@ async function bwbSearch({ q, preferOmgevingsStelsel, fetchWithTimeout }) {
     if (res1.length) return res1;
   }
 
-  // Generic fallback: title search by question
   const cql2 = `overheidbwb.titel any "${safeQ}"`;
   const res2 = await run(cql2);
   if (res2.length) return res2;
 
-  // Broader fallback: keywords from question
   const words = normalize(q).split(/\s+/).filter(w => w.length >= 6).slice(0, 6);
   if (words.length) {
     const cql3 = words.map(w => `overheidbwb.titel any "${w}"`).join(" OR ");
@@ -295,50 +332,49 @@ async function bwbSearch({ q, preferOmgevingsStelsel, fetchWithTimeout }) {
 }
 
 /* ================================
-   Source ranking (lightweight)
+   Ranking
 ================================ */
-function scoreSource({ s, qLc }) {
+function scoreSource({ s, qLc, scope }) {
   if (isBannedSource(s)) return -9999;
   const t = normalize(s?.title || "");
   let score = 0;
 
-  // Prefer Omgevingswet-stelsel
   if (t.includes("omgevingswet")) score += 10;
   if (t.includes("omgevingsbesluit")) score += 7;
   if (t.includes("besluit bouwwerken leefomgeving")) score += 9;
   if (t.includes("besluit kwaliteit leefomgeving")) score += 9;
   if (t.includes("besluit activiteiten leefomgeving")) score += 8;
 
-  // Match question keywords
   const kw = qLc.split(/\s+/).filter(w => w.length >= 5).slice(0, 10);
   for (const w of kw) if (t.includes(w)) score += 0.7;
 
-  // Prefer municipal CVDR for municipal scope, BWB for national
-  if (s.type === "CVDR") score += 2.5;
-  if (s.type === "BWB") score += 2.0;
+  if (scope === "municipal") {
+    if (s.type === "CVDR") score += 2.8;
+    if ((s.type || "").toLowerCase().includes("gemeenteblad")) score += 1.2;
+  } else {
+    if (s.type === "BWB") score += 2.4;
+  }
 
   return score;
 }
 
-function rankSources(sources, q) {
+function rankSources(sources, q, scope) {
   const qLc = normalize(q);
-  const scored = (sources || []).map(s => ({ ...s, _score: scoreSource({ s, qLc }) }));
+  const scored = (sources || []).map(s => ({ ...s, _score: scoreSource({ s, qLc, scope }) }));
   scored.sort((a, b) => (b._score || 0) - (a._score || 0));
   return scored.filter(x => x._score > -9990);
 }
 
 /* ================================
-   MAIN HANDLER (SINGLE EXPORT)
+   MAIN HANDLER
 ================================ */
 export default async function handler(req, res) {
   // --- CORS / PREFLIGHT MUST BE FIRST ---
   const origin = (req.headers.origin || "").toString();
 
-  // Allow only production app origin (your test environment)
   if (origin === "https://app.beleidsbank.nl") {
     res.setHeader("Access-Control-Allow-Origin", origin);
   } else {
-    // Still return something safe; Safari preflight expects headers
     res.setHeader("Access-Control-Allow-Origin", "https://app.beleidsbank.nl");
   }
 
@@ -370,7 +406,7 @@ export default async function handler(req, res) {
 
   try {
     // -----------------------------
-    // 0) Follow-up slot flow (NO extra OpenAI calls)
+    // 0) Follow-up slot flow
     // -----------------------------
     const pending = sessionId ? pendingStore.get(sessionId) : null;
     const fresh = pending && (Date.now() - pending.createdAt) < 7 * 60 * 1000;
@@ -380,26 +416,22 @@ export default async function handler(req, res) {
       collected = { ...(pending.collected || {}) };
       const missing = pending.missingSlots || [];
 
-      // Heuristic extraction
       if (missing.includes("municipality") && looksLikeMunicipality(q)) {
         collected.municipality = q.trim();
       }
 
       if (missing.includes("terrace_type") && !collected.terrace_type) {
-        if (normalize(q).includes("restaurant") || normalize(q).includes("horeca")) collected.terrace_type = q.trim();
+        if (hasMeaningfulDetail(q)) collected.terrace_type = q.trim();
       }
 
       if (missing.includes("location_hint") && !collected.location_hint) {
-        if (normalize(q).includes("openbare") || normalize(q).includes("stoep") || normalize(q).includes("eigen terrein")) {
-          collected.location_hint = q.trim();
-        }
+        if (hasMeaningfulDetail(q)) collected.location_hint = q.trim();
       }
 
       if (missing.includes("topic_hint") && !collected.topic_hint) {
         if (hasMeaningfulDetail(q)) collected.topic_hint = q.trim();
       }
 
-      // Determine remaining
       const stillMissing = [];
       for (const slot of missing) {
         if (slot === "municipality" && !collected.municipality) stillMissing.push("municipality");
@@ -419,40 +451,37 @@ export default async function handler(req, res) {
         return res.status(200).json({ answer: askForMissing(stillMissing), sources: [] });
       }
 
-      // Use the original question now
       q = pending.originalQuestion;
       pendingStore.delete(sessionId);
     }
 
     const qLc = normalize(q);
+    const municipality = collected.municipality || null;
 
     // -----------------------------
-    // 1) Decide scope + ask clarifying questions
+    // 1) Decide scope (FIXED)
     // -----------------------------
-    const municipalLike = isLikelyMunicipalQuestion(qLc);
-    const terraceLike = isTerraceQuestion(qLc);
+    const scope = decideScope(q, !!municipality);
 
-    let municipality = collected.municipality || null;
+    // Ask municipality only if scope is municipal and municipality missing
+    if (scope === "municipal" && !municipality) {
+      const need = ["municipality", ...(isTerraceQuestion(qLc) ? ["terrace_type"] : [])];
 
-    // For municipal-like questions, ensure municipality
-    if (municipalLike && !municipality) {
       if (sessionId) {
         pendingStore.set(sessionId, {
           originalQuestion: q,
-          missingSlots: ["municipality", ...(terraceLike ? ["terrace_type"] : [])],
+          missingSlots: need,
           collected: { ...collected },
           createdAt: Date.now(),
           attempts: 0
         });
       }
-      return res.status(200).json({
-        answer: askForMissing(["municipality", ...(terraceLike ? ["terrace_type"] : [])]),
-        sources: []
-      });
+
+      return res.status(200).json({ answer: askForMissing(need), sources: [] });
     }
 
-    // For very vague questions (not clearly municipal), ask topic hint (keeps it generic for all questions)
-    if (!municipalLike && isTooVagueGeneral(q) && !collected.topic_hint) {
+    // If national scope but question is too vague, ask topic hint (generic)
+    if (scope === "national" && isTooVagueGeneral(q) && !collected.topic_hint) {
       if (sessionId) {
         pendingStore.set(sessionId, {
           originalQuestion: q,
@@ -470,10 +499,8 @@ export default async function handler(req, res) {
     // -----------------------------
     let sources = [];
 
-    if (municipalLike && municipality) {
-      // Municipal search strategy
-      // For terraces: try APV + terrace terms first
-      if (terraceLike) {
+    if (scope === "municipal" && municipality) {
+      if (isTerraceQuestion(qLc)) {
         const topic1 = "algemene plaatselijke verordening APV terras terrassen horeca";
         sources = await cvdrSearch({ municipalityName: municipality, topicWords: topic1, fetchWithTimeout });
 
@@ -487,7 +514,6 @@ export default async function handler(req, res) {
           sources = await oepSearch({ municipalityName: municipality, topicWords: topic3, fetchWithTimeout });
         }
       } else {
-        // Generic municipal: search with the question keywords
         const topic = (collected.topic_hint && hasMeaningfulDetail(collected.topic_hint))
           ? `${collected.topic_hint} ${q}`
           : q;
@@ -496,7 +522,6 @@ export default async function handler(req, res) {
         if (!sources.length) sources = await oepSearch({ municipalityName: municipality, topicWords: topic, fetchWithTimeout });
       }
     } else {
-      // National (BWB)
       const preferOmgevingsStelsel =
         qLc.includes("omgevingsplan") ||
         qLc.includes("buitenplanse") ||
@@ -505,7 +530,6 @@ export default async function handler(req, res) {
         qLc.includes("bopa") ||
         qLc.includes("tijdelijk afwijken");
 
-      // Enrich with topic_hint if present
       const q2 = (collected.topic_hint && hasMeaningfulDetail(collected.topic_hint))
         ? `${q} ${collected.topic_hint}`
         : q;
@@ -514,18 +538,18 @@ export default async function handler(req, res) {
     }
 
     sources = removeBanned(dedupeByLink(sources));
-    sources = rankSources(sources, q).slice(0, 4).map(({ _score, ...s }) => s);
+    sources = rankSources(sources, q, scope).slice(0, 4).map(({ _score, ...s }) => s);
 
     if (!sources.length) {
       return res.status(200).json({
         answer:
-          "Geen officiële bronnen gevonden. Probeer iets specifieker te formuleren (bijv. relevante kernbegrippen of, bij gemeentelijke vragen, de gemeente).",
+          "Geen officiële bronnen gevonden. Probeer iets specifieker te formuleren (relevante kernbegrippen of, bij gemeentelijke vragen, de gemeente).",
         sources: []
       });
     }
 
     // -----------------------------
-    // 3) Ask OpenAI to answer ONLY from provided sources
+    // 3) Answer ONLY from provided sources
     // -----------------------------
     const sourcesText = sources
       .map((s, i) => `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}`)
@@ -582,19 +606,16 @@ Geef GEEN aparte bronnenlijst.
     let answer = aiData?.choices?.[0]?.message?.content?.trim() || "Geen antwoord gegenereerd.";
     answer = stripSourcesFromAnswer(answer);
 
-    // Absolute failsafe
     const ansLc = normalize(answer);
     if (ansLc.includes("wabo") || ansLc.includes("wet algemene bepalingen omgevingsrecht")) {
       answer = "Ik kan dit niet beantwoorden op basis van de aangeleverde bronnen (Wabo is niet toegestaan) en er staat geen expliciete actuele bepaling in de bronvermelding.";
     }
 
-    // Never return banned sources
     sources = removeBanned(sources);
 
     return res.status(200).json({ answer, sources });
 
   } catch (e) {
-    // Return real-ish info without leaking internals
     return res.status(500).json({ error: "Interne fout" });
   }
 }
