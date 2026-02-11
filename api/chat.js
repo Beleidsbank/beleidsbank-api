@@ -179,9 +179,9 @@ export default async function handler(req, res) {
     // -----------------------------
     // Zoekvolgorde
     // -----------------------------
-    let picked = await cvdrSearch();
-    if (!picked) picked = await oepSearch();
-    if (!picked) picked = await bwbSearch();
+    let picked = await oepSearch();
+if (!picked) picked = await bwbSearch();
+
 
     if (!picked) {
       return res.status(200).json({
