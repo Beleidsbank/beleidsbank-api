@@ -1,17 +1,18 @@
+// -----------------------------
+// Rate limiter + session store
+// -----------------------------
 const rateStore = new Map();
 
-// Bewaar "openstaande vraag" per IP (best-effort op serverless)
-const pendingStore = new Map(); // ip -> { question, type, createdAt }
+// Pending per session (niet per IP). Best-effort; maar stabieler omdat client dezelfde session_id stuurt.
+const pendingStore = new Map(); // sessionId -> { question, type, createdAt }
 
 function rateLimit(ip, limit = 10, windowMs = 60000) {
   const now = Date.now();
   const item = rateStore.get(ip) || { count: 0, resetAt: now + windowMs };
-
   if (now > item.resetAt) {
     item.count = 0;
     item.resetAt = now + windowMs;
   }
-
   item.count++;
   rateStore.set(ip, item);
   return item.count <= limit;
@@ -20,20 +21,48 @@ function rateLimit(ip, limit = 10, windowMs = 60000) {
 function looksLikeMunicipality(text) {
   const t = (text || "").trim();
   if (!t) return false;
-
-  // max 3 woorden, geen rare tekens, niet te lang
   const words = t.split(/\s+/).filter(Boolean);
   if (words.length > 3) return false;
   if (t.length > 40) return false;
-  if (!/^[\p{L}\s.'-]+$/u.test(t)) return false; // alleen letters/spaties/.-'
-  // minimaal 2 letters
+  if (!/^[\p{L}\s.'-]+$/u.test(t)) return false;
   if (t.replace(/\s+/g, "").length < 2) return false;
-
   return true;
 }
 
+function normalize(s) {
+  return (s || "").toLowerCase();
+}
+
+function extractSearchTermsNL(q) {
+  const text = normalize(q).replace(/[^\p{L}\p{N}\s]/gu, " ");
+  const stop = new Set([
+    "mag","ik","een","de","het","dit","dat","voor","van","in","op","aan","bij","naar",
+    "hoe","wat","waar","wanneer","welke","welk","kan","kun","moet","mogen","plaats","plaatsen",
+    "gemeente","geldt","betreft","regels","regel","vergunning","aanvragen","nodig","onder","voorwaarden",
+    "is","zijn","worden","wordt","ook","nog","dan","als","met","zonder","en","of"
+  ]);
+  const words = text.split(/\s+/).filter(w => w.length >= 4 && !stop.has(w));
+  // Zorg dat we bij terras-vragen altijd “terras” meenemen als het voorkomt
+  const hasTerras = text.includes("terras");
+  const top = words.slice(0, 6);
+  if (hasTerras && !top.includes("terras")) top.unshift("terras");
+  return top.join(" ").trim() || (hasTerras ? "terras" : text.trim());
+}
+
+function stripSourcesFromAnswer(answer) {
+  const a = (answer || "").trim();
+  if (!a) return a;
+  // knip alles weg vanaf een "Bronnen:" kop (AI wil dat soms toch toevoegen)
+  const idx = a.toLowerCase().indexOf("\nbronnen:");
+  if (idx !== -1) return a.slice(0, idx).trim();
+  const idx2 = a.toLowerCase().indexOf("bronnen:");
+  // als bronnen: middenin staat op nieuwe regel of begin
+  if (idx2 !== -1 && (idx2 === 0 || a[idx2 - 1] === "\n")) return a.slice(0, idx2).trim();
+  return a;
+}
+
 export default async function handler(req, res) {
-  // ---------------- CORS ----------------
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "https://app.beleidsbank.nl");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -46,13 +75,17 @@ export default async function handler(req, res) {
     req.socket?.remoteAddress ||
     "unknown";
 
-  if (!rateLimit(ip)) {
-    return res.status(429).json({ error: "Too many requests" });
-  }
+  if (!rateLimit(ip)) return res.status(429).json({ error: "Too many requests" });
 
-  const { message } = req.body || {};
+  const { message, session_id } = req.body || {};
   let q = (message || "").toString().trim();
+  const sessionId = (session_id || "").toString().trim();
+
   if (!q) return res.status(400).json({ error: "Missing message" });
+  if (!sessionId) {
+    // We ondersteunen session_id; zonder session_id blijft het werken maar municipality-followup is instabiel.
+    // We geven wel antwoord, maar vragen om municipality kan dan weer stuk gaan.
+  }
 
   const fetchWithTimeout = async (url, options = {}, ms = 12000) => {
     const controller = new AbortController();
@@ -67,107 +100,87 @@ export default async function handler(req, res) {
   const pickAll = (text, re) => [...text.matchAll(re)].map(m => m[1]);
 
   try {
-    // =====================================================
-    // 0) "Gemeente-antwoord" afhandelen (context onthouden)
-    // =====================================================
-    const pending = pendingStore.get(ip);
+    // 0) Pending flow (session-based)
+    const pending = sessionId ? pendingStore.get(sessionId) : null;
     const now = Date.now();
-    const pendingIsFresh = pending && (now - pending.createdAt) < 5 * 60 * 1000; // 5 min
+    const pendingIsFresh = pending && (now - pending.createdAt) < 5 * 60 * 1000;
+
+    let forcedType = null;
+    let municipality = null;
 
     if (pendingIsFresh && looksLikeMunicipality(q)) {
-      // gebruiker heeft alleen gemeente gestuurd, plak die op de openstaande vraag
-      const municipality = q.trim();
-      q = `${pending.question} (gemeente: ${municipality})`;
-
-      // zet voor deze request de routeType vast op de pending type
-      // en geef municipality mee in variabele
-      var forcedRouteType = pending.type;
-      var forcedMunicipality = municipality;
-
-      // pending opgelost
-      pendingStore.delete(ip);
+      municipality = q.trim();
+      forcedType = pending.type;
+      q = pending.question; // originele vraag herstellen
+      pendingStore.delete(sessionId);
     }
 
-    // =====================================================
-    // 1) AI ROUTER + gemeente-extractie
-    // =====================================================
-    const routerResp = await fetchWithTimeout(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          temperature: 0,
-          messages: [
-            {
-              role: "system",
-              content: `
-Analyseer de vraag en geef strikt JSON terug:
+    // 1) AI router (type + municipality)
+    let routeType = "national";
 
+    if (forcedType) {
+      routeType = forcedType;
+    } else {
+      const routerResp = await fetchWithTimeout(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+          },
+          body: JSON.stringify({
+            model: "gpt-4o-mini",
+            temperature: 0,
+            messages: [
+              {
+                role: "system",
+                content: `
+Analyseer de vraag en geef strikt JSON terug:
 {
   "type": "national | municipal_regulation | municipal_decision",
   "municipality": "naam of null"
 }
 
-- national: landelijke wet- en regelgeving (BWB / wetten.overheid.nl)
-- municipal_regulation: gemeentelijke verordeningen/beleidsregels (CVDR / lokaleregelgeving)
-- municipal_decision: gemeentelijke bekendmakingen/besluiten (OEP / Gemeenteblad)
+- municipal_regulation: verordening/beleidsregel/APV (CVDR)
+- municipal_decision: bekendmaking/besluit (OEP Gemeenteblad)
+- national: landelijke wet/regeling (BWB)
 
-Als geen gemeente genoemd: municipality = null.
+Als geen gemeente genoemd: municipality=null.
 `
-            },
-            { role: "user", content: q }
-          ]
-        })
-      },
-      12000
-    );
+              },
+              { role: "user", content: q }
+            ]
+          })
+        },
+        12000
+      );
 
-    let routeType = "national";
-    let municipality = null;
-
-    try {
-      const routerData = await routerResp.json();
-      const parsed = JSON.parse(routerData?.choices?.[0]?.message?.content || "{}");
-      routeType = parsed.type || "national";
-      municipality = parsed.municipality || null;
-    } catch {
-      routeType = "national";
-      municipality = null;
+      try {
+        const routerData = await routerResp.json();
+        const parsed = JSON.parse(routerData?.choices?.[0]?.message?.content || "{}");
+        routeType = parsed.type || "national";
+        municipality = parsed.municipality || null;
+      } catch {
+        routeType = "national";
+        municipality = null;
+      }
     }
 
-    // Als we eerder forcedRouteType/municipality hadden (gemeente-reply), override
-    if (typeof forcedRouteType !== "undefined") routeType = forcedRouteType;
-    if (typeof forcedMunicipality !== "undefined") municipality = forcedMunicipality;
-
-    // =====================================================
-    // 2) Als gemeente nodig is maar ontbreekt → vraag terug + onthoud pending
-    // =====================================================
-    if (
-      (routeType === "municipal_regulation" || routeType === "municipal_decision") &&
-      !municipality
-    ) {
-      pendingStore.set(ip, { question: q, type: routeType, createdAt: Date.now() });
-
+    // 2) Gemeente nodig maar ontbreekt → vraag terug + onthoud pending in session
+    if ((routeType === "municipal_regulation" || routeType === "municipal_decision") && !municipality) {
+      if (sessionId) {
+        pendingStore.set(sessionId, { question: q, type: routeType, createdAt: Date.now() });
+      }
       return res.status(200).json({
         answer: "Voor welke gemeente geldt dit?",
-        sources: []
+        sources: [],
+        need_municipality: true
       });
     }
 
-    // =====================================================
-    // 3) Gerichte zoek (met betrouwbare post-filter op creator)
-    // =====================================================
-    const cleaned = q.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ");
-    const keywords = cleaned.split(/\s+/).filter(w => w.length >= 4).slice(0, 8);
-    const term = keywords.join(" ").trim() || cleaned.trim();
-
-    const normalize = (s) => (s || "").toLowerCase();
     const munLc = normalize(municipality || "");
+    const baseTerm = extractSearchTermsNL(q);
 
     const dedupeByLink = (arr) => {
       const seen = new Set();
@@ -184,30 +197,22 @@ Als geen gemeente genoemd: municipality = null.
     const scoreTitle = (title) => {
       const t = normalize(title);
       let score = 0;
-      for (const k of keywords) {
+      for (const k of baseTerm.split(/\s+/).filter(Boolean)) {
         if (t.includes(k)) score += 2;
       }
-      // kleine boosts
-      if (t.includes("algemene plaatselijke verordening")) score += 3;
-      if (t.includes("apv")) score += 3;
-      if (t.includes("verkeersbesluit")) score += 2;
-
-      const year = (q.match(/\b(20\d{2})\b/) || [])[1];
-      if (year && t.includes(year)) score += 2;
-
-      // als municipality in titel voorkomt
       if (munLc && t.includes(munLc)) score += 2;
-
+      if (t.includes("apv") || t.includes("algemene plaatselijke verordening")) score += 3;
+      if (t.includes("terras") || t.includes("terrassen")) score += 3;
       return score;
     };
 
+    // ---- BWB
     const bwbSearch = async () => {
       const bwbQuery = `overheidbwb.titel any "${q}"`;
       const url =
         "https://zoekservice.overheid.nl/sru/Search" +
-        "?version=1.2&operation=searchRetrieve" +
-        "&x-connection=BWB" +
-        "&maximumRecords=8&startRecord=1" +
+        "?version=1.2&operation=searchRetrieve&x-connection=BWB" +
+        "&maximumRecords=10&startRecord=1" +
         "&query=" + encodeURIComponent(bwbQuery);
 
       const resp = await fetchWithTimeout(url, {}, 12000);
@@ -216,24 +221,24 @@ Als geen gemeente genoemd: municipality = null.
       const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
       const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
 
-      const sources = ids.map((id, i) => ({
+      return dedupeByLink(ids.map((id, i) => ({
         title: titles[i] || id,
         link: `https://wetten.overheid.nl/${id}`,
         type: "BWB"
-      }));
-
-      return dedupeByLink(sources).slice(0, 6);
+      }))).slice(0, 6);
     };
 
-    const cvdrSearch = async () => {
-      // Zoek vooral in TITELS om ruis te beperken
-      const cvdrQuery = `dcterms.title any "${q}"`;
+    // ---- CVDR (zoeken + creator-filter in response)
+    const cvdrSearchMunicipality = async () => {
+      const query = munLc
+        ? `(dcterms.creator all "${municipality}") AND (keyword all "${baseTerm}")`
+        : `keyword all "${baseTerm}"`;
+
       const url =
         "https://zoekservice.overheid.nl/sru/Search" +
-        "?version=1.2&operation=searchRetrieve" +
-        "&x-connection=CVDR" +
-        "&maximumRecords=12&startRecord=1" +
-        "&query=" + encodeURIComponent(cvdrQuery);
+        "?version=1.2&operation=searchRetrieve&x-connection=CVDR" +
+        "&maximumRecords=25&startRecord=1" +
+        "&query=" + encodeURIComponent(query);
 
       const resp = await fetchWithTimeout(url, {}, 12000);
       const xml = await resp.text();
@@ -256,22 +261,26 @@ Als geen gemeente genoemd: municipality = null.
         });
       }
 
-      sources = sources.map(s => ({ ...s, score: scoreTitle(s.title) }))
-                       .sort((a, b) => b.score - a.score);
+      sources = sources
+        .map(s => ({ ...s, score: scoreTitle(s.title) }))
+        .sort((a, b) => b.score - a.score);
 
-      return dedupeByLink(sources).slice(0, 6).map(({ _creator, score, ...rest }) => rest);
+      return dedupeByLink(sources)
+        .slice(0, 10)
+        .map(({ _creator, score, ...rest }) => rest);
     };
 
-    const oepSearch = async () => {
-      // Forceer Gemeenteblad in de query (vermindert ruis enorm)
-      const oepQuery = `publicatieNaam="Gemeenteblad" AND (titel any "${q}")`;
+    // ---- OEP (Gemeenteblad + creator-filter)
+    const oepSearchMunicipality = async () => {
+      const query = munLc
+        ? `publicatieNaam="Gemeenteblad" AND (dcterms.creator all "${municipality}") AND (keyword all "${baseTerm}")`
+        : `publicatieNaam="Gemeenteblad" AND (keyword all "${baseTerm}")`;
 
       const url =
         "https://zoek.officielebekendmakingen.nl/sru/Search" +
-        "?version=1.2&operation=searchRetrieve" +
-        "&x-connection=oep&recordSchema=dc" +
-        "&maximumRecords=12&startRecord=1" +
-        "&query=" + encodeURIComponent(oepQuery);
+        "?version=1.2&operation=searchRetrieve&x-connection=oep&recordSchema=dc" +
+        "&maximumRecords=25&startRecord=1" +
+        "&query=" + encodeURIComponent(query);
 
       const resp = await fetchWithTimeout(url, {}, 12000);
       const xml = await resp.text();
@@ -294,47 +303,45 @@ Als geen gemeente genoemd: municipality = null.
         });
       }
 
-      sources = sources.map(s => ({ ...s, score: scoreTitle(s.title) }))
-                       .sort((a, b) => b.score - a.score);
+      sources = sources
+        .map(s => ({ ...s, score: scoreTitle(s.title) }))
+        .sort((a, b) => b.score - a.score);
 
-      return dedupeByLink(sources).slice(0, 6).map(({ _creator, score, ...rest }) => rest);
+      return dedupeByLink(sources)
+        .slice(0, 10)
+        .map(({ _creator, score, ...rest }) => rest);
     };
 
-    // Welke zoekbron gebruiken?
+    // 4) Kies bronnen per route
     let sources = [];
+
     if (routeType === "national") {
       sources = await bwbSearch();
-      // fallback: als BWB niets vindt, probeer OEP (soms Kamerstukken/moties etc.)
-      if (!sources.length) sources = await oepSearch();
+      // (optioneel) OEP-kamerstukken als fallback kun je later toevoegen, maar voor nu niet nodig
     } else if (routeType === "municipal_regulation") {
-      sources = await cvdrSearch();
-      if (!sources.length) sources = await oepSearch();
-      if (!sources.length) sources = await bwbSearch();
+      sources = await cvdrSearchMunicipality();
+      if (!sources.length) sources = await oepSearchMunicipality();
+      // geen BWB fallback voor gemeentelijke vraag
     } else if (routeType === "municipal_decision") {
-      sources = await oepSearch();
-      if (!sources.length) sources = await cvdrSearch();
-      if (!sources.length) sources = await bwbSearch();
+      sources = await oepSearchMunicipality();
+      if (!sources.length) sources = await cvdrSearchMunicipality();
+      // geen BWB fallback
     } else {
-      // fallback
+      // fallback safe
       sources = await bwbSearch();
-      if (!sources.length) sources = await cvdrSearch();
-      if (!sources.length) sources = await oepSearch();
     }
 
     if (!sources.length) {
       return res.status(200).json({ answer: "Geen officiële bronnen gevonden.", sources: [] });
     }
 
-    // top 4 bronnen
     const topSources = sources.slice(0, 4);
 
     const sourcesText = topSources
       .map((s, i) => `Bron ${i + 1}: ${s.title}\n${s.link}`)
       .join("\n\n");
 
-    // =====================================================
-    // 4) Antwoord genereren (zonder bronnenlijst)
-    // =====================================================
+    // 5) Antwoord genereren (zonder bronnenlijst)
     const aiResp = await fetchWithTimeout(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -369,7 +376,8 @@ Als de bronnen de vraag niet beantwoorden: zeg dat expliciet.
     let aiData = {};
     try { aiData = JSON.parse(aiRaw); } catch {}
 
-    const answer = aiData?.choices?.[0]?.message?.content?.trim();
+    let answer = aiData?.choices?.[0]?.message?.content?.trim() || "";
+    answer = stripSourcesFromAnswer(answer);
 
     return res.status(200).json({
       answer: answer || "Geen antwoord gegenereerd.",
