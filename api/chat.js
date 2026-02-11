@@ -1,11 +1,6 @@
 const rateStore = new Map();
-const pendingStore = new Map(); 
-// sessionId -> {
-//   originalQuestion,
-//   missingSlots: [],
-//   collected: {},
-//   createdAt
-// }
+const pendingStore = new Map();
+// sessionId -> { originalQuestion, missingSlots:[], collected:{}, createdAt }
 
 function rateLimit(ip, limit = 10, windowMs = 60000) {
   const now = Date.now();
@@ -21,6 +16,15 @@ function rateLimit(ip, limit = 10, windowMs = 60000) {
 
 function normalize(s) {
   return (s || "").toLowerCase().trim();
+}
+
+function looksLikeMunicipality(text) {
+  const t = (text || "").trim();
+  if (!t) return false;
+  if (t.length > 40) return false;
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length > 3) return false;
+  return /^[\p{L}\s.'-]+$/u.test(t);
 }
 
 function dedupeByLink(arr) {
@@ -55,22 +59,27 @@ function clamp(n, a, b) {
 }
 
 /* ================================
-   AI ANALYSE
+   AI ANALYSE (met bekende context)
 ================================ */
-
-async function analyzeQuestionWithAI({ q, apiKey, fetchWithTimeout }) {
+async function analyzeQuestionWithAI({ q, knownMunicipality, apiKey, fetchWithTimeout }) {
   const prompt = `
-Analyseer een vraag over Nederlandse wet- en regelgeving.
-Geef GEEN inhoudelijk antwoord.
+Analyseer een vraag over NL wet- en regelgeving. Geef GEEN inhoudelijk antwoord.
+
+Bekende context:
+- municipality (indien bekend): ${knownMunicipality ? `"${knownMunicipality}"` : "null"}
 
 Geef JSON met:
 - scope: "municipal" | "national" | "unknown"
-- municipality: string|null
-- query_terms: array<string>
-- include_terms: array<string>
-- exclude_terms: array<string>
-- missing_slots: array<string> (bv. ["municipality"] indien nodig)
+- municipality: string|null (alleen invullen als expliciet in vraag of in bekende context)
+- query_terms: array<string> (3-10)
+- include_terms: array<string> (0-10)
+- exclude_terms: array<string> (0-15)
+- is_too_vague: boolean
 - clarification_questions: array<string> (max 2)
+
+Belangrijk:
+- Als scope municipal en municipality al bekend is, stel NIET opnieuw de vraag "Voor welke gemeente...".
+- Stel alleen vervolgvragen als is_too_vague true of noodzakelijke context ontbreekt.
 
 Vraag:
 """${q}"""
@@ -87,9 +96,9 @@ Vraag:
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0.1,
-        max_tokens: 400,
+        max_tokens: 380,
         messages: [
-          { role: "system", content: "Output ALLEEN geldige JSON." },
+          { role: "system", content: "Output ALLEEN geldige JSON. Geen tekst eromheen." },
           { role: "user", content: prompt }
         ]
       })
@@ -99,47 +108,48 @@ Vraag:
 
   const raw = await resp.text();
 
+  const arr = (x) => (Array.isArray(x) ? x.filter(Boolean).map(String) : []);
+
   try {
-    const content = JSON.parse(raw)?.choices?.[0]?.message?.content;
+    const content = JSON.parse(raw)?.choices?.[0]?.message?.content?.trim();
     const data = JSON.parse(content);
+
     return {
-      scope: data.scope || "unknown",
-      municipality: data.municipality || null,
-      query_terms: data.query_terms || [],
-      include_terms: data.include_terms || [],
-      exclude_terms: data.exclude_terms || [],
-      missing_slots: data.missing_slots || [],
-      clarification_questions: data.clarification_questions || []
+      scope: ["municipal", "national", "unknown"].includes(data.scope) ? data.scope : "unknown",
+      municipality: data.municipality ? String(data.municipality) : null,
+      query_terms: arr(data.query_terms).slice(0, 12),
+      include_terms: arr(data.include_terms).slice(0, 12),
+      exclude_terms: arr(data.exclude_terms).slice(0, 20),
+      is_too_vague: !!data.is_too_vague,
+      clarification_questions: arr(data.clarification_questions).slice(0, 2)
     };
   } catch {
     return {
       scope: "unknown",
-      municipality: null,
-      query_terms: q.split(" "),
+      municipality: knownMunicipality || null,
+      query_terms: q.split(/\s+/).filter(Boolean).slice(0, 8),
       include_terms: [],
       exclude_terms: [],
-      missing_slots: [],
+      is_too_vague: q.trim().length < 18,
       clarification_questions: []
     };
   }
 }
 
 /* ================================
-   SLOT EXTRACTION (NO LOOP FIX)
+   SLOT EXTRACTION (anti-loop)
 ================================ */
-
 async function extractSlotsWithAI({ userText, missingSlots, apiKey, fetchWithTimeout }) {
   const prompt = `
-Extraheer alleen deze velden uit het antwoord.
-Geef JSON.
-
+Extraheer ALLEEN deze velden uit het antwoord en geef JSON.
 Slots: ${JSON.stringify(missingSlots)}
 
 Regels:
-- municipality = alleen gemeentenaam
-- detail = korte context (bv. "terras bij restaurant")
+- municipality: alleen gemeentenaam (bv "Amsterdam"), anders null.
+- detail: korte context (bv "terras bij restaurant"), anders null.
+Geen extra velden.
 
-User antwoord:
+Antwoord:
 """${userText}"""
 `;
 
@@ -154,7 +164,7 @@ User antwoord:
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0,
-        max_tokens: 200,
+        max_tokens: 160,
         messages: [
           { role: "system", content: "Output ALLEEN geldige JSON." },
           { role: "user", content: prompt }
@@ -167,8 +177,9 @@ User antwoord:
   const raw = await resp.text();
 
   try {
-    const content = JSON.parse(raw)?.choices?.[0]?.message?.content;
-    return JSON.parse(content);
+    const content = JSON.parse(raw)?.choices?.[0]?.message?.content?.trim();
+    const data = JSON.parse(content);
+    return data && typeof data === "object" ? data : {};
   } catch {
     return {};
   }
@@ -177,75 +188,140 @@ User antwoord:
 /* ================================
    SCORING
 ================================ */
-
-function scoreSources({ sources, q, include, exclude, scope }) {
+function scoreSources({ sources, q, queryTerms, includeTerms, excludeTerms, scope }) {
   const qLc = normalize(q);
+  const pos = [...new Set([...queryTerms, ...includeTerms].map(normalize).filter(Boolean))];
+  const neg = [...new Set((excludeTerms || []).map(normalize).filter(Boolean))].filter(t => t && !qLc.includes(t));
+
+  const typeBoost = (type) => {
+    if (scope === "municipal") {
+      if (type === "CVDR") return 3.0;
+      if ((type || "").toLowerCase().includes("gemeenteblad")) return 1.5;
+    }
+    if (scope === "national") {
+      if (type === "BWB") return 2.5;
+    }
+    return 0.5;
+  };
+
+  const genericNoise = ["jaarverslag", "jaarrekening", "aanbested", "subsidieplafond", "inspraakreactie"];
 
   function scoreOne(s) {
-    const title = normalize(s.title || "");
+    const title = normalize(s?.title || "");
     let score = 0;
 
-    include.forEach(t => {
-      if (title.includes(normalize(t))) score += 2;
-    });
+    for (const t of pos) if (t && title.includes(t)) score += 2.2;
 
-    exclude.forEach(t => {
-      if (!qLc.includes(normalize(t)) && title.includes(normalize(t))) {
-        score -= 3;
-      }
-    });
+    const qWords = qLc.split(/\s+/).filter(w => w.length >= 4).slice(0, 10);
+    for (const w of qWords) if (title.includes(w)) score += 0.6;
 
-    if (scope === "municipal" && s.type === "CVDR") score += 2;
-    if (scope === "national" && s.type === "BWB") score += 2;
+    for (const t of neg) if (title.includes(t)) score -= 3.0;
 
+    for (const n of genericNoise) if (title.includes(n) && !qLc.includes(n)) score -= 1.2;
+
+    score += typeBoost(s.type);
     return score;
   }
 
-  const scored = sources.map(s => ({ ...s, _score: scoreOne(s) }));
-  scored.sort((a, b) => b._score - a._score);
+  const scored = (sources || []).map(s => ({ ...s, _score: scoreOne(s) }));
+  scored.sort((a, b) => (b._score || 0) - (a._score || 0));
   return scored;
 }
 
-function computeConfidence(scored) {
-  if (!scored.length) return 0;
-  const top = scored[0]._score;
-  const second = scored[1]?._score || 0;
-  return clamp((top - second + top) / 10, 0, 1);
+function computeConfidence(scoredSources) {
+  if (!scoredSources?.length) return 0;
+  const top = scoredSources[0]?._score ?? 0;
+  const second = scoredSources[1]?._score ?? 0;
+  const gap = top - second;
+  return clamp((top / 8) + (gap / 4), 0, 1);
 }
 
 /* ================================
-   SEARCH FUNCTIONS
+   SEARCH
 ================================ */
+function buildCqlFromTerms(terms = []) {
+  const clean = (terms || []).map(t => String(t).trim()).filter(t => t.length >= 2).slice(0, 8);
+  if (!clean.length) return `keyword all ""`;
+  const parts = clean.map(t => `keyword all "${t.replaceAll('"', "")}"`);
+  return parts.join(" OR ");
+}
 
-async function cvdrSearch({ municipalityName, query, fetchWithTimeout }) {
+async function cvdrSearch({ municipalityName, cqlTopic, fetchWithTimeout }) {
   const base = "https://zoekdienst.overheid.nl/sru/Search";
-  const cql = `(dcterms.creator="${municipalityName}") AND (keyword all "${query}")`;
+  const creatorsToTry = [
+    municipalityName,
+    `Gemeente ${municipalityName}`,
+    `gemeente ${municipalityName}`
+  ];
+
+  for (const creator of creatorsToTry) {
+    const cql = `(dcterms.creator="${creator}") AND (${cqlTopic})`;
+
+    const url =
+      `${base}?version=1.2` +
+      `&operation=searchRetrieve` +
+      `&x-connection=cvdr` +
+      `&x-info-1-accept=any` +
+      `&maximumRecords=25` +
+      `&startRecord=1` +
+      `&query=${encodeURIComponent(cql)}`;
+
+    const resp = await fetchWithTimeout(url, {}, 15000);
+    const xml = await resp.text();
+
+    const ids = pickAll(xml, /<dcterms:identifier>(CVDR[0-9_]+)<\/dcterms:identifier>/g);
+    const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
+
+    const items = ids.map((id, i) => ({
+      title: titles[i] || id,
+      link: `https://lokaleregelgeving.overheid.nl/${id}`,
+      type: "CVDR"
+    }));
+
+    const uniq = dedupeByLink(items);
+    if (uniq.length) return uniq;
+  }
+  return [];
+}
+
+async function oepSearch({ municipalityName, cqlTopic, fetchWithTimeout }) {
+  const base = "https://zoek.officielebekendmakingen.nl/sru/Search";
+  const cql = `publicatieNaam="Gemeenteblad" AND (${cqlTopic}) AND (keyword all "${municipalityName}")`;
 
   const url =
-    `${base}?version=1.2&operation=searchRetrieve&x-connection=cvdr` +
-    `&maximumRecords=25&startRecord=1&query=${encodeURIComponent(cql)}`;
+    `${base}?version=1.2` +
+    `&operation=searchRetrieve` +
+    `&x-connection=oep` +
+    `&recordSchema=dc` +
+    `&maximumRecords=25` +
+    `&startRecord=1` +
+    `&query=${encodeURIComponent(cql)}`;
 
   const resp = await fetchWithTimeout(url, {}, 15000);
   const xml = await resp.text();
 
-  const ids = pickAll(xml, /<dcterms:identifier>(CVDR[0-9_]+)<\/dcterms:identifier>/g);
+  const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
   const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
 
-  return dedupeByLink(
-    ids.map((id, i) => ({
-      title: titles[i] || id,
-      link: `https://lokaleregelgeving.overheid.nl/${id}`,
-      type: "CVDR"
-    }))
-  );
+  const items = ids.map((id, i) => ({
+    title: titles[i] || id,
+    link: `https://zoek.officielebekendmakingen.nl/${id}.html`,
+    type: "OEP (Gemeenteblad)"
+  }));
+
+  return dedupeByLink(items);
 }
 
-async function bwbSearch({ query, fetchWithTimeout }) {
+async function bwbSearch({ q, cqlTopic, fetchWithTimeout }) {
   const base = "https://zoekservice.overheid.nl/sru/Search";
+  const query = cqlTopic
+    ? `(overheidbwb.titel any "${q}") OR (overheidbwb.titel any "${cqlTopic}")`
+    : `overheidbwb.titel any "${q}"`;
+
   const url =
     `${base}?version=1.2&operation=searchRetrieve&x-connection=BWB` +
-    `&maximumRecords=15&startRecord=1&query=` +
-    encodeURIComponent(`overheidbwb.titel any "${query}"`);
+    `&maximumRecords=12&startRecord=1` +
+    `&query=${encodeURIComponent(query)}`;
 
   const resp = await fetchWithTimeout(url, {}, 15000);
   const xml = await resp.text();
@@ -253,21 +329,17 @@ async function bwbSearch({ query, fetchWithTimeout }) {
   const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
   const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
 
-  return dedupeByLink(
-    ids.map((id, i) => ({
-      title: titles[i] || id,
-      link: `https://wetten.overheid.nl/${id}`,
-      type: "BWB"
-    }))
-  );
+  return dedupeByLink(ids.map((id, i) => ({
+    title: titles[i] || id,
+    link: `https://wetten.overheid.nl/${id}`,
+    type: "BWB"
+  })));
 }
 
 /* ================================
-   MAIN HANDLER
+   HANDLER
 ================================ */
-
 export default async function handler(req, res) {
-
   res.setHeader("Access-Control-Allow-Origin", "https://app.beleidsbank.nl");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -283,8 +355,8 @@ export default async function handler(req, res) {
   if (!rateLimit(ip)) return res.status(429).json({ error: "Too many requests" });
 
   const { message, session_id } = req.body || {};
-  const sessionId = (session_id || "").trim();
-  let q = (message || "").trim();
+  const sessionId = (session_id || "").toString().trim();
+  let q = (message || "").toString().trim();
   if (!q) return res.status(400).json({ error: "Missing message" });
 
   const apiKey = process.env.OPENAI_API_KEY;
@@ -301,51 +373,77 @@ export default async function handler(req, res) {
   };
 
   try {
-
-    /* ========= SLOT FILLING ========= */
-
+    // -----------------------------
+    // 0) Slot-filling (anti-loop)
+    // -----------------------------
+    let carriedContext = {}; // blijft in deze request bestaan, ook na delete pending
     const pending = sessionId ? pendingStore.get(sessionId) : null;
-    const fresh = pending && (Date.now() - pending.createdAt) < 600000;
+    const fresh = pending && (Date.now() - pending.createdAt) < 7 * 60 * 1000;
 
     if (fresh) {
+      const missingSlots = pending.missingSlots || [];
+      const collected = pending.collected || {};
 
       const extracted = await extractSlotsWithAI({
         userText: q,
-        missingSlots: pending.missingSlots,
+        missingSlots,
         apiKey,
         fetchWithTimeout
       });
 
-      Object.assign(pending.collected, extracted);
-
-      const stillMissing = pending.missingSlots.filter(
-        s => !pending.collected[s]
-      );
-
-      if (!stillMissing.length) {
-        q = pending.originalQuestion;
-        pendingStore.delete(sessionId);
-      } else {
-        pending.missingSlots = stillMissing;
-        pendingStore.set(sessionId, pending);
-        return res.status(200).json({
-          answer: "Kun je dit nog iets concreter maken?",
-          sources: []
-        });
+      // Fallback: als only municipality gevraagd is en user typt "Amsterdam"
+      if (missingSlots.includes("municipality") && !extracted?.municipality && looksLikeMunicipality(q)) {
+        extracted.municipality = q.trim();
       }
+
+      if (missingSlots.includes("municipality") && extracted?.municipality) {
+        collected.municipality = String(extracted.municipality).trim();
+      }
+      if (missingSlots.includes("detail") && extracted?.detail) {
+        collected.detail = String(extracted.detail).trim();
+      }
+
+      const stillMissing = [];
+      if (missingSlots.includes("municipality") && !collected.municipality) stillMissing.push("municipality");
+      if (missingSlots.includes("detail") && !collected.detail) stillMissing.push("detail");
+
+      if (stillMissing.length) {
+        pending.missingSlots = stillMissing;
+        pending.collected = collected;
+        pendingStore.set(sessionId, pending);
+
+        const ask = stillMissing.includes("municipality")
+          ? "Voor welke gemeente geldt dit?"
+          : "Wat is de context (bijv. type activiteit/organisatie/locatie)?";
+
+        return res.status(200).json({ answer: ask, sources: [] });
+      }
+
+      // slots compleet: context meenemen en terug naar originele vraag
+      carriedContext = { ...collected };
+      q = pending.originalQuestion;
+      pendingStore.delete(sessionId);
     }
 
-    /* ========= ANALYSE ========= */
-
+    // -----------------------------
+    // 1) AI analyse (met context)
+    // -----------------------------
     const analysis = await analyzeQuestionWithAI({
       q,
+      knownMunicipality: carriedContext.municipality || null,
       apiKey,
       fetchWithTimeout
     });
 
-    let municipality = analysis.municipality;
+    // Gebruik context als AI het niet zet
+    let municipality = analysis.municipality || carriedContext.municipality || null;
 
-    if (analysis.scope === "municipal" && !municipality) {
+    // -----------------------------
+    // 2) Clarify als nodig (maar NIET opnieuw als we 'm al hebben)
+    // -----------------------------
+    const needsMunicipality = analysis.scope === "municipal" && !municipality;
+
+    if (needsMunicipality) {
       if (sessionId) {
         pendingStore.set(sessionId, {
           originalQuestion: q,
@@ -354,62 +452,88 @@ export default async function handler(req, res) {
           createdAt: Date.now()
         });
       }
+      return res.status(200).json({ answer: "Voor welke gemeente geldt dit?", sources: [] });
+    }
+
+    if (analysis.is_too_vague) {
+      const qs = (analysis.clarification_questions || []).filter(Boolean);
+      const toAsk = qs.length ? qs.slice(0, 2) : ["Kun je je vraag iets specifieker maken (context/onderdeel/waarover)?"];
+
+      if (sessionId) {
+        pendingStore.set(sessionId, {
+          originalQuestion: q,
+          missingSlots: ["detail"],
+          collected: municipality ? { municipality } : {},
+          createdAt: Date.now()
+        });
+      }
 
       return res.status(200).json({
-        answer: "Voor welke gemeente geldt dit?",
+        answer: toAsk.length === 1 ? toAsk[0] : `Ik heb nog ${toAsk.length} korte vragen:\n- ${toAsk.join("\n- ")}`,
         sources: []
       });
     }
 
-    /* ========= SEARCH ========= */
+    // -----------------------------
+    // 3) Search
+    // -----------------------------
+    const cqlTopic = buildCqlFromTerms([...analysis.query_terms, ...analysis.include_terms]);
 
     let sources = [];
-
-    if (analysis.scope === "municipal") {
-      sources = await cvdrSearch({
-        municipalityName: municipality,
-        query: analysis.query_terms.join(" "),
-        fetchWithTimeout
-      });
+    if (analysis.scope === "municipal" && municipality) {
+      sources = await cvdrSearch({ municipalityName: municipality, cqlTopic, fetchWithTimeout });
+      if (!sources.length) sources = await oepSearch({ municipalityName: municipality, cqlTopic, fetchWithTimeout });
     } else {
-      sources = await bwbSearch({
-        query: analysis.query_terms.join(" "),
-        fetchWithTimeout
-      });
+      sources = await bwbSearch({ q, cqlTopic: analysis.query_terms.join(" "), fetchWithTimeout });
     }
 
+    sources = dedupeByLink(sources);
+
+    // -----------------------------
+    // 4) Rerank + confidence
+    // -----------------------------
     const scored = scoreSources({
       sources,
       q,
-      include: analysis.include_terms,
-      exclude: analysis.exclude_terms,
+      queryTerms: analysis.query_terms,
+      includeTerms: analysis.include_terms,
+      excludeTerms: analysis.exclude_terms,
       scope: analysis.scope
     });
 
     const confidence = computeConfidence(scored);
     const topSources = scored.slice(0, 4);
 
-    if (confidence < 0.3) {
-      return res.status(200).json({
-        answer: analysis.clarification_questions?.[0] ||
-          "Kun je je vraag iets specifieker formuleren?",
-        sources: []
-      });
-    }
-
     if (!topSources.length) {
       return res.status(200).json({
-        answer: "Geen officiële bronnen gevonden.",
+        answer: "Geen officiële bronnen gevonden. Probeer iets concreter te formuleren (kernbegrippen/onderwerp).",
         sources: []
       });
     }
 
-    /* ========= FINAL ANSWER ========= */
+    // als confidence laag: vraag 1 extra detail (met state), maar niet opnieuw gemeente
+    if (confidence < 0.35) {
+      const followUp =
+        (analysis.clarification_questions || []).find(x => !normalize(x).includes("welke gemeente")) ||
+        "Kun je aangeven wat je precies bedoelt (context/activiteit/locatie)?";
 
+      if (sessionId) {
+        pendingStore.set(sessionId, {
+          originalQuestion: q,
+          missingSlots: ["detail"],
+          collected: municipality ? { municipality } : {},
+          createdAt: Date.now()
+        });
+      }
+
+      return res.status(200).json({ answer: followUp, sources: [] });
+    }
+
+    // -----------------------------
+    // 5) Final answer (ALLEEN bronnen)
+    // -----------------------------
     const sourcesText = topSources
-      .map((s, i) =>
-        `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}`
-      )
+      .map((s, i) => `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}`)
       .join("\n\n");
 
     const aiResp = await fetchWithTimeout(
@@ -423,32 +547,34 @@ export default async function handler(req, res) {
         body: JSON.stringify({
           model: "gpt-4o-mini",
           temperature: 0.2,
-          max_tokens: 500,
+          max_tokens: 520,
           messages: [
             {
               role: "system",
-              content:
-                "Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen."
+              content: `
+Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen.
+Geef:
+1) Kort antwoord (max 4 zinnen)
+2) Toelichting (alleen uit bronnen)
+Geef GEEN aparte bronnenlijst.
+Als bronnen het niet beantwoorden: zeg dat expliciet.
+`
             },
-            {
-              role: "user",
-              content: `Vraag:\n${q}\n\nOfficiële bronnen:\n${sourcesText}`
-            }
+            { role: "user", content: `Vraag:\n${q}\n\nOfficiële bronnen:\n${sourcesText}` }
           ]
         })
       },
       20000
     );
 
-    const raw = await aiResp.text();
-    const parsed = JSON.parse(raw);
-    let answer = parsed?.choices?.[0]?.message?.content || "";
+    const aiRaw = await aiResp.text();
+    let aiData = {};
+    try { aiData = JSON.parse(aiRaw); } catch {}
+
+    let answer = aiData?.choices?.[0]?.message?.content?.trim() || "Geen antwoord gegenereerd.";
     answer = stripSourcesFromAnswer(answer);
 
-    return res.status(200).json({
-      answer,
-      sources: topSources
-    });
+    return res.status(200).json({ answer, sources: topSources });
 
   } catch (e) {
     return res.status(500).json({ error: "Interne fout" });
