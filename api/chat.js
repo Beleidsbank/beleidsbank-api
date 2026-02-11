@@ -4,12 +4,10 @@ const pendingStore = new Map(); // sessionId -> { question, type, createdAt }
 function rateLimit(ip, limit = 10, windowMs = 60000) {
   const now = Date.now();
   const item = rateStore.get(ip) || { count: 0, resetAt: now + windowMs };
-
   if (now > item.resetAt) {
     item.count = 0;
     item.resetAt = now + windowMs;
   }
-
   item.count++;
   rateStore.set(ip, item);
   return item.count <= limit;
@@ -18,64 +16,32 @@ function rateLimit(ip, limit = 10, windowMs = 60000) {
 function looksLikeMunicipality(text) {
   const t = (text || "").trim();
   if (!t) return false;
-  const words = t.split(/\s+/).filter(Boolean);
-  if (words.length > 3) return false;
   if (t.length > 40) return false;
-  if (!/^[\p{L}\s.'-]+$/u.test(t)) return false;
-  if (t.replace(/\s+/g, "").length < 2) return false;
-  return true;
+  return /^[\p{L}\s.'-]+$/u.test(t);
 }
 
 function normalize(s) {
   return (s || "").toLowerCase();
 }
 
-function extractSearchTermsNL(q) {
-  const text = normalize(q).replace(/[^\p{L}\p{N}\s]/gu, " ");
-  const stop = new Set([
-    "mag","ik","een","de","het","dit","dat","voor","van","in","op","aan","bij","naar",
-    "hoe","wat","waar","wanneer","welke","welk","kan","kun","moet","mogen",
-    "gemeente","geldt","betreft","regels","regel","vergunning","aanvragen","nodig","onder","voorwaarden",
-    "is","zijn","worden","wordt","ook","nog","dan","als","met","zonder","en","of"
-  ]);
-  const words = text.split(/\s+/).filter(w => w.length >= 4 && !stop.has(w));
-
-  // extra: als “terras” of “terrassen” voorkomt, forceren we dat als zoekterm
-  const hasTerras = text.includes("terras") || text.includes("terrassen");
-  const top = words.slice(0, 6);
-
-  if (hasTerras && !top.includes("terras") && !top.includes("terrassen")) top.unshift("terras");
-
-  // als gebruiker alleen “Mag ik een terras plaatsen?” typt, willen we niet leeg eindigen
-  const term = top.join(" ").trim();
-  return term || (hasTerras ? "terras" : text.trim());
+function extractKeywords(q) {
+  const cleaned = normalize(q).replace(/[^\p{L}\p{N}\s]/gu, " ");
+  const words = cleaned.split(/\s+/).filter(w => w.length >= 4);
+  return words.slice(0, 5).join(" ") || cleaned;
 }
 
-function stripSourcesFromAnswer(answer) {
-  const a = (answer || "").trim();
-  if (!a) return a;
-  const low = a.toLowerCase();
-  const idx = low.indexOf("\nbronnen:");
-  if (idx !== -1) return a.slice(0, idx).trim();
-  const idx2 = low.indexOf("bronnen:");
-  if (idx2 !== -1 && (idx2 === 0 || a[idx2 - 1] === "\n")) return a.slice(0, idx2).trim();
-  return a;
-}
-
-function dedupeByLink(arr) {
+function dedupe(arr) {
   const seen = new Set();
-  const out = [];
-  for (const s of arr || []) {
-    if (!s?.link) continue;
-    if (seen.has(s.link)) continue;
+  return arr.filter(s => {
+    if (!s.link) return false;
+    if (seen.has(s.link)) return false;
     seen.add(s.link);
-    out.push(s);
-  }
-  return out;
+    return true;
+  });
 }
 
 export default async function handler(req, res) {
-  // CORS
+
   res.setHeader("Access-Control-Allow-Origin", "https://app.beleidsbank.nl");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -91,12 +57,12 @@ export default async function handler(req, res) {
   if (!rateLimit(ip)) return res.status(429).json({ error: "Too many requests" });
 
   const { message, session_id } = req.body || {};
-  let q = (message || "").toString().trim();
-  const sessionId = (session_id || "").toString().trim();
+  let q = (message || "").trim();
+  const sessionId = (session_id || "").trim();
 
   if (!q) return res.status(400).json({ error: "Missing message" });
 
-  const fetchWithTimeout = async (url, options = {}, ms = 12000) => {
+  const fetchWithTimeout = async (url, options = {}, ms = 15000) => {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), ms);
     try {
@@ -109,225 +75,118 @@ export default async function handler(req, res) {
   const pickAll = (text, re) => [...text.matchAll(re)].map(m => m[1]);
 
   try {
-    // 0) Pending flow (session-based)
+
+    // -------------------------
+    // Pending gemeente flow
+    // -------------------------
+
     const pending = sessionId ? pendingStore.get(sessionId) : null;
-    const now = Date.now();
-    const pendingIsFresh = pending && (now - pending.createdAt) < 5 * 60 * 1000;
+    const fresh = pending && (Date.now() - pending.createdAt) < 5 * 60 * 1000;
 
-    let forcedType = null;
     let municipality = null;
-
-    if (pendingIsFresh && looksLikeMunicipality(q)) {
-      municipality = q.trim();
-      forcedType = pending.type;
-      q = pending.question; // herstel originele vraag
-      pendingStore.delete(sessionId);
-    }
-
-    // 1) AI router
     let routeType = "national";
 
-    if (forcedType) {
-      routeType = forcedType;
+    if (fresh && looksLikeMunicipality(q)) {
+      municipality = q.trim();
+      routeType = pending.type;
+      q = pending.question;
+      pendingStore.delete(sessionId);
     } else {
-      const routerResp = await fetchWithTimeout(
-        "https://api.openai.com/v1/chat/completions",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
-          },
-          body: JSON.stringify({
-            model: "gpt-4o-mini",
-            temperature: 0,
-            messages: [
-              {
-                role: "system",
-                content: `
-Analyseer de vraag en geef strikt JSON terug:
-{
-  "type": "national | municipal_regulation | municipal_decision",
-  "municipality": "naam of null"
-}
-
-- municipal_regulation: verordening/beleidsregel/APV (CVDR)
-- municipal_decision: bekendmaking/besluit (OEP Gemeenteblad)
-- national: landelijke wet/regeling (BWB)
-Als geen gemeente genoemd: municipality=null.
-`
-              },
-              { role: "user", content: q }
-            ]
-          })
-        },
-        12000
-      );
-
-      try {
-        const routerData = await routerResp.json();
-        const parsed = JSON.parse(routerData?.choices?.[0]?.message?.content || "{}");
-        routeType = parsed.type || "national";
-        municipality = parsed.municipality || null;
-      } catch {
-        routeType = "national";
-        municipality = null;
+      // simpele detectie: als "gemeente" of plaatsnaam in vraag voorkomt
+      if (normalize(q).includes("amsterdam") ||
+          normalize(q).includes("utrecht") ||
+          normalize(q).includes("rotterdam")) {
+        routeType = "municipal";
+        municipality = q.match(/(amsterdam|utrecht|rotterdam)/i)?.[0];
+      } else if (normalize(q).includes("terras")) {
+        routeType = "municipal";
       }
     }
 
-    // 2) Gemeente nodig?
-    if ((routeType === "municipal_regulation" || routeType === "municipal_decision") && !municipality) {
-      if (sessionId) pendingStore.set(sessionId, { question: q, type: routeType, createdAt: Date.now() });
-      return res.status(200).json({ answer: "Voor welke gemeente geldt dit?", sources: [], need_municipality: true });
+    if (routeType === "municipal" && !municipality) {
+      if (sessionId) {
+        pendingStore.set(sessionId, {
+          question: q,
+          type: "municipal",
+          createdAt: Date.now()
+        });
+      }
+      return res.status(200).json({
+        answer: "Voor welke gemeente geldt dit?",
+        sources: []
+      });
     }
 
-    const munLc = normalize(municipality || "");
-    const baseTerm = extractSearchTermsNL(q);
+    // -------------------------
+    // SEARCH
+    // -------------------------
 
-    const scoreTitle = (title) => {
-      const t = normalize(title);
-      let score = 0;
+    let sources = [];
 
-      for (const k of baseTerm.split(/\s+/).filter(Boolean)) {
-        if (t.includes(k)) score += 2;
-      }
+    if (routeType === "municipal" && municipality) {
 
-      if (munLc && t.includes(munLc)) score += 2;
-      if (t.includes("apv") || t.includes("algemene plaatselijke verordening")) score += 3;
-      if (t.includes("terras") || t.includes("terrassen")) score += 3;
-      return score;
-    };
+      const keywords = extractKeywords(q);
+      const searchQuery =
+        `publicatieNaam="Gemeenteblad" AND "${municipality}" AND "${keywords}"`;
 
-    // --- BWB
-    const bwbSearch = async () => {
+      const url =
+        "https://zoek.officielebekendmakingen.nl/sru/Search" +
+        "?version=1.2&operation=searchRetrieve&x-connection=oep&recordSchema=dc" +
+        "&maximumRecords=20&startRecord=1" +
+        "&query=" + encodeURIComponent(searchQuery);
+
+      const resp = await fetchWithTimeout(url);
+      const xml = await resp.text();
+
+      const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
+      const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
+
+      sources = ids.map((id, i) => ({
+        title: titles[i] || id,
+        link: `https://zoek.officielebekendmakingen.nl/${id}.html`,
+        type: "Gemeenteblad"
+      }));
+
+    } else {
+      // landelijke fallback
       const bwbQuery = `overheidbwb.titel any "${q}"`;
+
       const url =
         "https://zoekservice.overheid.nl/sru/Search" +
         "?version=1.2&operation=searchRetrieve&x-connection=BWB" +
-        "&maximumRecords=10&startRecord=1" +
+        "&maximumRecords=8&startRecord=1" +
         "&query=" + encodeURIComponent(bwbQuery);
 
-      const resp = await fetchWithTimeout(url, {}, 12000);
+      const resp = await fetchWithTimeout(url);
       const xml = await resp.text();
 
       const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
       const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
 
-      return dedupeByLink(ids.map((id, i) => ({
+      sources = ids.map((id, i) => ({
         title: titles[i] || id,
         link: `https://wetten.overheid.nl/${id}`,
         type: "BWB"
-      }))).slice(0, 6);
-    };
-
-    // ✅ CVDR: eerst breed zoeken, daarna filteren op creator
-    const cvdrSearchMunicipality = async () => {
-      // breed: keyword zoeken op baseTerm + (optioneel) terrassen/uitstallingen meegeven
-      const extra = "terras terrassen uitstallingen horeca";
-      const query = `keyword all "${baseTerm} ${extra}"`;
-
-      const url =
-        "https://zoekservice.overheid.nl/sru/Search" +
-        "?version=1.2&operation=searchRetrieve&x-connection=CVDR" +
-        "&maximumRecords=50&startRecord=1" +
-        "&query=" + encodeURIComponent(query);
-
-      const resp = await fetchWithTimeout(url, {}, 12000);
-      const xml = await resp.text();
-
-      const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
-      const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
-      const creators = pickAll(xml, /<dcterms:creator>(.*?)<\/dcterms:creator>/g);
-
-      let sources = ids.map((id, i) => ({
-        title: titles[i] || id,
-        link: `https://lokaleregelgeving.overheid.nl/${id}`,
-        type: "CVDR",
-        _creator: creators[i] || ""
       }));
-
-      if (munLc) {
-        sources = sources.filter(s => {
-          const c = normalize(s._creator);
-          return c.includes(munLc) || c.includes(`gemeente ${munLc}`);
-        });
-      }
-
-      sources = sources
-        .map(s => ({ ...s, score: scoreTitle(s.title) }))
-        .sort((a, b) => b.score - a.score);
-
-      return dedupeByLink(sources)
-        .slice(0, 10)
-        .map(({ _creator, score, ...rest }) => rest);
-    };
-
-    // ✅ OEP: Gemeenteblad breed, daarna filteren op creator
-    const oepSearchMunicipality = async () => {
-      const extra = "terras terrassen uitstallingen horeca";
-      const query = `publicatieNaam="Gemeenteblad" AND keyword all "${baseTerm} ${extra}"`;
-
-      const url =
-        "https://zoek.officielebekendmakingen.nl/sru/Search" +
-        "?version=1.2&operation=searchRetrieve&x-connection=oep&recordSchema=dc" +
-        "&maximumRecords=50&startRecord=1" +
-        "&query=" + encodeURIComponent(query);
-
-      const resp = await fetchWithTimeout(url, {}, 12000);
-      const xml = await resp.text();
-
-      const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
-      const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
-      const creators = pickAll(xml, /<dcterms:creator>(.*?)<\/dcterms:creator>/g);
-
-      let sources = ids.map((id, i) => ({
-        title: titles[i] || id,
-        link: `https://zoek.officielebekendmakingen.nl/${id}.html`,
-        type: "OEP",
-        _creator: creators[i] || ""
-      }));
-
-      if (munLc) {
-        sources = sources.filter(s => {
-          const c = normalize(s._creator);
-          return c.includes(munLc) || c.includes(`gemeente ${munLc}`);
-        });
-      }
-
-      sources = sources
-        .map(s => ({ ...s, score: scoreTitle(s.title) }))
-        .sort((a, b) => b.score - a.score);
-
-      return dedupeByLink(sources)
-        .slice(0, 10)
-        .map(({ _creator, score, ...rest }) => rest);
-    };
-
-    // 3) Pick sources per routeType
-    let sources = [];
-
-    if (routeType === "national") {
-      sources = await bwbSearch();
-    } else if (routeType === "municipal_regulation") {
-      sources = await cvdrSearchMunicipality();
-      if (!sources.length) sources = await oepSearchMunicipality();
-      // geen BWB fallback (anders krijg je weer BWBR’s)
-    } else if (routeType === "municipal_decision") {
-      sources = await oepSearchMunicipality();
-      if (!sources.length) sources = await cvdrSearchMunicipality();
-      // geen BWB fallback
     }
+
+    sources = dedupe(sources).slice(0, 4);
 
     if (!sources.length) {
-      return res.status(200).json({ answer: "Geen officiële bronnen gevonden.", sources: [] });
+      return res.status(200).json({
+        answer: "Geen officiële bronnen gevonden.",
+        sources: []
+      });
     }
 
-    const topSources = sources.slice(0, 4);
-    const sourcesText = topSources
+    const sourcesText = sources
       .map((s, i) => `Bron ${i + 1}: ${s.title}\n${s.link}`)
       .join("\n\n");
 
-    // 4) Answer generation (no sources list)
+    // -------------------------
+    // AI ANTWOORD
+    // -------------------------
+
     const aiResp = await fetchWithTimeout(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -347,27 +206,23 @@ Gebruik uitsluitend de aangeleverde officiële bronnen.
 Geef:
 1) Kort antwoord
 2) Toelichting
-Geef GEEN aparte bronnenlijst.
-Als de bronnen de vraag niet beantwoorden: zeg dat expliciet.
 `
             },
-            { role: "user", content: `Vraag:\n${q}\n\nBronnen:\n${sourcesText}` }
+            {
+              role: "user",
+              content: `Vraag:\n${q}\n\nBronnen:\n${sourcesText}`
+            }
           ]
         })
-      },
-      20000
+      }
     );
 
-    const aiRaw = await aiResp.text();
-    let aiData = {};
-    try { aiData = JSON.parse(aiRaw); } catch {}
-
-    let answer = aiData?.choices?.[0]?.message?.content?.trim() || "";
-    answer = stripSourcesFromAnswer(answer);
+    const aiData = await aiResp.json();
+    const answer = aiData?.choices?.[0]?.message?.content || "Geen antwoord gegenereerd.";
 
     return res.status(200).json({
-      answer: answer || "Geen antwoord gegenereerd.",
-      sources: topSources
+      answer,
+      sources
     });
 
   } catch (e) {
