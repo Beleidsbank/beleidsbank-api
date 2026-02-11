@@ -1,15 +1,12 @@
 // -----------------------------
-// Simple in-memory rate limiter (best effort on serverless)
+// Simple in-memory rate limiter
 // -----------------------------
 const rateStore = new Map();
-/**
- * limit: max requests per windowMs per IP
- */
+
 function rateLimit(ip, limit = 10, windowMs = 60_000) {
   const now = Date.now();
   const item = rateStore.get(ip) || { count: 0, resetAt: now + windowMs };
 
-  // reset window
   if (now > item.resetAt) {
     item.count = 0;
     item.resetAt = now + windowMs;
@@ -18,14 +15,11 @@ function rateLimit(ip, limit = 10, windowMs = 60_000) {
   item.count += 1;
   rateStore.set(ip, item);
 
-  const remaining = Math.max(0, limit - item.count);
-  return { ok: item.count <= limit, remaining, resetAt: item.resetAt };
+  return { ok: item.count <= limit };
 }
 
 export default async function handler(req, res) {
-  // -----------------------------
-  // CORS: alleen jouw site toestaan
-  // -----------------------------
+
   const allowedOrigins = new Set([
     "https://app.beleidsbank.nl"
   ]);
@@ -34,43 +28,26 @@ export default async function handler(req, res) {
   if (allowedOrigins.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
-
-  // Als request niet vanaf jouw site komt, blokkeren
   if (!allowedOrigins.has(origin)) {
-    return res.status(403).json({ error: "Forbidden (origin not allowed)" });
+    return res.status(403).json({ error: "Forbidden" });
   }
 
-  // -----------------------------
-  // Rate limit per IP
-  // -----------------------------
   const ip =
     (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
     req.socket?.remoteAddress ||
     "unknown";
 
-  const rl = rateLimit(ip, 10, 60_000); // 10 per minuut
-  res.setHeader("X-RateLimit-Limit", "10");
-  res.setHeader("X-RateLimit-Remaining", String(rl.remaining));
-  res.setHeader("X-RateLimit-Reset", String(Math.ceil(rl.resetAt / 1000)));
-
-  if (!rl.ok) {
-    return res.status(429).json({ error: "Too many requests. Try again in a minute." });
+  if (!rateLimit(ip).ok) {
+    return res.status(429).json({ error: "Too many requests" });
   }
 
-  const { message, municipality } = req.body || {};
+  const { message } = req.body || {};
   const q = (message || "").toString().trim();
+  if (!q) return res.status(400).json({ error: "Missing message" });
 
-  if (!q) {
-    return res.status(400).json({ error: "Missing 'message'." });
-  }
-
-  // timeout helper
   const fetchWithTimeout = async (url, options = {}, ms = 12000) => {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), ms);
@@ -84,88 +61,27 @@ export default async function handler(req, res) {
   const pickAll = (text, re) => [...text.matchAll(re)].map(m => m[1]);
 
   try {
-    // Maak zoekwoorden
-    const cleaned = q
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s]/gu, " ")
-      .replace(/\s+/g, " ")
-      .trim();
 
-    const stopwords = new Set([
-      "wat","wanneer","is","de","het","een","rond","over","in","op",
-      "van","en","voor","beleid","wet","wordt","zijn","met","hoe","waarom"
-    ]);
-
-    const keywords = cleaned
-      .split(" ")
-      .filter(w => w.length >= 3 && !stopwords.has(w))
-      .slice(0, 6);
-
+    const cleaned = q.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ");
+    const keywords = cleaned.split(/\s+/).filter(w => w.length >= 4).slice(0, 6);
     const term = keywords.length ? keywords.join(" ") : cleaned;
 
-    // 1) BWB (wetten) – landelijke wetgeving
-    const bwbSearch = async () => {
-      const bwbQuery = `overheidbwb.titel any "${term}"`;
-
-      const bwbUrl =
-        "https://zoekservice.overheid.nl/sru/Search" +
-        "?version=1.2" +
-        "&operation=searchRetrieve" +
-        "&x-connection=BWB" +
-        "&maximumRecords=8" +
-        "&startRecord=1" +
-        "&query=" + encodeURIComponent(bwbQuery);
-
-      const resp = await fetchWithTimeout(bwbUrl, {}, 12000);
-      const xml = await resp.text();
-
-      const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
-      const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
-
-      if (!ids.length) return null;
-
-      // dedupe
-      const uniq = [];
-      const seen = new Set();
-      for (let i = 0; i < ids.length; i++) {
-        const id = ids[i];
-        if (seen.has(id)) continue;
-        seen.add(id);
-
-        uniq.push({
-          title: titles[i] || `Regeling ${id}`,
-          link: `https://wetten.overheid.nl/${id}`,
-          type: "BWB (wet/regeling)"
-        });
-
-        if (uniq.length >= 3) break;
-      }
-
-      return { sources: uniq };
-    };
-
-    // 2) CVDR (decentrale regelgeving: APV/verordeningen/beleidsregels, etc.)
-    //    Alleen zinvol als er een municipality is meegegeven.
+    // -----------------------------
+    // CVDR (gemeentelijke regelingen)
+    // -----------------------------
     const cvdrSearch = async () => {
-      if (!municipality) return null;
+      const query = `keyword all "${term}"`;
 
-      // Let op: CVDR is via zoekservice.overheid.nl met x-connection=CVDR
-      // We zoeken op term + creator (gemeente).
-      const cvdrQuery = `(keyword all "${term}") AND (dcterms.creator all "${municipality}")`;
-
-      const cvdrUrl =
+      const url =
         "https://zoekservice.overheid.nl/sru/Search" +
-        "?version=1.2" +
-        "&operation=searchRetrieve" +
+        "?version=1.2&operation=searchRetrieve" +
         "&x-connection=CVDR" +
-        "&maximumRecords=8" +
-        "&startRecord=1" +
-        "&query=" + encodeURIComponent(cvdrQuery);
+        "&maximumRecords=6&startRecord=1" +
+        "&query=" + encodeURIComponent(query);
 
-      const resp = await fetchWithTimeout(cvdrUrl, {}, 12000);
+      const resp = await fetchWithTimeout(url);
       const xml = await resp.text();
 
-      // CVDR records gebruiken doorgaans dcterms:title + dcterms:identifier
       const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
       const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
 
@@ -175,130 +91,112 @@ export default async function handler(req, res) {
       const seen = new Set();
 
       for (let i = 0; i < ids.length; i++) {
-        const id = (ids[i] || "").trim();
-        if (!id) continue;
-        if (seen.has(id)) continue;
-        seen.add(id);
+        if (seen.has(ids[i])) continue;
+        seen.add(ids[i]);
 
         sources.push({
-          title: titles[i] || `Regeling ${id}`,
-          link: `https://lokaleregelgeving.overheid.nl/${id}`,
-          type: "CVDR (gemeentelijke regeling)"
+          title: titles[i] || ids[i],
+          link: `https://lokaleregelgeving.overheid.nl/${ids[i]}`,
+          type: "CVDR"
         });
 
         if (sources.length >= 3) break;
       }
 
-      if (!sources.length) return null;
-      return { sources };
+      return sources.length ? { sources } : null;
     };
 
-    // 3) OEP (officiële bekendmakingen) – voor besluiten/kennisgevingen etc.
+    // -----------------------------
+    // OEP (Gemeenteblad etc.)
+    // -----------------------------
     const oepSearch = async () => {
-      let sruQuery = `keyword all "${term}"`;
 
-      // Als municipality is meegegeven, proberen we gericht Gemeenteblad + creator te pakken.
-      // (De precieze veldnamen/filters kunnen per recordSchema verschillen; dit is een goede V1-start.)
-      if (municipality) {
-        sruQuery += ` AND (dcterms.creator all "${municipality}")`;
-        // probeer Gemeenteblad te forceren (werkt in veel OEP SRU queries)
-        sruQuery += ` AND (overheid.publicatieNaam="Gemeenteblad")`;
-      }
+      const query = `keyword all "${term}"`;
 
-      const oepUrl =
+      const url =
         "https://zoek.officielebekendmakingen.nl/sru/Search" +
-        "?version=1.2" +
-        "&operation=searchRetrieve" +
-        "&x-connection=oep" +
-        "&recordSchema=dc" +
-        "&maximumRecords=12" +
-        "&startRecord=1" +
-        "&query=" + encodeURIComponent(sruQuery);
+        "?version=1.2&operation=searchRetrieve" +
+        "&x-connection=oep&recordSchema=dc" +
+        "&maximumRecords=8&startRecord=1" +
+        "&query=" + encodeURIComponent(query);
 
-      const resp = await fetchWithTimeout(oepUrl, {}, 12000);
+      const resp = await fetchWithTimeout(url);
       const xml = await resp.text();
 
-      const titlesAll = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
-      const idsAll = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
-      const typesAll = pickAll(xml, /<dcterms:type[^>]*scheme="overheidop:([^"]+)"[^>]*>.*?<\/dcterms:type>/g);
+      const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
+      const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
 
-      // In jouw oude code blokkeerde je Provinciaalblad/Waterschapsblad.
-      // Als municipality meegegeven is, wil je juist Gemeenteblad; dit blijft OK.
-      const blockedTypes = new Set(["Provinciaalblad", "Waterschapsblad"]);
+      if (!ids.length) return null;
 
-      const records = [];
-      const n = Math.min(titlesAll.length, idsAll.length);
-      for (let i = 0; i < n; i++) {
-        const title = titlesAll[i];
-        const id = idsAll[i];
-        const type = typesAll[i] || "";
-        if (blockedTypes.has(type)) continue;
+      const sources = [];
 
-        const titleLc = (title || "").toLowerCase();
-        const hit = keywords.some(k => titleLc.includes(k));
-        const score = hit ? 1 : 0;
-
-        // Oude hacky filter op "id includes municipality" is verwijderd,
-        // omdat we nu in de query al filteren op creator + publicatieNaam.
-        records.push({
-          title,
-          link: `https://zoek.officielebekendmakingen.nl/${id}.html`,
-          type: type || "OEP",
-          score
+      for (let i = 0; i < Math.min(4, ids.length); i++) {
+        sources.push({
+          title: titles[i] || ids[i],
+          link: `https://zoek.officielebekendmakingen.nl/${ids[i]}.html`,
+          type: "OEP"
         });
       }
 
-      records.sort((a, b) => b.score - a.score);
-
-      const sources = records.slice(0, 4).map(r => ({
-        title: r.title,
-        link: r.link,
-        type: r.type
-      }));
-
-      if (!sources.length) return null;
-      return { sources };
+      return sources.length ? { sources } : null;
     };
 
     // -----------------------------
-    // Routing: welke bron eerst?
+    // BWB (landelijke wetgeving)
     // -----------------------------
-    let picked = null;
+    const bwbSearch = async () => {
 
-    if (municipality) {
-      // Gemeentelijke volgorde: eerst regelgeving (CVDR), dan bekendmakingen (OEP), dan landelijk (BWB)
-      picked = await cvdrSearch();
-      if (!picked) picked = await oepSearch();
-      if (!picked) picked = await bwbSearch();
-    } else {
-      // Landelijke volgorde: eerst BWB, dan OEP
-      picked = await bwbSearch();
-      if (!picked) picked = await oepSearch();
-    }
+      const query = `overheidbwb.titel any "${term}"`;
 
-    if (!picked || !picked.sources || picked.sources.length === 0) {
+      const url =
+        "https://zoekservice.overheid.nl/sru/Search" +
+        "?version=1.2&operation=searchRetrieve" +
+        "&x-connection=BWB" +
+        "&maximumRecords=6&startRecord=1" +
+        "&query=" + encodeURIComponent(query);
+
+      const resp = await fetchWithTimeout(url);
+      const xml = await resp.text();
+
+      const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
+      const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
+
+      if (!ids.length) return null;
+
+      const sources = [];
+
+      for (let i = 0; i < Math.min(3, ids.length); i++) {
+        sources.push({
+          title: titles[i] || ids[i],
+          link: `https://wetten.overheid.nl/${ids[i]}`,
+          type: "BWB"
+        });
+      }
+
+      return sources.length ? { sources } : null;
+    };
+
+    // -----------------------------
+    // Zoekvolgorde
+    // -----------------------------
+    let picked = await cvdrSearch();
+    if (!picked) picked = await oepSearch();
+    if (!picked) picked = await bwbSearch();
+
+    if (!picked) {
       return res.status(200).json({
-        answer:
-          "Ik kon geen betrouwbare officiële bronnen vinden voor deze vraag. Probeer een concretere wet/regelingnaam of een andere zoekterm.",
+        answer: "Geen officiële bronnen gevonden.",
         sources: []
       });
     }
 
     const sourcesText = picked.sources
-      .map((s, i) => `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}\n`)
-      .join("\n");
+      .map((s, i) => `Bron ${i + 1}: ${s.title}\n${s.link}`)
+      .join("\n\n");
 
     // -----------------------------
-    // OpenAI call (met harde error handling)
+    // OpenAI
     // -----------------------------
-    if (!process.env.OPENAI_API_KEY) {
-      console.log("CONFIG_ERROR: OPENAI_API_KEY missing");
-      return res.status(500).json({
-        error: "Server configuratie: OPENAI_API_KEY ontbreekt.",
-        sources: picked.sources
-      });
-    }
-
     const aiResp = await fetchWithTimeout(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -310,71 +208,36 @@ export default async function handler(req, res) {
         body: JSON.stringify({
           model: "gpt-4o-mini",
           temperature: 0.2,
-          max_tokens: 380,
           messages: [
             {
               role: "system",
               content: `
-Je bent Beleidsbank.nl (v1 landelijk + gemeentelijk).
-Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen.
-Noem waar mogelijk artikel/hoofdstuk/paragraaf als dat in de bron zichtbaar is; anders zeg je dat het niet zichtbaar is.
-Verzin niets en gebruik geen eigen kennis.
-Als de bronnen de vraag niet beantwoorden: zeg dat expliciet.
-
+Je bent Beleidsbank.nl.
+Je antwoordt uitsluitend op basis van de aangeleverde officiële bronnen.
 Structuur:
-1) Kort antwoord (max 4 zinnen)
-2) Toelichting (alleen uit bronnen)
-3) Bronnen (genummerd, met link)
+1. Kort antwoord
+2. Toelichting
+3. Bronnen
 `
             },
-            { role: "user", content: `Vraag:\n${q}\n\nOfficiële bronnen:\n${sourcesText}` }
+            {
+              role: "user",
+              content: `Vraag:\n${q}\n\nBronnen:\n${sourcesText}`
+            }
           ]
         })
-      },
-      20000
+      }
     );
 
-    const aiRaw = await aiResp.text();
-    let aiData = {};
-    try { aiData = JSON.parse(aiRaw); } catch(e) {}
-
-    if (!aiResp.ok) {
-      const msg = aiData?.error?.message || aiRaw || "Unknown OpenAI error";
-      console.log("OPENAI_ERROR", { status: aiResp.status, message: msg });
-
-      // Geef nette fout terug, maar mét bronnen
-      return res.status(502).json({
-        error: `AI provider error (${aiResp.status}).`,
-        details: msg,
-        sources: picked.sources
-      });
-    }
-
+    const aiData = await aiResp.json();
     const answer = aiData?.choices?.[0]?.message?.content?.trim();
 
-    if (!answer) {
-      console.log("OPENAI_EMPTY_RESPONSE", { body: aiData });
-      return res.status(502).json({
-        error: "AI gaf geen bruikbaar antwoord terug.",
-        sources: picked.sources
-      });
-    }
-
-    // Minimal logging
-    console.log(JSON.stringify({
-      t: new Date().toISOString(),
-      ip,
-      q_len: q.length,
-      sources: picked.sources.map(s => s.link).slice(0, 4)
-    }));
-
     return res.status(200).json({
-      answer: (municipality ? `Scope: Gemeente ${municipality}\n\n` : "Scope: Landelijk\n\n") + answer,
+      answer: answer || "Geen antwoord gegenereerd.",
       sources: picked.sources
     });
 
   } catch (e) {
-    console.log("SERVER_ERROR", String(e?.message || e));
-    return res.status(500).json({ error: "Interne fout bij Beleidsbank" });
+    return res.status(500).json({ error: "Interne fout" });
   }
 }
