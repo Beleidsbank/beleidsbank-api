@@ -1,6 +1,3 @@
-// -----------------------------
-// Rate limiter
-// -----------------------------
 const rateStore = new Map();
 
 function rateLimit(ip, limit = 10, windowMs = 60000) {
@@ -20,9 +17,7 @@ function rateLimit(ip, limit = 10, windowMs = 60000) {
 
 export default async function handler(req, res) {
 
-  // -----------------------------
-  // CORS
-  // -----------------------------
+  // ---------------- CORS ----------------
   res.setHeader("Access-Control-Allow-Origin", "https://app.beleidsbank.nl");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -57,50 +52,30 @@ export default async function handler(req, res) {
 
   try {
 
-    const cleaned = q.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ");
+    const cleaned = q.toLowerCase();
     const keywords = cleaned.split(/\s+/).filter(w => w.length >= 4).slice(0, 6);
     const term = keywords.join(" ");
 
-    // -----------------------------
-    // BWB
-    // -----------------------------
-    const bwbPromise = (async () => {
+    const scoreSource = (title) => {
+      let score = 0;
+      const lower = title.toLowerCase();
+
+      keywords.forEach(k => {
+        if (lower.includes(k)) score += 2;
+      });
+
+      if (cleaned.includes("apv") && lower.includes("apv")) score += 3;
+      if (cleaned.includes("wet") && lower.includes("wet")) score += 3;
+
+      const yearMatch = cleaned.match(/\b(20\d{2})\b/);
+      if (yearMatch && lower.includes(yearMatch[1])) score += 2;
+
+      return score;
+    };
+
+    const search = async (urlBuilder, type, linkBuilder) => {
       try {
-        const url =
-          "https://zoekservice.overheid.nl/sru/Search" +
-          "?version=1.2&operation=searchRetrieve" +
-          "&x-connection=BWB" +
-          "&maximumRecords=5&startRecord=1" +
-          "&query=" + encodeURIComponent(`overheidbwb.titel any "${term}"`);
-
-        const resp = await fetchWithTimeout(url);
-        const xml = await resp.text();
-
-        const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
-        const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
-
-        return ids.map((id, i) => ({
-          title: titles[i] || id,
-          link: `https://wetten.overheid.nl/${id}`,
-          type: "BWB"
-        }));
-      } catch {
-        return [];
-      }
-    })();
-
-    // -----------------------------
-    // CVDR
-    // -----------------------------
-    const cvdrPromise = (async () => {
-      try {
-        const url =
-          "https://zoekservice.overheid.nl/sru/Search" +
-          "?version=1.2&operation=searchRetrieve" +
-          "&x-connection=CVDR" +
-          "&maximumRecords=5&startRecord=1" +
-          "&query=" + encodeURIComponent(`keyword all "${term}"`);
-
+        const url = urlBuilder(term);
         const resp = await fetchWithTimeout(url);
         const xml = await resp.text();
 
@@ -109,63 +84,49 @@ export default async function handler(req, res) {
 
         return ids.map((id, i) => ({
           title: titles[i] || id,
-          link: `https://lokaleregelgeving.overheid.nl/${id}`,
-          type: "CVDR"
+          link: linkBuilder(id),
+          type
         }));
       } catch {
         return [];
       }
-    })();
+    };
 
-    // -----------------------------
-    // OEP
-    // -----------------------------
-    const oepPromise = (async () => {
-      try {
-        const url =
-          "https://zoek.officielebekendmakingen.nl/sru/Search" +
-          "?version=1.2&operation=searchRetrieve" +
-          "&x-connection=oep&recordSchema=dc" +
-          "&maximumRecords=5&startRecord=1" +
-          "&query=" + encodeURIComponent(`keyword all "${term}"`);
-
-        const resp = await fetchWithTimeout(url);
-        const xml = await resp.text();
-
-        const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
-        const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
-
-        return ids.map((id, i) => ({
-          title: titles[i] || id,
-          link: `https://zoek.officielebekendmakingen.nl/${id}.html`,
-          type: "OEP"
-        }));
-      } catch {
-        return [];
-      }
-    })();
-
-    // Parallel uitvoeren
     const [bwb, cvdr, oep] = await Promise.all([
-      bwbPromise,
-      cvdrPromise,
-      oepPromise
+
+      search(
+        term => `https://zoekservice.overheid.nl/sru/Search?version=1.2&operation=searchRetrieve&x-connection=BWB&maximumRecords=5&query=${encodeURIComponent(`overheidbwb.titel any "${term}"`)}`,
+        "BWB",
+        id => `https://wetten.overheid.nl/${id}`
+      ),
+
+      search(
+        term => `https://zoekservice.overheid.nl/sru/Search?version=1.2&operation=searchRetrieve&x-connection=CVDR&maximumRecords=5&query=${encodeURIComponent(`keyword all "${term}"`)}`,
+        "CVDR",
+        id => `https://lokaleregelgeving.overheid.nl/${id}`
+      ),
+
+      search(
+        term => `https://zoek.officielebekendmakingen.nl/sru/Search?version=1.2&operation=searchRetrieve&x-connection=oep&recordSchema=dc&maximumRecords=5&query=${encodeURIComponent(`keyword all "${term}"`)}`,
+        "OEP",
+        id => `https://zoek.officielebekendmakingen.nl/${id}.html`
+      )
     ]);
 
-    let allSources = [...bwb, ...cvdr, ...oep];
+    // Combine + deduplicate
+    const all = [...bwb, ...cvdr, ...oep];
+    const unique = [];
+    const seen = new Set();
 
-    // -----------------------------
-    // Scoring
-    // -----------------------------
-    allSources = allSources.map(s => {
-      const score = keywords.reduce((acc, k) =>
-        s.title.toLowerCase().includes(k) ? acc + 1 : acc, 0);
-      return { ...s, score };
-    });
+    for (const s of all) {
+      if (!seen.has(s.link)) {
+        seen.add(s.link);
+        unique.push({ ...s, score: scoreSource(s.title) });
+      }
+    }
 
-    allSources.sort((a, b) => b.score - a.score);
-
-    const topSources = allSources.slice(0, 4);
+    unique.sort((a, b) => b.score - a.score);
+    const topSources = unique.slice(0, 4);
 
     if (!topSources.length) {
       return res.status(200).json({
@@ -178,9 +139,6 @@ export default async function handler(req, res) {
       .map((s, i) => `Bron ${i + 1}: ${s.title}\n${s.link}`)
       .join("\n\n");
 
-    // -----------------------------
-    // OpenAI
-    // -----------------------------
     const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -195,11 +153,11 @@ export default async function handler(req, res) {
             role: "system",
             content: `
 Je bent Beleidsbank.nl.
-Gebruik uitsluitend de aangeleverde officiële bronnen.
+Gebruik uitsluitend de aangeleverde bronnen.
 Geef:
 1. Kort antwoord
 2. Toelichting
-3. Bronnen
+Geef GEEN aparte bronnenlijst.
 `
           },
           {
@@ -218,7 +176,7 @@ Geef:
       sources: topSources
     });
 
-  } catch (e) {
+  } catch {
     return res.status(500).json({ error: "Interne fout" });
   }
 }
