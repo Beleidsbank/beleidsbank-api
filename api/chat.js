@@ -70,7 +70,10 @@ function hasMeaningfulDetail(s) {
 /* ================================
    ABSOLUTE BAN: WABO must never show
 ================================ */
-const BANNED_BWBR_IDS = new Set(["BWBR0047270"]); // Wabo
+const BANNED_BWBR_IDS = new Set([
+  "BWBR0047270", // Wabo (you observed)
+  "BWBR0024779"  // Wabo (official id)
+]);
 
 function isBannedSource(item) {
   const id = (item?.id || "").toString().trim().toUpperCase();
@@ -116,8 +119,8 @@ function isLegalBasisQuestion(qLc) {
     qLc.includes("juridische grondslag") ||
     qLc.includes("bevoegdheid") ||
     qLc.includes("grondslag") ||
-    qLc.includes("vereist") && (qLc.includes("omgevingsvergunning") || qLc.includes("vergunning")) ||
-    qLc.includes("vergunningplicht")
+    qLc.includes("vergunningplicht") ||
+    (qLc.includes("vereist") && (qLc.includes("omgevingsvergunning") || qLc.includes("vergunning")))
   );
 }
 
@@ -132,17 +135,15 @@ function isExplicitMunicipalTopic(qLc) {
     qLc.includes("parkeervergunning") ||
     qLc.includes("horeca") ||
     qLc.includes("sluitingstijden") ||
-    qLc.includes("handhaving") && qLc.includes("gemeente") ||
     qLc.includes("gemeentelijke verordening") ||
-    qLc.includes("beleidsregel") && qLc.includes("gemeente")
+    (qLc.includes("beleidsregel") && qLc.includes("gemeente"))
   );
 }
 
 function isOmgevingsplanLocalInterpretationQuestion(qLc) {
-  // Local interpretation questions about what the municipal plan says in a place/area.
   return (
     (qLc.includes("wat staat er in") && qLc.includes("omgevingsplan")) ||
-    (qLc.includes("regels") && qLc.includes("omgevingsplan") && (qLc.includes("amsterdam") || qLc.includes("gemeente"))) ||
+    (qLc.includes("regels") && qLc.includes("omgevingsplan") && (qLc.includes("gemeente") || qLc.includes("stadsdeel"))) ||
     (qLc.includes("omgevingsplan") && (qLc.includes("locatie") || qLc.includes("adres") || qLc.includes("gebied") || qLc.includes("perceel"))) ||
     (qLc.includes("omgevingsplan") && qLc.includes("van de gemeente"))
   );
@@ -159,19 +160,18 @@ function isTooVagueGeneral(q) {
   return false;
 }
 
-function decideScope(q, municipalityKnown) {
+function decideScope(q) {
   const qLc = normalize(q);
 
-  // If it asks for legal basis / permit requirement / which provision => NATIONAL (even if a municipality is mentioned)
+  // Legal basis / permit requirement => NATIONAL (even if municipality mentioned)
   if (isLegalBasisQuestion(qLc)) return "national";
 
-  // Explicit municipal topics => MUNICIPAL (ask municipality if missing)
+  // Explicit municipal topics => MUNICIPAL
   if (isExplicitMunicipalTopic(qLc)) return "municipal";
 
-  // Omgevingsplan can be municipal only when it is clearly about local plan contents at a location/area
+  // Omgevingsplan municipal only if question is clearly about the plan’s local contents at a location
   if (isOmgevingsplanLocalInterpretationQuestion(qLc)) return "municipal";
 
-  // Otherwise default to national (covers "wet/regeling" type questions)
   return "national";
 }
 
@@ -188,6 +188,52 @@ function makeFetchWithTimeout() {
       clearTimeout(id);
     }
   };
+}
+
+/* ================================
+   Extract snippet from wetten.overheid.nl
+   - We do this ONLY for Omgevingswet article 5.1 area to enable accurate “which provision”
+================================ */
+function htmlToTextLite(html) {
+  return (html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<\/(p|div|li|h1|h2|h3|h4|h5|h6|br)>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function extractAround(text, needle, radius = 1200) {
+  const idx = text.toLowerCase().indexOf(needle.toLowerCase());
+  if (idx === -1) return null;
+  const start = Math.max(0, idx - radius);
+  const end = Math.min(text.length, idx + radius);
+  return text.slice(start, end).trim();
+}
+
+async function wettenSnippetOmgevingswetArt51(fetchWithTimeout) {
+  const url = "https://wetten.overheid.nl/BWBR0037885";
+  const resp = await fetchWithTimeout(url, {}, 12000);
+  const html = await resp.text();
+  const text = htmlToTextLite(html);
+
+  // Try “Artikel 5.1” first
+  let snip = extractAround(text, "Artikel 5.1", 1500);
+  if (!snip) snip = extractAround(text, "5.1", 1500);
+
+  // If still nothing, return a small beginning (fallback)
+  if (!snip) return text.slice(0, 2000);
+
+  // Keep it small for tokens, but enough for model to cite lid/onderdeel if present
+  return snip.slice(0, 2400);
 }
 
 /* ================================
@@ -265,12 +311,14 @@ async function oepSearch({ municipalityName, topicWords, fetchWithTimeout }) {
 }
 
 /* ================================
-   SRU search: BWB (robust)
-   - Pass 1: prefer Omgevingswet-stelsel titles for omgevingsplan/vergunning questions
-   - Pass 2: generic title search on question
-   - Always hard-filter Wabo afterwards
+   SRU search: BWB (improved for legal-basis questions)
+   - If question is about permit requirement / legal basis for omgevingsplan deviation:
+     ALWAYS include Omgevingswet BWBR0037885 as top candidate + snippet.
+   - Avoid amendment/noise by prioritizing primary titles.
 ================================ */
-async function bwbSearch({ q, preferOmgevingsStelsel, fetchWithTimeout }) {
+const OMGEVINGSWET_ID = "BWBR0037885";
+
+async function bwbSearch({ q, fetchWithTimeout, forceOmgevingswet }) {
   const base = "https://zoekservice.overheid.nl/sru/Search";
   const safeQ = (q || "").replaceAll('"', "");
 
@@ -300,32 +348,50 @@ async function bwbSearch({ q, preferOmgevingsStelsel, fetchWithTimeout }) {
     return items;
   };
 
-  if (preferOmgevingsStelsel) {
-    const preferred = [
-      `overheidbwb.titel any "Omgevingswet"`,
-      `overheidbwb.titel any "Omgevingsbesluit"`,
-      `overheidbwb.titel any "Besluit bouwwerken leefomgeving"`,
-      `overheidbwb.titel any "Besluit kwaliteit leefomgeving"`,
-      `overheidbwb.titel any "Besluit activiteiten leefomgeving"`,
-      `overheidbwb.titel any "Invoeringswet Omgevingswet"`
-    ].join(" OR ");
+  // 1) Force primary Omgevingswet and core decrees FIRST (reduces amendments)
+  const coreTitles = [
+    `overheidbwb.titel any "Omgevingswet"`,
+    `overheidbwb.titel any "Omgevingsbesluit"`,
+    `overheidbwb.titel any "Besluit bouwwerken leefomgeving"`,
+    `overheidbwb.titel any "Besluit kwaliteit leefomgeving"`,
+    `overheidbwb.titel any "Besluit activiteiten leefomgeving"`,
+    `overheidbwb.titel any "Invoeringswet Omgevingswet"`
+  ].join(" OR ");
 
-    const qPart = safeQ ? ` OR (overheidbwb.titel any "${safeQ}")` : "";
-    const cql1 = `(${preferred}${qPart})`;
-
-    const res1 = await run(cql1);
-    if (res1.length) return res1;
+  const resCore = await run(`(${coreTitles})`);
+  if (resCore.length) {
+    // If forceOmgevingswet, ensure the Omgevingswet itself is present even if SRU missed it.
+    if (forceOmgevingswet && !resCore.some(x => (x.id || "").toUpperCase() === OMGEVINGSWET_ID)) {
+      resCore.unshift({
+        id: OMGEVINGSWET_ID,
+        title: "Omgevingswet",
+        link: `https://wetten.overheid.nl/${OMGEVINGSWET_ID}`,
+        type: "BWB"
+      });
+    }
+    return resCore;
   }
 
-  const cql2 = `overheidbwb.titel any "${safeQ}"`;
-  const res2 = await run(cql2);
+  // 2) Generic fallback: title any question (still filter Wabo later)
+  const res2 = await run(`overheidbwb.titel any "${safeQ}"`);
   if (res2.length) return res2;
 
+  // 3) Broad fallback: keyword splits
   const words = normalize(q).split(/\s+/).filter(w => w.length >= 6).slice(0, 6);
   if (words.length) {
     const cql3 = words.map(w => `overheidbwb.titel any "${w}"`).join(" OR ");
     const res3 = await run(cql3);
     if (res3.length) return res3;
+  }
+
+  // 4) Final: return at least Omgevingswet if forced
+  if (forceOmgevingswet) {
+    return removeBanned([{
+      id: OMGEVINGSWET_ID,
+      title: "Omgevingswet",
+      link: `https://wetten.overheid.nl/${OMGEVINGSWET_ID}`,
+      type: "BWB"
+    }]);
   }
 
   return [];
@@ -339,20 +405,27 @@ function scoreSource({ s, qLc, scope }) {
   const t = normalize(s?.title || "");
   let score = 0;
 
-  if (t.includes("omgevingswet")) score += 10;
-  if (t.includes("omgevingsbesluit")) score += 7;
-  if (t.includes("besluit bouwwerken leefomgeving")) score += 9;
-  if (t.includes("besluit kwaliteit leefomgeving")) score += 9;
-  if (t.includes("besluit activiteiten leefomgeving")) score += 8;
+  // Strongly prefer primary Omgevingswet for legal-basis questions
+  if ((s.id || "").toUpperCase() === OMGEVINGSWET_ID) score += 50;
 
-  const kw = qLc.split(/\s+/).filter(w => w.length >= 5).slice(0, 10);
+  if (t === "omgevingswet" || t.includes("omgevingswet")) score += 20;
+  if (t.includes("omgevingsbesluit")) score += 10;
+  if (t.includes("besluit bouwwerken leefomgeving")) score += 12;
+  if (t.includes("besluit kwaliteit leefomgeving")) score += 12;
+  if (t.includes("besluit activiteiten leefomgeving")) score += 11;
+
+  // Deprioritize amendment-y titles a bit
+  if (t.includes("wijzig") || t.includes("aanvullings") || t.includes("verzamel")) score -= 4;
+
+  // Match question keywords
+  const kw = qLc.split(/\s+/).filter(w => w.length >= 5).slice(0, 12);
   for (const w of kw) if (t.includes(w)) score += 0.7;
 
   if (scope === "municipal") {
-    if (s.type === "CVDR") score += 2.8;
-    if ((s.type || "").toLowerCase().includes("gemeenteblad")) score += 1.2;
+    if (s.type === "CVDR") score += 3;
+    if ((s.type || "").toLowerCase().includes("gemeenteblad")) score += 1;
   } else {
-    if (s.type === "BWB") score += 2.4;
+    if (s.type === "BWB") score += 2.5;
   }
 
   return score;
@@ -459,9 +532,9 @@ export default async function handler(req, res) {
     const municipality = collected.municipality || null;
 
     // -----------------------------
-    // 1) Decide scope (FIXED)
+    // 1) Decide scope
     // -----------------------------
-    const scope = decideScope(q, !!municipality);
+    const scope = decideScope(q);
 
     // Ask municipality only if scope is municipal and municipality missing
     if (scope === "municipal" && !municipality) {
@@ -480,7 +553,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ answer: askForMissing(need), sources: [] });
     }
 
-    // If national scope but question is too vague, ask topic hint (generic)
+    // If national scope but too vague, ask topic hint
     if (scope === "national" && isTooVagueGeneral(q) && !collected.topic_hint) {
       if (sessionId) {
         pendingStore.set(sessionId, {
@@ -498,6 +571,11 @@ export default async function handler(req, res) {
     // 2) Search sources
     // -----------------------------
     let sources = [];
+
+    const isOmgevingsplanDeviationLegalBasis =
+      (qLc.includes("afwijken") || qLc.includes("afwijking") || qLc.includes("tijdelijk")) &&
+      qLc.includes("omgevingsplan") &&
+      (qLc.includes("omgevingsvergunning") || qLc.includes("vergunning") || qLc.includes("welke bepaling") || qLc.includes("welk artikel"));
 
     if (scope === "municipal" && municipality) {
       if (isTerraceQuestion(qLc)) {
@@ -522,19 +600,14 @@ export default async function handler(req, res) {
         if (!sources.length) sources = await oepSearch({ municipalityName: municipality, topicWords: topic, fetchWithTimeout });
       }
     } else {
-      const preferOmgevingsStelsel =
-        qLc.includes("omgevingsplan") ||
-        qLc.includes("buitenplanse") ||
-        qLc.includes("bouwactiviteit") ||
-        qLc.includes("omgevingsvergunning") ||
-        qLc.includes("bopa") ||
-        qLc.includes("tijdelijk afwijken");
-
       const q2 = (collected.topic_hint && hasMeaningfulDetail(collected.topic_hint))
         ? `${q} ${collected.topic_hint}`
         : q;
 
-      sources = await bwbSearch({ q: q2, preferOmgevingsStelsel, fetchWithTimeout });
+      // Force Omgevingswet for this category of question
+      const forceOw = !!isOmgevingsplanDeviationLegalBasis || isLegalBasisQuestion(qLc) || qLc.includes("omgevingsplanactiviteit") || qLc.includes("bopa");
+
+      sources = await bwbSearch({ q: q2, fetchWithTimeout, forceOmgevingswet: forceOw });
     }
 
     sources = removeBanned(dedupeByLink(sources));
@@ -549,12 +622,35 @@ export default async function handler(req, res) {
     }
 
     // -----------------------------
-    // 3) Answer ONLY from provided sources
+    // 3) Build sourcesText + (critical) include Omgevingswet art. 5.1 snippet if relevant
     // -----------------------------
-    const sourcesText = sources
-      .map((s, i) => `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}`)
-      .join("\n\n");
+    const needOwSnippet =
+      scope === "national" &&
+      (isOmgevingsplanDeviationLegalBasis || isLegalBasisQuestion(qLc) || qLc.includes("omgevingsplanactiviteit") || qLc.includes("bopa"));
 
+    let owSnippet = null;
+    if (needOwSnippet) {
+      try {
+        owSnippet = await wettenSnippetOmgevingswetArt51(fetchWithTimeout);
+      } catch {
+        owSnippet = null;
+      }
+    }
+
+    const sourcesText = sources
+      .map((s, i) => {
+        const head = `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}`;
+        const isOw = (s.id || "").toUpperCase() === OMGEVINGSWET_ID || normalize(s.title) === "omgevingswet";
+        if (isOw && owSnippet) {
+          return `${head}\n\nRelevante tekst (uittreksel):\n${owSnippet}`;
+        }
+        return head;
+      })
+      .join("\n\n---\n\n");
+
+    // -----------------------------
+    // 4) Answer ONLY from provided sources
+    // -----------------------------
     const aiResp = await fetchWithTimeout(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -565,32 +661,32 @@ export default async function handler(req, res) {
         },
         body: JSON.stringify({
           model: "gpt-4o-mini",
-          temperature: 0.15,
-          max_tokens: 520,
+          temperature: 0.1,
+          max_tokens: 650,
           messages: [
             {
               role: "system",
               content: `
-Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen.
+Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen (incl. eventuele uittreksels).
 
 STRICT:
-- Gebruik uitsluitend wat je uit de bronvermelding kunt afleiden.
 - Noem GEEN wet/regeling als die naam/titel niet in de bronvermelding staat.
-- Noem GEEN artikelnummer/bepaling als het artikelnummer niet letterlijk in de bronvermelding staat.
+- Noem GEEN artikelnummer/bepaling als die niet letterlijk in de brontekst/uittreksel staat.
 - NOOIT Wabo (Wet algemene bepalingen omgevingsrecht) noemen of gebruiken.
-- Als de vraag vraagt naar een bepaling maar de bronvermelding bevat die niet: zeg dat expliciet.
+- Als de vraag vraagt naar een bepaling maar die staat niet letterlijk in de bronvermelding/uittreksel: zeg dat expliciet (geen aannames).
 
 Geef:
-1) Kort antwoord (max 4 zinnen)
-2) Toelichting (bulletpoints) — alleen uit bronvermelding
-Geef GEEN aparte bronnenlijst.
+1) Kort antwoord (max 3 zinnen)
+2) Grondslag (exacte bepaling/ artikel/ lid/ onderdeel als die letterlijk in de bron staat)
+3) Toelichting (bulletpoints) — alleen uit bron
+Geen aparte bronnenlijst.
 `
             },
             {
               role: "user",
               content:
                 `Vraag:\n${q}\n` +
-                (municipality ? `Gemeente: ${municipality}\n` : "") +
+                (municipality ? `Gemeente (context): ${municipality}\n` : "") +
                 `\nOfficiële bronnen:\n${sourcesText}`
             }
           ]
@@ -608,9 +704,10 @@ Geef GEEN aparte bronnenlijst.
 
     const ansLc = normalize(answer);
     if (ansLc.includes("wabo") || ansLc.includes("wet algemene bepalingen omgevingsrecht")) {
-      answer = "Ik kan dit niet beantwoorden op basis van de aangeleverde bronnen (Wabo is niet toegestaan) en er staat geen expliciete actuele bepaling in de bronvermelding.";
+      answer = "Ik kan dit niet beantwoorden op basis van de aangeleverde bronnen (Wabo is niet toegestaan) en er staat geen expliciete actuele bepaling in de bronvermelding/uittreksel.";
     }
 
+    // Never return banned sources
     sources = removeBanned(sources);
 
     return res.status(200).json({ answer, sources });
