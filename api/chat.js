@@ -52,9 +52,9 @@ export default async function handler(req, res) {
 
   try {
 
-    // =========================================================
-    // 1️⃣ AI ROUTER (CLASSIFICATIE)
-    // =========================================================
+    // =====================================================
+    // 1️⃣ AI ROUTER (ALLEEN CLASSIFICATIE)
+    // =====================================================
 
     const routerResp = await fetchWithTimeout(
       "https://api.openai.com/v1/chat/completions",
@@ -71,7 +71,8 @@ export default async function handler(req, res) {
             {
               role: "system",
               content: `
-Classificeer de vraag in één van de volgende categorieën:
+Classificeer deze vraag in één categorie:
+
 - national
 - municipal_regulation
 - municipal_decision
@@ -86,113 +87,122 @@ Geef alleen JSON terug:
       }
     );
 
-    const routerData = await routerResp.json();
     let routeType = "national";
-
     try {
+      const routerData = await routerResp.json();
       routeType = JSON.parse(routerData.choices[0].message.content).type;
     } catch {
       routeType = "national";
     }
 
-    // =========================================================
-    // 2️⃣ GERichte ZOEK
-    // =========================================================
-
     const cleaned = q.toLowerCase();
-    const keywords = cleaned.split(/\s+/).filter(w => w.length >= 4).slice(0, 6);
-    const term = keywords.join(" ");
 
-    const scoreSource = (title) => {
-      let score = 0;
-      const lower = title.toLowerCase();
-
-      keywords.forEach(k => {
-        if (lower.includes(k)) score += 2;
-      });
-
-      if (cleaned.includes("apv") && lower.includes("apv")) score += 5;
-      if (cleaned.includes("wet") && lower.includes("wet")) score += 5;
-
-      return score;
-    };
-
-    const search = async (urlBuilder, linkBuilder) => {
-      try {
-        const resp = await fetchWithTimeout(urlBuilder(term));
-        const xml = await resp.text();
-
-        const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
-        const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
-
-        return ids.map((id, i) => ({
-          title: titles[i] || id,
-          link: linkBuilder(id)
-        }));
-      } catch {
-        return [];
-      }
-    };
+    // =====================================================
+    // 2️⃣ GERichte ZOEK PER TYPE
+    // =====================================================
 
     let results = [];
 
+    // -------- NATIONAL (BWB) --------
     if (routeType === "national") {
-      results = await search(
-        term => `https://zoekservice.overheid.nl/sru/Search?version=1.2&operation=searchRetrieve&x-connection=BWB&maximumRecords=5&query=${encodeURIComponent(`overheidbwb.titel any "${term}"`)}`,
-        id => `https://wetten.overheid.nl/${id}`
-      );
+
+      const query = `overheidbwb.titel any "${q}"`;
+
+      const url =
+        "https://zoekservice.overheid.nl/sru/Search" +
+        "?version=1.2&operation=searchRetrieve" +
+        "&x-connection=BWB" +
+        "&maximumRecords=5" +
+        "&query=" + encodeURIComponent(query);
+
+      const resp = await fetchWithTimeout(url);
+      const xml = await resp.text();
+
+      const ids = pickAll(xml, /<dcterms:identifier>(BWBR[0-9A-Z]+)<\/dcterms:identifier>/g);
+      const titles = pickAll(xml, /<overheidbwb:titel>(.*?)<\/overheidbwb:titel>/g);
+
+      results = ids.map((id, i) => ({
+        title: titles[i] || id,
+        link: `https://wetten.overheid.nl/${id}`
+      }));
     }
 
+    // -------- MUNICIPAL REGULATION (CVDR) --------
     if (routeType === "municipal_regulation") {
-      results = await search(
-        term => `https://zoekservice.overheid.nl/sru/Search?version=1.2&operation=searchRetrieve&x-connection=CVDR&maximumRecords=5&query=${encodeURIComponent(`keyword all "${term}"`)}`,
-        id => `https://lokaleregelgeving.overheid.nl/${id}`
-      );
+
+      const query = `dcterms.title any "${q}"`;
+
+      const url =
+        "https://zoekservice.overheid.nl/sru/Search" +
+        "?version=1.2&operation=searchRetrieve" +
+        "&x-connection=CVDR" +
+        "&maximumRecords=5" +
+        "&query=" + encodeURIComponent(query);
+
+      const resp = await fetchWithTimeout(url);
+      const xml = await resp.text();
+
+      const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
+      const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
+
+      results = ids.map((id, i) => ({
+        title: titles[i] || id,
+        link: `https://lokaleregelgeving.overheid.nl/${id}`
+      }));
     }
 
+    // -------- MUNICIPAL DECISION (OEP - Gemeenteblad) --------
     if (routeType === "municipal_decision") {
-      results = await search(
-        term => `https://zoek.officielebekendmakingen.nl/sru/Search?version=1.2&operation=searchRetrieve&x-connection=oep&recordSchema=dc&maximumRecords=5&query=${encodeURIComponent(`keyword all "${term}"`)}`,
-        id => `https://zoek.officielebekendmakingen.nl/${id}.html`
-      );
+
+      const query = `publicatieNaam="Gemeenteblad" AND titel any "${q}"`;
+
+      const url =
+        "https://zoek.officielebekendmakingen.nl/sru/Search" +
+        "?version=1.2&operation=searchRetrieve" +
+        "&x-connection=oep&recordSchema=dc" +
+        "&maximumRecords=5" +
+        "&query=" + encodeURIComponent(query);
+
+      const resp = await fetchWithTimeout(url);
+      const xml = await resp.text();
+
+      const ids = pickAll(xml, /<dcterms:identifier>(.*?)<\/dcterms:identifier>/g);
+      const titles = pickAll(xml, /<dcterms:title>(.*?)<\/dcterms:title>/g);
+
+      results = ids.map((id, i) => ({
+        title: titles[i] || id,
+        link: `https://zoek.officielebekendmakingen.nl/${id}.html`
+      }));
     }
 
-    // fallback als niets gevonden
+    // Fallback
     if (!results.length) {
-      results = await search(
-        term => `https://zoekservice.overheid.nl/sru/Search?version=1.2&operation=searchRetrieve&x-connection=BWB&maximumRecords=5&query=${encodeURIComponent(`keyword all "${term}"`)}`,
-        id => `https://wetten.overheid.nl/${id}`
-      );
-    }
-
-    // deduplicate
-    const unique = [];
-    const seen = new Set();
-
-    for (const r of results) {
-      if (!seen.has(r.link)) {
-        seen.add(r.link);
-        unique.push({ ...r, score: scoreSource(r.title) });
-      }
-    }
-
-    unique.sort((a, b) => b.score - a.score);
-    const topSources = unique.slice(0, 4);
-
-    if (!topSources.length) {
       return res.status(200).json({
         answer: "Geen officiële bronnen gevonden.",
         sources: []
       });
     }
 
+    // Deduplicatie
+    const unique = [];
+    const seen = new Set();
+
+    for (const r of results) {
+      if (!seen.has(r.link)) {
+        seen.add(r.link);
+        unique.push(r);
+      }
+    }
+
+    const topSources = unique.slice(0, 4);
+
     const sourcesText = topSources
       .map((s, i) => `Bron ${i + 1}: ${s.title}\n${s.link}`)
       .join("\n\n");
 
-    // =========================================================
+    // =====================================================
     // 3️⃣ ANTWOORD GENEREREN
-    // =========================================================
+    // =====================================================
 
     const aiResp = await fetchWithTimeout(
       "https://api.openai.com/v1/chat/completions",
@@ -233,7 +243,7 @@ Geef GEEN aparte bronnenlijst.
       sources: topSources
     });
 
-  } catch {
+  } catch (e) {
     return res.status(500).json({ error: "Interne fout" });
   }
 }
