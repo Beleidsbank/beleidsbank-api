@@ -1,4 +1,8 @@
 // /api/chat.js
+// Fix: force correct “grondslag + bewijsquote” by (1) fetching Omgevingswet snippet,
+// (2) extracting a concrete quote candidate server-side, (3) requiring the model to
+// use that exact quote (or explicitly say it’s missing), and (4) post-validating
+// the model output with a hard fallback if it still freewheels.
 
 const rateStore = new Map();
 const pendingStore = new Map();
@@ -71,8 +75,8 @@ function hasMeaningfulDetail(s) {
    ABSOLUTE BAN: WABO must never show
 ================================ */
 const BANNED_BWBR_IDS = new Set([
-  "BWBR0047270", // Wabo (observed earlier)
-  "BWBR0024779"  // Wabo (official id)
+  "BWBR0047270", // (you observed earlier)
+  "BWBR0024779"  // Wabo official id
 ]);
 
 function isBannedSource(item) {
@@ -184,7 +188,7 @@ function makeFetchWithTimeout() {
 }
 
 /* ================================
-   Extract snippet from wetten.overheid.nl (Omgevingswet art. 5.1 context)
+   wetten.overheid.nl snippet + quote candidate (server-side)
 ================================ */
 function htmlToTextLite(html) {
   return (html || "")
@@ -203,12 +207,41 @@ function htmlToTextLite(html) {
     .trim();
 }
 
-function extractAround(text, needle, radius = 1600) {
+function extractAround(text, needle, radius = 1800) {
   const idx = text.toLowerCase().indexOf(needle.toLowerCase());
   if (idx === -1) return null;
   const start = Math.max(0, idx - radius);
   const end = Math.min(text.length, idx + radius);
   return text.slice(start, end).trim();
+}
+
+function wordsMax(str, maxWords = 25) {
+  const w = (str || "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+  return w.slice(0, maxWords).join(" ");
+}
+
+function extractQuoteCandidateFromSnippet(snip) {
+  const t = (snip || "").replace(/\r/g, "\n");
+  const lines = t.split("\n").map(x => x.trim()).filter(Boolean);
+
+  // Prefer a line that includes both "omgevingsvergunning" and "omgevingsplan"
+  const a = lines.find(l => /omgevingsvergunning/i.test(l) && /omgevingsplan/i.test(l));
+  if (a) return wordsMax(a, 25);
+
+  // Otherwise, any line containing "omgevingsvergunning"
+  const b = lines.find(l => /omgevingsvergunning/i.test(l));
+  if (b) return wordsMax(b, 25);
+
+  // Fallback: some text near the word
+  const flat = lines.join(" ");
+  const idx = flat.toLowerCase().indexOf("omgevingsvergunning");
+  if (idx !== -1) {
+    const start = Math.max(0, idx - 140);
+    const end = Math.min(flat.length, idx + 220);
+    return wordsMax(flat.slice(start, end), 25);
+  }
+
+  return null;
 }
 
 async function wettenSnippetOmgevingswetArt51(fetchWithTimeout) {
@@ -217,11 +250,11 @@ async function wettenSnippetOmgevingswetArt51(fetchWithTimeout) {
   const html = await resp.text();
   const text = htmlToTextLite(html);
 
-  let snip = extractAround(text, "Artikel 5.1", 1800);
-  if (!snip) snip = extractAround(text, "5.1", 1800);
+  let snip = extractAround(text, "Artikel 5.1", 2000);
+  if (!snip) snip = extractAround(text, "5.1", 2000);
+  if (!snip) return text.slice(0, 3200);
 
-  if (!snip) return text.slice(0, 2600);
-  return snip.slice(0, 3000);
+  return snip.slice(0, 3400);
 }
 
 /* ================================
@@ -299,7 +332,7 @@ async function oepSearch({ municipalityName, topicWords, fetchWithTimeout }) {
 }
 
 /* ================================
-   SRU search: BWB (improved for legal-basis questions)
+   SRU search: BWB (prefer core titles)
 ================================ */
 const OMGEVINGSWET_ID = "BWBR0037885";
 
@@ -333,6 +366,7 @@ async function bwbSearch({ q, fetchWithTimeout, forceOmgevingswet }) {
     return items;
   };
 
+  // Core stelsel
   const coreTitles = [
     `overheidbwb.titel any "Omgevingswet"`,
     `overheidbwb.titel any "Omgevingsbesluit"`,
@@ -385,7 +419,7 @@ function scoreSource({ s, qLc, scope }) {
   const t = normalize(s?.title || "");
   let score = 0;
 
-  if ((s.id || "").toUpperCase() === OMGEVINGSWET_ID) score += 50;
+  if ((s.id || "").toUpperCase() === OMGEVINGSWET_ID) score += 60;
 
   if (t.includes("omgevingswet")) score += 20;
   if (t.includes("omgevingsbesluit")) score += 10;
@@ -393,7 +427,8 @@ function scoreSource({ s, qLc, scope }) {
   if (t.includes("besluit kwaliteit leefomgeving")) score += 12;
   if (t.includes("besluit activiteiten leefomgeving")) score += 11;
 
-  if (t.includes("wijzig") || t.includes("aanvullings") || t.includes("verzamel")) score -= 4;
+  // push amendments down
+  if (t.includes("wijzig") || t.includes("aanvullings") || t.includes("verzamel") || t.includes("besluit beperkingengebied")) score -= 6;
 
   const kw = qLc.split(/\s+/).filter(w => w.length >= 5).slice(0, 12);
   for (const w of kw) if (t.includes(w)) score += 0.7;
@@ -413,6 +448,25 @@ function rankSources(sources, q, scope) {
   const scored = (sources || []).map(s => ({ ...s, _score: scoreSource({ s, qLc, scope }) }));
   scored.sort((a, b) => (b._score || 0) - (a._score || 0));
   return scored.filter(x => x._score > -9990);
+}
+
+/* ================================
+   Post-validate model output (hard fallback)
+================================ */
+function hasSection(answer, label) {
+  const a = (answer || "").toLowerCase();
+  return a.includes(label.toLowerCase() + ":");
+}
+
+function hardFallbackLegalBasis({ q, quoteCandidate }) {
+  const qc = quoteCandidate ? `Bewijsquote: "${quoteCandidate}"` : "Bewijsquote: (niet gevonden in het aangeleverde uittreksel)";
+  return [
+    `1) Antwoord: Voor afwijken van het omgevingsplan kan een omgevingsvergunningplicht gelden; de exacte grondslag moet uit de aangeleverde tekst blijken.`,
+    `2) Grondslag: Artikel 5.1 Omgevingswet (alleen “Artikel 5.1” is zichtbaar in de aangeleverde tekst; lid/onderdeel: niet zichtbaar).`,
+    `3) ${qc}`,
+    `4) Toelichting:`,
+    `- Ik kan alleen verwijzen naar wat in de aangeleverde tekst/uittreksel staat; als lid/onderdeel ontbreekt, kan ik dat niet aanvullen.`
+  ].join("\n");
 }
 
 /* ================================
@@ -466,21 +520,10 @@ export default async function handler(req, res) {
       collected = { ...(pending.collected || {}) };
       const missing = pending.missingSlots || [];
 
-      if (missing.includes("municipality") && looksLikeMunicipality(q)) {
-        collected.municipality = q.trim();
-      }
-
-      if (missing.includes("terrace_type") && !collected.terrace_type) {
-        if (hasMeaningfulDetail(q)) collected.terrace_type = q.trim();
-      }
-
-      if (missing.includes("location_hint") && !collected.location_hint) {
-        if (hasMeaningfulDetail(q)) collected.location_hint = q.trim();
-      }
-
-      if (missing.includes("topic_hint") && !collected.topic_hint) {
-        if (hasMeaningfulDetail(q)) collected.topic_hint = q.trim();
-      }
+      if (missing.includes("municipality") && looksLikeMunicipality(q)) collected.municipality = q.trim();
+      if (missing.includes("terrace_type") && !collected.terrace_type && hasMeaningfulDetail(q)) collected.terrace_type = q.trim();
+      if (missing.includes("location_hint") && !collected.location_hint && hasMeaningfulDetail(q)) collected.location_hint = q.trim();
+      if (missing.includes("topic_hint") && !collected.topic_hint && hasMeaningfulDetail(q)) collected.topic_hint = q.trim();
 
       const stillMissing = [];
       for (const slot of missing) {
@@ -525,7 +568,6 @@ export default async function handler(req, res) {
           attempts: 0
         });
       }
-
       return res.status(200).json({ answer: askForMissing(need), sources: [] });
     }
 
@@ -556,35 +598,20 @@ export default async function handler(req, res) {
       if (isTerraceQuestion(qLc)) {
         const topic1 = "algemene plaatselijke verordening APV terras terrassen horeca";
         sources = await cvdrSearch({ municipalityName: municipality, topicWords: topic1, fetchWithTimeout });
-
-        if (!sources.length) {
-          const topic2 = "terras terrassen terrasvergunning horeca";
-          sources = await cvdrSearch({ municipalityName: municipality, topicWords: topic2, fetchWithTimeout });
-        }
-
-        if (!sources.length) {
-          const topic3 = "terras terrassen horeca";
-          sources = await oepSearch({ municipalityName: municipality, topicWords: topic3, fetchWithTimeout });
-        }
+        if (!sources.length) sources = await cvdrSearch({ municipalityName: municipality, topicWords: "terras terrassen terrasvergunning horeca", fetchWithTimeout });
+        if (!sources.length) sources = await oepSearch({ municipalityName: municipality, topicWords: "terras terrassen horeca", fetchWithTimeout });
       } else {
-        const topic = (collected.topic_hint && hasMeaningfulDetail(collected.topic_hint))
-          ? `${collected.topic_hint} ${q}`
-          : q;
-
+        const topic = (collected.topic_hint && hasMeaningfulDetail(collected.topic_hint)) ? `${collected.topic_hint} ${q}` : q;
         sources = await cvdrSearch({ municipalityName: municipality, topicWords: topic, fetchWithTimeout });
         if (!sources.length) sources = await oepSearch({ municipalityName: municipality, topicWords: topic, fetchWithTimeout });
       }
     } else {
-      const q2 = (collected.topic_hint && hasMeaningfulDetail(collected.topic_hint))
-        ? `${q} ${collected.topic_hint}`
-        : q;
-
+      const q2 = (collected.topic_hint && hasMeaningfulDetail(collected.topic_hint)) ? `${q} ${collected.topic_hint}` : q;
       const forceOw =
         !!isOmgevingsplanDeviationLegalBasis ||
         isLegalBasisQuestion(qLc) ||
         qLc.includes("omgevingsplanactiviteit") ||
         qLc.includes("bopa");
-
       sources = await bwbSearch({ q: q2, fetchWithTimeout, forceOmgevingswet: forceOw });
     }
 
@@ -593,25 +620,28 @@ export default async function handler(req, res) {
 
     if (!sources.length) {
       return res.status(200).json({
-        answer:
-          "Geen officiële bronnen gevonden. Probeer iets specifieker te formuleren (relevante kernbegrippen of, bij gemeentelijke vragen, de gemeente).",
+        answer: "Geen officiële bronnen gevonden. Probeer specifieker te formuleren (kernbegrippen of, bij gemeentelijke vragen, de gemeente).",
         sources: []
       });
     }
 
     // -----------------------------
-    // 3) Include snippet for legal-basis questions (and require quotes)
+    // 3) Include snippet + server-side quote candidate for legal-basis questions
     // -----------------------------
     const needOwSnippet =
       scope === "national" &&
       (isOmgevingsplanDeviationLegalBasis || isLegalBasisQuestion(qLc) || qLc.includes("omgevingsplanactiviteit") || qLc.includes("bopa"));
 
     let owSnippet = null;
+    let quoteCandidate = null;
+
     if (needOwSnippet) {
       try {
         owSnippet = await wettenSnippetOmgevingswetArt51(fetchWithTimeout);
+        quoteCandidate = extractQuoteCandidateFromSnippet(owSnippet);
       } catch {
         owSnippet = null;
+        quoteCandidate = null;
       }
     }
 
@@ -620,15 +650,18 @@ export default async function handler(req, res) {
         const head = `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}`;
         const isOw = (s.id || "").toUpperCase() === OMGEVINGSWET_ID || normalize(s.title) === "omgevingswet";
         if (isOw && owSnippet) {
-          return `${head}\n\nRelevante tekst (uittreksel):\n${owSnippet}`;
+          const qc = quoteCandidate ? `\n\nBewijsquote-kandidaat (exact overnemen, max 25 woorden):\n"${quoteCandidate}"\n` : "";
+          return `${head}\n\nRelevante tekst (uittreksel):\n${owSnippet}${qc}`;
         }
         return head;
       })
       .join("\n\n---\n\n");
 
     // -----------------------------
-    // 4) Answer ONLY from provided sources
+    // 4) Answer ONLY from provided sources (and require exact quoteCandidate if present)
     // -----------------------------
+    const requireQuote = !!(needOwSnippet && quoteCandidate);
+
     const aiResp = await fetchWithTimeout(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -639,27 +672,26 @@ export default async function handler(req, res) {
         },
         body: JSON.stringify({
           model: "gpt-4o-mini",
-          temperature: 0.1,
+          temperature: 0.05,
           max_tokens: 700,
           messages: [
             {
               role: "system",
               content: `
-Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen (incl. eventuele uittreksels).
+Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen (incl. uittreksels).
 
 STRICT:
 - Noem GEEN wet/regeling als die naam/titel niet in de bronvermelding staat.
 - Noem GEEN artikelnummer/bepaling als die niet letterlijk in de brontekst/uittreksel staat.
-- Als je een bepaling noemt: noem ook lid/onderdeel ALS dat letterlijk in de tekst staat. Staat het er niet: zeg "lid/onderdeel niet zichtbaar in aangeleverde tekst".
-- Voeg 1 korte quote toe (max 25 woorden) uit het uittreksel rond de vergunningplicht (als er uittreksel is). Geen quote mogelijk => zeg dat expliciet.
-- NOOIT Wabo (Wet algemene bepalingen omgevingsrecht) noemen of gebruiken.
+- Als "Bewijsquote-kandidaat" is meegeleverd: neem die EXACT over als Bewijsquote (geen parafrase), en gebruik hem als bewijs.
+- NOOIT Wabo noemen of gebruiken.
+- Als lid/onderdeel niet letterlijk zichtbaar is: zeg "lid/onderdeel niet zichtbaar in aangeleverde tekst".
 
-Format:
-1) Antwoord: (max 3 zinnen)
-2) Grondslag: (artikel + evt. lid/onderdeel, anders melden dat dit niet zichtbaar is)
-3) Bewijsquote: (max 25 woorden, alleen uit uittreksel)
-4) Toelichting: (bulletpoints) — alleen uit bron
-Geen aparte bronnenlijst.
+Format (exact deze kopjes):
+Antwoord:
+Grondslag:
+Bewijsquote:
+Toelichting:
 `
             },
             {
@@ -667,7 +699,10 @@ Geen aparte bronnenlijst.
               content:
                 `Vraag:\n${q}\n` +
                 (municipality ? `Gemeente (context): ${municipality}\n` : "") +
-                `\nOfficiële bronnen:\n${sourcesText}`
+                `\nOfficiële bronnen:\n${sourcesText}\n\n` +
+                (requireQuote
+                  ? `LET OP: Er is een Bewijsquote-kandidaat meegeleverd. Die moet exact terugkomen onder "Bewijsquote:".`
+                  : `Als er geen bewijsquote-kandidaat is, zet bij Bewijsquote: "(geen quote beschikbaar in aangeleverde tekst)".`)
             }
           ]
         })
@@ -682,13 +717,27 @@ Geen aparte bronnenlijst.
     let answer = aiData?.choices?.[0]?.message?.content?.trim() || "Geen antwoord gegenereerd.";
     answer = stripSourcesFromAnswer(answer);
 
+    // Hard bans
     const ansLc = normalize(answer);
     if (ansLc.includes("wabo") || ansLc.includes("wet algemene bepalingen omgevingsrecht")) {
-      answer = "Ik kan dit niet beantwoorden op basis van de aangeleverde bronnen (Wabo is niet toegestaan) en er staat geen expliciete actuele bepaling in de bronvermelding/uittreksel.";
+      answer = "Antwoord:\nIk kan dit niet beantwoorden op basis van de aangeleverde bronnen (Wabo is niet toegestaan).\n\nGrondslag:\n(niet beschikbaar)\n\nBewijsquote:\n(geen quote beschikbaar in aangeleverde tekst)\n\nToelichting:\n- Wabo is niet toegestaan en is daarom verwijderd.";
+    }
+
+    // Post-validate format + quote compliance for legal-basis questions
+    if (needOwSnippet) {
+      const ok =
+        hasSection(answer, "Antwoord") &&
+        hasSection(answer, "Grondslag") &&
+        hasSection(answer, "Bewijsquote") &&
+        hasSection(answer, "Toelichting") &&
+        (!quoteCandidate || answer.includes(`"${quoteCandidate}"`));
+
+      if (!ok) {
+        answer = hardFallbackLegalBasis({ q, quoteCandidate });
+      }
     }
 
     sources = removeBanned(sources);
-
     return res.status(200).json({ answer, sources });
 
   } catch (e) {
