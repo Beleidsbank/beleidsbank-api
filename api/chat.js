@@ -1,24 +1,29 @@
-// /api/chat.js
-// ✅ Fix for your CURRENT failure:
-// Your model still uses a HEADER as “Bewijsquote”: "Artikel 5.1 (omgevingsvergunningplichtige activiteiten wet)"
+// /api/chat.js  (Beleidsbank) — v1.1
 //
-// Root cause:
-// - “omgevingsvergunningplichtige” contains the substring “plicht”, so a naive check for “plicht” mistakenly
-//   accepts a header as a “normquote”.
-// - If no real normquote is found, the answer MUST contain the placeholder "(geen normquote gevonden ...)".
-//   If it doesn’t: hard fallback.
+// Goals in this version
+// ✅ Always return ONLY 3 headings to the client:
+//    Antwoord:
+//    Toelichting:
+//    Bronnen:
 //
-// This version:
-// ✅ Treats “Artikel 5.1 …” and “omgevingsvergunningplichtige activiteiten” as HEADER (never valid quote)
-// ✅ Normquote is only valid if it contains: (verboden) OR (zonder omgevingsvergunning) OR (is vereist/vereist) as a norm sentence
-// ✅ If we didn’t find a normquote server-side, we FORCE the placeholder; any other quote triggers fallback
-// ✅ If we DID find a normquote, model must include it EXACTLY; otherwise fallback
+// ✅ No “speculative yes”: if there is no explicit normquote in the provided excerpts,
+//    the answer may NOT claim “vereist/verboden/nodig/verplicht/mag niet zonder vergunning”.
+//
+// ✅ Stronger post-validation:
+//    - If no normquote => Toelichting MUST contain placeholder line
+//    - If normquote exists => Toelichting MUST include it exactly
+//
 // ✅ Wabo hard-banned
-// ✅ Scope: “welke bepaling/grondslag” => NATIONAL (BWB) (no municipality loop)
-// ✅ Municipal SRU still works for APV/terras etc.
+// ✅ National vs Municipal scope logic preserved
+// ✅ Caching for heavy Omgevingswet extraction
+// ✅ Cleanup for in-memory Maps to prevent slow growth
+// ✅ Backend appends Bronnen consistently (model never prints sources)
 
 const rateStore = new Map();
 const pendingStore = new Map(); // sessionId -> { originalQuestion, missingSlots:[], collected:{}, createdAt, attempts }
+
+// Simple in-memory cache (best-effort, may reset in serverless cold starts)
+const cacheStore = new Map(); // key -> { value, expiresAt }
 
 const MAX_SOURCES_RETURN = 4;
 
@@ -26,6 +31,39 @@ const MAX_SOURCES_RETURN = 4;
 // Basics
 // ---------------------------
 function nowMs() { return Date.now(); }
+
+function cleanupStores() {
+  const now = nowMs();
+
+  // pendingStore: expire after 7 minutes
+  for (const [k, v] of pendingStore.entries()) {
+    const createdAt = Number(v?.createdAt || 0);
+    if (!createdAt || (now - createdAt) > 7 * 60 * 1000) pendingStore.delete(k);
+  }
+
+  // rateStore: remove entries long after resetAt
+  for (const [ip, v] of rateStore.entries()) {
+    const resetAt = Number(v?.resetAt || 0);
+    if (!resetAt || now > (resetAt + 2 * 60 * 1000)) rateStore.delete(ip);
+  }
+
+  // cacheStore: remove expired
+  for (const [k, v] of cacheStore.entries()) {
+    const expiresAt = Number(v?.expiresAt || 0);
+    if (!expiresAt || now > expiresAt) cacheStore.delete(k);
+  }
+}
+
+function cacheGet(key) {
+  const it = cacheStore.get(key);
+  if (!it) return null;
+  if (nowMs() > it.expiresAt) { cacheStore.delete(key); return null; }
+  return it.value;
+}
+
+function cacheSet(key, value, ttlMs) {
+  cacheStore.set(key, { value, expiresAt: nowMs() + ttlMs });
+}
 
 function rateLimit(ip, limit = 12, windowMs = 60000) {
   const now = nowMs();
@@ -73,17 +111,6 @@ function dedupeByLink(arr) {
     out.push(s);
   }
   return out;
-}
-
-function stripSourcesFromAnswer(answer) {
-  const a = (answer || "").trim();
-  if (!a) return a;
-  const low = a.toLowerCase();
-  const idx = low.indexOf("\nbronnen:");
-  if (idx !== -1) return a.slice(0, idx).trim();
-  const idx2 = low.indexOf("bronnen:");
-  if (idx2 !== -1 && (idx2 === 0 || a[idx2 - 1] === "\n")) return a.slice(0, idx2).trim();
-  return a;
 }
 
 function pickAll(text, re) {
@@ -400,7 +427,7 @@ function rankSources({ sources, q, scope }) {
 }
 
 // ---------------------------
-// Omgevingswet norm extraction (hard requirement: true norm sentence)
+// Omgevingswet norm extraction (strict: true norm sentence)
 // ---------------------------
 function htmlToTextLite(html) {
   return (html || "")
@@ -447,7 +474,7 @@ function isHeaderLike(line) {
   if (l.startsWith("hoofdstuk")) return true;
   if (l.startsWith("afdeling")) return true;
   if (l.startsWith("paragraaf")) return true;
-  if (l.includes("omgevingsvergunningplichtige activiteiten")) return true; // IMPORTANT
+  if (l.includes("omgevingsvergunningplichtige activiteiten")) return true;
   return false;
 }
 
@@ -463,8 +490,6 @@ function isNormSentence(line) {
     /\bvereist\b/.test(l);
 
   if (!normOk) return false;
-
-  // Prefer omgevingsplan(activiteit) mention, but not strictly required
   return true;
 }
 
@@ -492,7 +517,6 @@ function pickNormQuoteFromArticleSection(sectionText) {
   if (!best) best = contentLines.find(isNormSentence);
 
   if (!best) {
-    // Try flat fragment, but still must pass isNormSentence
     const flat = contentLines.join(" ").replace(/\s+/g, " ").trim();
     const idx = flat.toLowerCase().indexOf("omgevingsvergunning");
     if (idx !== -1) {
@@ -513,6 +537,11 @@ function pickNormQuoteFromArticleSection(sectionText) {
 }
 
 async function fetchOmgevingswetArt51Norm(fetchWithTimeout) {
+  // Cache this heavy operation
+  const cacheKey = `ow:${OMGEVINGSWET_ID}:art5.1`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
   const url = `https://wetten.overheid.nl/${OMGEVINGSWET_ID}`;
   const resp = await fetchWithTimeout(url, {}, 15000);
   const html = await resp.text();
@@ -521,37 +550,124 @@ async function fetchOmgevingswetArt51Norm(fetchWithTimeout) {
   const section = sliceArticleSection(text, "5.1");
   const quote = pickNormQuoteFromArticleSection(section);
 
-  return {
+  const out = {
     section: section ? section.slice(0, 4200) : null,
     quote // null if no true norm sentence was found
   };
+
+  // 12 hours TTL
+  cacheSet(cacheKey, out, 12 * 60 * 60 * 1000);
+  return out;
 }
 
 // ---------------------------
-// OpenAI call (strict)
+// Output helpers (3 headings)
+// ---------------------------
+const NO_QUOTE_PLACEHOLDER = "(geen normquote gevonden in aangeleverde tekst)";
+
+function formatSourcesBlock(sources) {
+  const lines = (sources || []).map((s, i) => {
+    const title = (s?.title || s?.id || `Bron ${i + 1}`).toString().trim();
+    const link = (s?.link || "").toString().trim();
+    const type = (s?.type || "").toString().trim();
+    const meta = [type, s?.id].filter(Boolean).join(" · ");
+    return `- ${title}${meta ? ` (${meta})` : ""}${link ? ` — ${link}` : ""}`;
+  });
+
+  return [
+    "Bronnen:",
+    lines.length ? lines.join("\n") : "- (geen bronnen)"
+  ].join("\n");
+}
+
+function stripSourcesFromAnswer(answer) {
+  // Defensive: model should not print sources, but if it does, remove it.
+  const a = (answer || "").trim();
+  if (!a) return a;
+  const low = a.toLowerCase();
+  const idx = low.indexOf("\nbronnen:");
+  if (idx !== -1) return a.slice(0, idx).trim();
+  const idx2 = low.indexOf("bronnen:");
+  if (idx2 !== -1 && (idx2 === 0 || a[idx2 - 1] === "\n")) return a.slice(0, idx2).trim();
+  return a;
+}
+
+function hasCoreSections(answer) {
+  const a = (answer || "").toLowerCase();
+  return a.includes("antwoord:") && a.includes("toelichting:");
+}
+
+function extractSection(answer, header) {
+  const re = new RegExp(`${header}:\\s*([\\s\\S]*?)(\\n\\s*[A-Za-zÀ-ÿ]+\\s*:\\s*|$)`, "i");
+  const m = (answer || "").match(re);
+  return (m?.[1] || "").trim();
+}
+
+function extractBewijsquoteFromToelichting(toelichting) {
+  // Accept formats like:
+  // Bewijsquote: "..."
+  // Bewijsquote: (geen normquote ...)
+  const m = (toelichting || "").match(/bewijsquote\s*:\s*([\s\S]*?)(\n|$)/i);
+  return (m?.[1] || "").trim();
+}
+
+function containsNormativeClaim(text) {
+  const t = normalize(text);
+  return (
+    /\bvereist\b/.test(t) ||
+    /\bverplicht\b/.test(t) ||
+    /\bvergunning\s+nodig\b/.test(t) ||
+    /\bzonder\s+omgevingsvergunning\b/.test(t) ||
+    /\bverboden\b/.test(t) ||
+    /\bmag\s+niet\b/.test(t)
+  );
+}
+
+function safeFallbackAnswer({ strictQuote }) {
+  // Returns only Antwoord + Toelichting. Bronnen are appended by backend.
+  const hasQuote = strictQuote && strictQuote !== NO_QUOTE_PLACEHOLDER;
+
+  return [
+    "Antwoord:",
+    hasQuote
+      ? "Op basis van de aangeleverde normzin volgt dat (voor de beschreven situatie) een omgevingsvergunning vereist is / het verboden is zonder vergunning."
+      : "Ik kan niet bevestigen of dit vereist/verboden is op basis van de aangeleverde tekst, omdat er geen expliciete normzin is meegeleverd.",
+    "",
+    "Toelichting:",
+    hasQuote
+      ? `- Bewijsquote: ${strictQuote}`
+      : `- Bewijsquote: ${NO_QUOTE_PLACEHOLDER}`,
+    "- Alleen informatie die letterlijk in de aangeleverde bronnen/uittreksels staat kan worden gebruikt."
+  ].join("\n");
+}
+
+// ---------------------------
+// OpenAI call (strict, 2 headings only)
 // ---------------------------
 async function callOpenAI({ apiKey, fetchWithTimeout, q, sourcesText, strictQuote }) {
   const system = `
+Je beantwoordt vragen over beleid en wetgeving in Nederland.
+
 Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen (incl. uittreksels).
 
 STRICT:
 - Noem GEEN wet/regeling als die naam/titel niet in de bronvermelding/uittreksel staat.
 - Noem GEEN artikelnummer/bepaling als die niet letterlijk in de brontekst/uittreksel staat.
 - NOOIT Wabo noemen of gebruiken.
-- Als er een verplichte bewijsquote is meegegeven: neem die EXACT over bij Bewijsquote (geen parafrase).
-- Als er géén verplichte bewijsquote is meegegeven: zet bij Bewijsquote exact "(geen normquote gevonden in aangeleverde tekst)".
-- Als je geen normquote hebt: zeg NIET dat iets “vereist” is; zeg dan dat de aangeleverde tekst geen expliciete normzin toont.
 
-Format (exact deze kopjes, elk op eigen regel):
+Bewijsquote-regel:
+- Als er een verplichte bewijsquote is meegegeven: neem die EXACT over in de Toelichting als: "- Bewijsquote: <quote>".
+- Als er géén verplichte bewijsquote is meegegeven: zet in de Toelichting EXACT: "- Bewijsquote: (geen normquote gevonden in aangeleverde tekst)".
+- Als er géén normquote is: doe géén stellige norm-claim (niet zeggen: vereist/verplicht/verboden/vergunning nodig).
+
+Output-format (ALLEEN deze 2 kopjes, exact zo, elk op eigen regel):
 Antwoord:
-Grondslag:
-Bewijsquote:
 Toelichting:
 `;
 
   const user = [
     `Vraag:\n${q}`,
-    `\nOfficiële bronnen:\n${sourcesText}`,
+    `\nOfficiële bronnen (incl. uittreksels):\n${sourcesText}`,
     strictQuote
       ? `\nVERPLICHTE Bewijsquote (exact overnemen):\n${strictQuote}`
       : `\nEr is géén normquote gevonden; gebruik de placeholder bij Bewijsquote.`
@@ -565,7 +681,7 @@ Toelichting:
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0.05,
-        max_tokens: 700,
+        max_tokens: 650,
         messages: [
           { role: "system", content: system.trim() },
           { role: "user", content: user.trim() }
@@ -584,42 +700,13 @@ Toelichting:
   }
 }
 
-function hasAllSections(answer) {
-  const a = (answer || "").toLowerCase();
-  return a.includes("antwoord:") && a.includes("grondslag:") && a.includes("bewijsquote:") && a.includes("toelichting:");
-}
-
-function extractBewijsquote(answer) {
-  // robust block extraction: take everything after "Bewijsquote:" until "\nToelichting:" or end
-  const m = (answer || "").match(/bewijsquote:\s*([\s\S]*?)(\n\s*toelichting\s*:|$)/i);
-  if (!m) return "";
-  return (m[1] || "").trim();
-}
-
-const NO_QUOTE_PLACEHOLDER = "(geen normquote gevonden in aangeleverde tekst)";
-
-function safeFallbackAnswer({ strictQuote }) {
-  return [
-    "Antwoord:",
-    strictQuote
-      ? "Op basis van de aangeleverde normzin in de Omgevingswet geldt dat voor de betreffende activiteit een omgevingsvergunning is vereist/verboden zonder vergunning."
-      : "Ik kan niet bevestigen dat dit ‘vereist’ is op basis van de aangeleverde tekst, omdat er geen expliciete normzin zichtbaar is.",
-    "",
-    "Grondslag:",
-    strictQuote ? "Artikel 5.1 Omgevingswet (lid/onderdeel: niet zichtbaar in aangeleverde tekst)" : "(niet zichtbaar in aangeleverde tekst)",
-    "",
-    "Bewijsquote:",
-    strictQuote || NO_QUOTE_PLACEHOLDER,
-    "",
-    "Toelichting:",
-    "- Alleen informatie die letterlijk in de aangeleverde bronnen/uittreksels staat kan worden gebruikt."
-  ].join("\n");
-}
-
 // ---------------------------
 // MAIN
 // ---------------------------
 export default async function handler(req, res) {
+  // Cleanup first (prevents slow growth)
+  cleanupStores();
+
   // ---- CORS / PREFLIGHT FIRST (Safari) ----
   const origin = (req.headers.origin || "").toString();
   if (origin === "https://app.beleidsbank.nl") {
@@ -684,7 +771,11 @@ export default async function handler(req, res) {
         pending.collected = collected;
         pending.attempts = attempts + 1;
         pendingStore.set(sessionId, pending);
-        return res.status(200).json({ answer: askForMissing(stillMissing), sources: [] });
+        return res.status(200).json({
+          answer: ["Antwoord:", askForMissing(stillMissing), "", "Toelichting:", "- Geef kort antwoord op de vraag hierboven, dan zoek ik de juiste bronnen.", "", "Bronnen:", "- (nog niet beschikbaar)"]
+            .join("\n"),
+          sources: []
+        });
       }
 
       q = pending.originalQuestion;
@@ -711,7 +802,12 @@ export default async function handler(req, res) {
           attempts: 0
         });
       }
-      return res.status(200).json({ answer: askForMissing(need), sources: [] });
+
+      return res.status(200).json({
+        answer: ["Antwoord:", askForMissing(need), "", "Toelichting:", "- Voor gemeentelijke regels heb ik minimaal de gemeente nodig.", "", "Bronnen:", "- (nog niet beschikbaar)"]
+          .join("\n"),
+        sources: []
+      });
     }
 
     if (scope === "national" && shouldAskMore(q, scope) && !collected.topic_hint) {
@@ -724,7 +820,12 @@ export default async function handler(req, res) {
           attempts: 0
         });
       }
-      return res.status(200).json({ answer: questionForSlot("topic_hint"), sources: [] });
+
+      return res.status(200).json({
+        answer: ["Antwoord:", questionForSlot("topic_hint"), "", "Toelichting:", "- Met een kernbegrip kan ik de juiste landelijke bron selecteren.", "", "Bronnen:", "- (nog niet beschikbaar)"]
+          .join("\n"),
+        sources: []
+      });
     }
 
     // -----------------------------
@@ -753,7 +854,8 @@ export default async function handler(req, res) {
         qLc.includes("omgevingsplanactiviteit") ||
         qLc.includes("bopa") ||
         qLc.includes("afwijken van het omgevingsplan") ||
-        qLc.includes("tijdelijk afwijken");
+        qLc.includes("tijdelijk afwijken") ||
+        qLc.includes("tijdelijk");
 
       const q2 = `${q} ${extra}`.trim();
       sources = await bwbSearchSmart({ q: q2, fetchWithTimeout, forceOw });
@@ -764,13 +866,22 @@ export default async function handler(req, res) {
 
     if (!sources.length) {
       return res.status(200).json({
-        answer: "Geen officiële bronnen gevonden. Formuleer specifieker met kernbegrippen (en bij gemeentelijke vragen: de gemeente).",
+        answer: [
+          "Antwoord:",
+          "Geen officiële bronnen gevonden. Formuleer specifieker met kernbegrippen (en bij gemeentelijke vragen: de gemeente).",
+          "",
+          "Toelichting:",
+          "- Tip: noem het onderwerp (bv. bouwen/milieu/handhaving) en de activiteit (bv. kappen, bouwen, evenement).",
+          "",
+          "Bronnen:",
+          "- (geen bronnen)"
+        ].join("\n"),
         sources: []
       });
     }
 
     // -----------------------------
-    // 3) Normquote (real norm sentence only)
+    // 3) Normquote (strict)
     // -----------------------------
     const needsOwNorm =
       scope === "national" &&
@@ -800,7 +911,7 @@ export default async function handler(req, res) {
       .join("\n\n---\n\n");
 
     // -----------------------------
-    // 4) Generate answer
+    // 4) Generate answer (2 headings only)
     // -----------------------------
     let answer = await callOpenAI({
       apiKey,
@@ -813,51 +924,73 @@ export default async function handler(req, res) {
     answer = stripSourcesFromAnswer(answer);
 
     // -----------------------------
-    // 5) Post-validation (THE IMPORTANT FIX)
+    // 5) Post-validation (hard)
     // -----------------------------
     const ansLc = normalize(answer);
 
+    // Never mention Wabo
     if (ansLc.includes("wabo") || ansLc.includes("wet algemene bepalingen omgevingsrecht")) {
       answer = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER });
     }
 
-    if (!hasAllSections(answer)) {
+    // Must have core headings
+    if (!hasCoreSections(answer)) {
       answer = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER });
     }
 
-    const bewijsquote = extractBewijsquote(answer);
+    const toelichting = extractSection(answer, "Toelichting");
+    const bewijsquote = extractBewijsquoteFromToelichting(toelichting);
     const bqLc = normalize(bewijsquote);
 
-    // If strictQuote exists, it MUST be included exactly
+    // If strictQuote exists, it MUST be included exactly in Toelichting
     if (owNorm.quote && !answer.includes(owNorm.quote)) {
       answer = safeFallbackAnswer({ strictQuote: owNorm.quote });
     }
 
-    // If no strictQuote exists, the quote MUST be the placeholder
+    // If no strictQuote exists, Toelichting MUST include the placeholder
     if (!owNorm.quote) {
-      // Any other quote (like "Artikel 5.1 ...") is invalid
-      if (!bqLc.includes(NO_QUOTE_PLACEHOLDER)) {
+      if (!bqLc.includes(normalize(NO_QUOTE_PLACEHOLDER))) {
         answer = safeFallbackAnswer({ strictQuote: NO_QUOTE_PLACEHOLDER });
       }
     }
 
     // Reject header-like quotes ALWAYS
     if (bqLc.includes("artikel 5.1") || bqLc.includes("hoofdstuk") || bqLc.includes("omgevingsvergunningplichtige activiteiten")) {
-      // Only allow if it’s exactly the strict quote and that strict quote is a real norm sentence (it will not be a header)
       if (!owNorm.quote || !answer.includes(owNorm.quote)) {
         answer = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER });
       }
     }
 
-    // Reject “impliceert” style reasoning if no normquote exists
+    // New: If placeholder => no normative claims in Antwoord
+    const antwoordText = extractSection(answer, "Antwoord");
+    const hasPlaceholder = !owNorm.quote && bqLc.includes(normalize(NO_QUOTE_PLACEHOLDER));
+    if (hasPlaceholder && containsNormativeClaim(antwoordText)) {
+      answer = safeFallbackAnswer({ strictQuote: NO_QUOTE_PLACEHOLDER });
+    }
+
+    // Never allow “impliceert” reasoning when no quote
     if (!owNorm.quote && ansLc.includes("impliceert")) {
       answer = safeFallbackAnswer({ strictQuote: NO_QUOTE_PLACEHOLDER });
     }
 
-    // Never return banned sources
+    // -----------------------------
+    // 6) Append Bronnen (backend authoritative)
+    // -----------------------------
     const safeSources = removeBanned(sources).slice(0, MAX_SOURCES_RETURN);
+    const sourcesBlock = formatSourcesBlock(safeSources);
 
-    return res.status(200).json({ answer, sources: safeSources });
+    // Ensure final response always has 3 headings
+    let final = answer.trim();
+    if (!final.toLowerCase().includes("antwoord:")) {
+      final = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER });
+    }
+    if (!final.toLowerCase().includes("toelichting:")) {
+      final = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER });
+    }
+
+    final = `${final}\n\n${sourcesBlock}`;
+
+    return res.status(200).json({ answer: final, sources: safeSources });
   } catch (e) {
     return res.status(500).json({ error: "Interne fout" });
   }
