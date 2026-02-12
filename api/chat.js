@@ -1,15 +1,14 @@
-// /api/chat.js — Beleidsbank V2-ready backend
+// /api/chat.js — Beleidsbank V1 (Optie A: praktisch, snel, bruikbaar) — V2-ready output
 //
-// Goals:
-// ✅ Backend returns ONLY 2 headings in `answer`:
-//    Antwoord:
-//    Toelichting:
-// ✅ Frontend renders sources from `sources` array (no "Bronnen:" inside answer)
-// ✅ Never show Wabo (hard ban)
-// ✅ Never allow guessed article numbers (unless provided via excerpts; in this V2-ready version we don't inject excerpts yet)
-// ✅ Strong stripping: if model prints "Bronnen/Sources" anyway, we remove it
-// ✅ Debug-friendly errors (prevents "load failed" without details)
-// ✅ CORS + OPTIONS included
+// Output:
+// - `answer` bevat alleen: Antwoord + Toelichting (2 koppen)
+// - `sources` array bevat bronnen voor frontend rendering
+//
+// Changes for Optie A:
+// ✅ Artikelnummer noemen mag (geen normquote vereist)
+// ✅ Geen zware parsing / geen normzin blokkades
+// ✅ Wabo hard banned
+// ✅ Model mag niet zelf "Bronnen" printen; we strippen het weg
 
 const MAX_SOURCES_RETURN = 4;
 const OMGEVINGSWET_ID = "BWBR0037885";
@@ -50,8 +49,7 @@ function dedupeByLink(arr) {
   return out;
 }
 
-// Remove any model-generated sources section variants.
-// We cut from the FIRST occurrence of "Bronnen" or "Sources" anywhere.
+// Cut from first "Bronnen"/"Sources" occurrence anywhere
 function stripSourcesFromAnswer(answer) {
   const a = (answer || "").trim();
   if (!a) return a;
@@ -92,10 +90,9 @@ function makeFetchWithTimeout() {
 }
 
 // ---------------------------
-// Sources (V2-ready: still simple; routing comes later)
+// Sources (V1 simple)
 // ---------------------------
 async function getNationalSources() {
-  // V2-ready: you can expand this later to include Bbl/Bal/Bkl/Omgevingsbesluit based on routing.
   return [
     {
       id: OMGEVINGSWET_ID,
@@ -107,7 +104,7 @@ async function getNationalSources() {
 }
 
 // ---------------------------
-// OpenAI
+// OpenAI (Optie A: allow article numbers)
 // ---------------------------
 async function callOpenAI({ apiKey, fetchWithTimeout, question }) {
   const system = `
@@ -116,8 +113,9 @@ Je bent een juridisch assistent voor Nederlandse wetgeving.
 Regels:
 - Nooit Wabo noemen of gebruiken.
 - Geef een praktisch en duidelijk antwoord (kort en bruikbaar).
-- Noem GEEN artikelnummer of lidnummer (tenzij het letterlijk in aangeleverde tekst staat; in deze versie is dat niet zo).
-- Print GEEN bronnen en géén kopje "Bronnen" of "Sources" (met of zonder dubbelepunt); bronnen worden apart door de applicatie getoond.
+- Je MAG artikelnummer(s) noemen als je die met hoge waarschijnlijkheid weet voor het Omgevingswet-stelsel.
+- Vermijd speculatie over uitzonderingen: als iets afhangt van omstandigheden, zeg dat kort.
+- Print GEEN bronnen en géén kopje "Bronnen" of "Sources"; bronnen worden apart getoond.
 
 Output EXACT (ALLEEN deze twee koppen):
 Antwoord:
@@ -137,7 +135,7 @@ Toelichting:
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0.2,
-        max_tokens: 600,
+        max_tokens: 650,
         messages: [
           { role: "system", content: system },
           { role: "user", content: user }
@@ -167,10 +165,8 @@ Toelichting:
 // ---------------------------
 export default async function handler(req, res) {
   // ---- CORS / OPTIONS ----
-  // If you test locally, change allow to "http://localhost:3000" (or your dev origin)
   const origin = (req.headers.origin || "").toString();
   const allow = "https://app.beleidsbank.nl";
-
   res.setHeader("Access-Control-Allow-Origin", origin === allow ? origin : allow);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -190,7 +186,7 @@ export default async function handler(req, res) {
   const fetchWithTimeout = makeFetchWithTimeout();
 
   try {
-    // Sources (V2-ready)
+    // Sources
     let sources = await getNationalSources();
     sources = removeBanned(dedupeByLink(sources)).slice(0, MAX_SOURCES_RETURN);
 
@@ -215,8 +211,7 @@ export default async function handler(req, res) {
       answer = ensureTwoHeadings(answer);
     }
 
-    // IMPORTANT (V2-ready): DO NOT append sources into answer.
-    // Frontend will render sources from the array.
+    // V2-ready: answer contains NO sources; frontend shows sources list.
     return res.status(200).json({ answer, sources });
   } catch (e) {
     return res.status(500).json({
