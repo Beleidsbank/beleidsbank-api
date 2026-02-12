@@ -1,17 +1,15 @@
-// /api/chat.js — Beleidsbank V1 (robust + no-double-sources + no-article-hallucinations)
+// /api/chat.js — Beleidsbank V2-ready backend
 //
-// V1 goals:
-// ✅ Always return exactly 3 headings to the client:
+// Goals:
+// ✅ Backend returns ONLY 2 headings in `answer`:
 //    Antwoord:
 //    Toelichting:
-//    Bronnen:
-//
-// ✅ Practical answers (no normzin-blockade in V1)
-// ✅ Never show Wabo
-// ✅ Never allow guessed article numbers (unless provided in supplied excerpts — in V1 we don't supply)
-// ✅ Model must NOT print sources; backend appends sources
-// ✅ Strong stripping to prevent double "Bronnen" blocks (even without colon)
-// ✅ Debug-friendly: returns OpenAI error details instead of generic “load failed”
+// ✅ Frontend renders sources from `sources` array (no "Bronnen:" inside answer)
+// ✅ Never show Wabo (hard ban)
+// ✅ Never allow guessed article numbers (unless provided via excerpts; in this V2-ready version we don't inject excerpts yet)
+// ✅ Strong stripping: if model prints "Bronnen/Sources" anyway, we remove it
+// ✅ Debug-friendly errors (prevents "load failed" without details)
+// ✅ CORS + OPTIONS included
 
 const MAX_SOURCES_RETURN = 4;
 const OMGEVINGSWET_ID = "BWBR0037885";
@@ -52,13 +50,12 @@ function dedupeByLink(arr) {
   return out;
 }
 
-// ULTRA-ROBUST STRIP: remove any trailing sources section variants,
-// including "Bronnen:" / "Bronnen :" / "Bronnen\n" / "Sources" etc.
+// Remove any model-generated sources section variants.
+// We cut from the FIRST occurrence of "Bronnen" or "Sources" anywhere.
 function stripSourcesFromAnswer(answer) {
   const a = (answer || "").trim();
   if (!a) return a;
 
-  // Find earliest occurrence of "Bronnen" or "Sources" anywhere
   const m = a.match(/\b(bronnen|sources)\b\s*:?\s*/i);
   if (!m) return a;
 
@@ -66,19 +63,6 @@ function stripSourcesFromAnswer(answer) {
   if (idx >= 0) return a.slice(0, idx).trim();
 
   return a;
-}
-
-
-function formatSourcesBlock(sources) {
-  const lines = (sources || []).map(s => {
-    const title = (s?.title || "").toString().trim();
-    const type = (s?.type || "").toString().trim();
-    const id = (s?.id || "").toString().trim();
-    const link = (s?.link || "").toString().trim();
-    return `- ${title}${type || id ? ` (${[type, id].filter(Boolean).join(" · ")})` : ""}${link ? ` — ${link}` : ""}`;
-  });
-
-  return ["Bronnen:", lines.length ? lines.join("\n") : "- (geen bronnen)"].join("\n");
 }
 
 function ensureTwoHeadings(answer) {
@@ -108,9 +92,10 @@ function makeFetchWithTimeout() {
 }
 
 // ---------------------------
-// Sources (V1 simple)
+// Sources (V2-ready: still simple; routing comes later)
 // ---------------------------
 async function getNationalSources() {
+  // V2-ready: you can expand this later to include Bbl/Bal/Bkl/Omgevingsbesluit based on routing.
   return [
     {
       id: OMGEVINGSWET_ID,
@@ -131,9 +116,8 @@ Je bent een juridisch assistent voor Nederlandse wetgeving.
 Regels:
 - Nooit Wabo noemen of gebruiken.
 - Geef een praktisch en duidelijk antwoord (kort en bruikbaar).
-- Noem GEEN artikelnummer of lidnummer (tenzij het letterlijk in aangeleverde tekst staat; in V1 staat het er niet).
-- Print GEEN bronnen en géén kopje "Bronnen" of "Sources" (met of zonder dubbelepunt); bronnen worden door de backend toegevoegd.
-- Als de vraag om een artikelnummer vraagt: zeg dat V1 het artikelnummer niet automatisch ophaalt en verwijs naar de Omgevingswet als bron.
+- Noem GEEN artikelnummer of lidnummer (tenzij het letterlijk in aangeleverde tekst staat; in deze versie is dat niet zo).
+- Print GEEN bronnen en géén kopje "Bronnen" of "Sources" (met of zonder dubbelepunt); bronnen worden apart door de applicatie getoond.
 
 Output EXACT (ALLEEN deze twee koppen):
 Antwoord:
@@ -206,7 +190,7 @@ export default async function handler(req, res) {
   const fetchWithTimeout = makeFetchWithTimeout();
 
   try {
-    // Sources (V1)
+    // Sources (V2-ready)
     let sources = await getNationalSources();
     sources = removeBanned(dedupeByLink(sources)).slice(0, MAX_SOURCES_RETURN);
 
@@ -221,7 +205,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // Clean + enforce format
+    // Clean + enforce format (2 headings only)
     let answer = stripSourcesFromAnswer(ai.content);
     answer = ensureTwoHeadings(answer);
 
@@ -231,10 +215,9 @@ export default async function handler(req, res) {
       answer = ensureTwoHeadings(answer);
     }
 
-    // Append sources as 3rd heading (ONLY backend)
-    const final = `${answer}\n\n${formatSourcesBlock(sources)}`;
-
-    return res.status(200).json({ answer: final, sources });
+    // IMPORTANT (V2-ready): DO NOT append sources into answer.
+    // Frontend will render sources from the array.
+    return res.status(200).json({ answer, sources });
   } catch (e) {
     return res.status(500).json({
       error: "Interne fout",
