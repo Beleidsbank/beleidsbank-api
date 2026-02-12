@@ -9,8 +9,8 @@
 // ✅ Practical answers (no normzin-blockade in V1)
 // ✅ Never show Wabo
 // ✅ Never allow guessed article numbers (unless provided in supplied excerpts — in V1 we don't supply)
-// ✅ Never allow the model to print sources; backend appends sources
-// ✅ Fix double "Bronnen:" by stripping any model-added sources block
+// ✅ Model must NOT print sources; backend appends sources
+// ✅ Strong stripping to prevent double "Bronnen" blocks (even without colon)
 // ✅ Debug-friendly: returns OpenAI error details instead of generic “load failed”
 
 const MAX_SOURCES_RETURN = 4;
@@ -52,18 +52,23 @@ function dedupeByLink(arr) {
   return out;
 }
 
-// STRONG strip: remove anything from first "Bronnen:" or "Sources:" onward
+// ULTRA-ROBUST STRIP: remove any trailing sources section variants,
+// including "Bronnen:" / "Bronnen :" / "Bronnen\n" / "Sources" etc.
 function stripSourcesFromAnswer(answer) {
   const a = (answer || "").trim();
   if (!a) return a;
 
-  const m = a.match(/\b(bronnen|sources)\s*:/i);
-  if (!m) return a;
+  const patterns = [
+    /\n\s*bronnen\s*:\s*[\s\S]*$/i,
+    /\n\s*sources\s*:\s*[\s\S]*$/i,
+    /\n\s*bronnen\s*\n[\s\S]*$/i, // no colon
+    /\n\s*sources\s*\n[\s\S]*$/i
+  ];
 
-  const idx = m.index ?? -1;
-  if (idx >= 0) return a.slice(0, idx).trim();
+  let out = a;
+  for (const re of patterns) out = out.replace(re, "").trim();
 
-  return a;
+  return out;
 }
 
 function formatSourcesBlock(sources) {
@@ -83,7 +88,6 @@ function ensureTwoHeadings(answer) {
   const lc = a.toLowerCase();
   if (lc.includes("antwoord:") && lc.includes("toelichting:")) return a;
 
-  // fallback minimal format
   return [
     "Antwoord:",
     "Er kon geen goed geformatteerd antwoord worden gegenereerd.",
@@ -130,7 +134,8 @@ Regels:
 - Nooit Wabo noemen of gebruiken.
 - Geef een praktisch en duidelijk antwoord (kort en bruikbaar).
 - Noem GEEN artikelnummer of lidnummer (tenzij het letterlijk in aangeleverde tekst staat; in V1 staat het er niet).
-- Print GEEN bronnen en géén kopje "Bronnen:" of "Sources:"; bronnen worden door de backend toegevoegd.
+- Print GEEN bronnen en géén kopje "Bronnen" of "Sources" (met of zonder dubbelepunt); bronnen worden door de backend toegevoegd.
+- Als de vraag om een artikelnummer vraagt: zeg dat V1 het artikelnummer niet automatisch ophaalt en verwijs naar de Omgevingswet als bron.
 
 Output EXACT (ALLEEN deze twee koppen):
 Antwoord:
@@ -221,6 +226,12 @@ export default async function handler(req, res) {
     // Clean + enforce format
     let answer = stripSourcesFromAnswer(ai.content);
     answer = ensureTwoHeadings(answer);
+
+    // Extra guardrail: if model still mentioned "bronnen/sources", strip again
+    if (/\b(bronnen|sources)\b/i.test(answer)) {
+      answer = stripSourcesFromAnswer(answer);
+      answer = ensureTwoHeadings(answer);
+    }
 
     // Append sources as 3rd heading (ONLY backend)
     const final = `${answer}\n\n${formatSourcesBlock(sources)}`;
