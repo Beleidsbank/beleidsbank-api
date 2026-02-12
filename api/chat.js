@@ -1,35 +1,19 @@
-// /api/chat.js — Beleidsbank (stable production version)
-
-const rateStore = new Map();
-const pendingStore = new Map();
-const cacheStore = new Map();
+// /api/chat.js — Beleidsbank V1 (stable, practical version)
 
 const MAX_SOURCES_RETURN = 4;
 const OMGEVINGSWET_ID = "BWBR0037885";
-const NO_QUOTE_PLACEHOLDER = "(geen normquote gevonden in aangeleverde tekst)";
+
+const BANNED_IDS = new Set([
+  "BWBR0024779",
+  "BWBR0047270"
+]);
 
 // ---------------------------
-// Utils
+// Helpers
 // ---------------------------
-
-function nowMs() { return Date.now(); }
 
 function normalize(s) {
   return (s || "").toLowerCase().trim();
-}
-
-function rateLimit(ip, limit = 15, windowMs = 60000) {
-  const now = nowMs();
-  const item = rateStore.get(ip) || { count: 0, resetAt: now + windowMs };
-
-  if (now > item.resetAt) {
-    item.count = 0;
-    item.resetAt = now + windowMs;
-  }
-
-  item.count++;
-  rateStore.set(ip, item);
-  return item.count <= limit;
 }
 
 function dedupeByLink(arr) {
@@ -42,47 +26,33 @@ function dedupeByLink(arr) {
   });
 }
 
-// ---------------------------
-// WABO HARD BAN
-// ---------------------------
-
-const BANNED_BWBR_IDS = new Set([
-  "BWBR0024779",
-  "BWBR0047270"
-]);
-
-function isBannedSource(item) {
+function isBanned(item) {
   const id = (item?.id || "").toUpperCase();
   const title = normalize(item?.title);
-
-  if (BANNED_BWBR_IDS.has(id)) return true;
+  if (BANNED_IDS.has(id)) return true;
   if (title.includes("wabo")) return true;
   if (title.includes("wet algemene bepalingen omgevingsrecht")) return true;
-
   return false;
 }
 
 function removeBanned(items) {
-  return (items || []).filter(x => !isBannedSource(x));
+  return (items || []).filter(x => !isBanned(x));
 }
 
-// ---------------------------
-// Strict Mode Detection
-// ---------------------------
+function stripSourcesFromAnswer(answer) {
+  const re = /bronnen\s*:/i;
+  const m = re.exec(answer);
+  if (!m) return answer.trim();
+  return answer.slice(0, m.index).trim();
+}
 
-function isStrictNormQuestion(q) {
-  const qLc = normalize(q);
-  return (
-    qLc.includes("noem de normzin") ||
-    qLc.includes("welke normzin") ||
-    qLc.includes("op grond van welk artikel") ||
-    qLc.includes("welke bepaling")
+function formatSourcesBlock(sources) {
+  const lines = sources.map(s =>
+    `- ${s.title} (${s.type} · ${s.id}) — ${s.link}`
   );
-}
 
-// ---------------------------
-// Fetch Helper
-// ---------------------------
+  return ["Bronnen:", lines.join("\n")].join("\n");
+}
 
 function makeFetchWithTimeout() {
   return async (url, options = {}, ms = 15000) => {
@@ -97,10 +67,10 @@ function makeFetchWithTimeout() {
 }
 
 // ---------------------------
-// BWB Search (simplified stable version)
+// Basic National Source (V1 simplified)
 // ---------------------------
 
-async function bwbSearch(fetchWithTimeout) {
+async function getNationalSources() {
   return [{
     id: OMGEVINGSWET_ID,
     title: "Omgevingswet",
@@ -110,79 +80,27 @@ async function bwbSearch(fetchWithTimeout) {
 }
 
 // ---------------------------
-// Norm Extraction (only for strict mode)
+// OpenAI
 // ---------------------------
 
-function htmlToTextLite(html) {
-  return (html || "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<\/(p|div|li|h\d|br)>/gi, "\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function extractNormSentence(text) {
-  const match = text.match(/het is verboden .*? omgevingsvergunning.*?\./i);
-  return match ? `"${match[0].trim()}"` : null;
-}
-
-async function fetchOmgevingswetNorm(fetchWithTimeout) {
-  const url = `https://wetten.overheid.nl/${OMGEVINGSWET_ID}`;
-  const resp = await fetchWithTimeout(url);
-  const html = await resp.text();
-  const text = htmlToTextLite(html);
-  return extractNormSentence(text);
-}
-
-// ---------------------------
-// Output Formatting
-// ---------------------------
-
-function stripSourcesFromAnswer(answer) {
-  const a = (answer || "").trim();
-  const re = /bronnen\s*:/i;
-  const m = re.exec(a);
-  if (!m) return a;
-  return a.slice(0, m.index).trim();
-}
-
-function formatSourcesBlock(sources) {
-  const lines = sources.map(s =>
-    `- ${s.title} (${s.type} · ${s.id}) — ${s.link}`
-  );
-
-  return ["Bronnen:", lines.join("\n")].join("\n");
-}
-
-// ---------------------------
-// OpenAI Call
-// ---------------------------
-
-async function callOpenAI({ apiKey, fetchWithTimeout, q, strictMode, strictQuote }) {
+async function callOpenAI({ apiKey, fetchWithTimeout, question }) {
 
   const system = `
-Je beantwoordt vragen over Nederlands beleid en wetgeving.
+Je bent een juridisch assistent voor Nederlandse wetgeving.
 
-STRICT:
+Regels:
 - Nooit Wabo noemen.
-- Noem alleen wetten die in de bronlijst staan.
+- Geef een praktisch en duidelijk antwoord.
+- Noem indien mogelijk de relevante wet.
+- Output EXACT dit format:
 
-Output EXACT:
 Antwoord:
 Toelichting:
 `;
 
   const user = `
 Vraag:
-${q}
-
-${strictMode && strictQuote
-  ? `Gebruik deze normzin exact:\n${strictQuote}`
-  : strictMode
-  ? `Geen normzin gevonden.`
-  : ""}
+${question}
 `;
 
   const resp = await fetchWithTimeout(
@@ -195,8 +113,8 @@ ${strictMode && strictQuote
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        temperature: 0.1,
-        max_tokens: 500,
+        temperature: 0.2,
+        max_tokens: 600,
         messages: [
           { role: "system", content: system.trim() },
           { role: "user", content: user.trim() }
@@ -210,63 +128,55 @@ ${strictMode && strictQuote
 }
 
 // ---------------------------
-// MAIN HANDLER
+// MAIN
 // ---------------------------
 
 export default async function handler(req, res) {
 
-  if (req.method !== "POST")
+  if (req.method !== "POST") {
     return res.status(405).json({ error: "Only POST allowed" });
-
-  const ip =
-    (req.headers["x-forwarded-for"] || "").split(",")[0] ||
-    req.socket?.remoteAddress ||
-    "unknown";
-
-  if (!rateLimit(ip))
-    return res.status(429).json({ error: "Too many requests" });
-
-  const { message } = req.body || {};
-  if (!message)
-    return res.status(400).json({ error: "Missing message" });
-
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey)
-    return res.status(500).json({ error: "Missing API key" });
-
-  const fetchWithTimeout = makeFetchWithTimeout();
-  const strictMode = isStrictNormQuestion(message);
-
-  let sources = await bwbSearch(fetchWithTimeout);
-  sources = removeBanned(dedupeByLink(sources));
-
-  let strictQuote = null;
-
-  if (strictMode) {
-    try {
-      strictQuote = await fetchOmgevingswetNorm(fetchWithTimeout);
-    } catch {}
   }
 
-  let answer = await callOpenAI({
-    apiKey,
-    fetchWithTimeout,
-    q: message,
-    strictMode,
-    strictQuote
-  });
+  const { message } = req.body || {};
+  if (!message) {
+    return res.status(400).json({ error: "Missing message" });
+  }
 
-  answer = stripSourcesFromAnswer(answer);
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: "Missing API key" });
+  }
 
-  if (!answer.toLowerCase().includes("antwoord:"))
-    answer = `Antwoord:\nIk kan dit niet bevestigen.\n\nToelichting:\n- ${NO_QUOTE_PLACEHOLDER}`;
+  const fetchWithTimeout = makeFetchWithTimeout();
 
-  const sourcesBlock = formatSourcesBlock(sources);
+  try {
 
-  const final = `${answer}\n\n${sourcesBlock}`;
+    // --- V1: Only national source (expand in V2) ---
+    let sources = await getNationalSources();
+    sources = removeBanned(dedupeByLink(sources)).slice(0, MAX_SOURCES_RETURN);
 
-  return res.status(200).json({
-    answer: final,
-    sources
-  });
+    let answer = await callOpenAI({
+      apiKey,
+      fetchWithTimeout,
+      question: message
+    });
+
+    answer = stripSourcesFromAnswer(answer);
+
+    if (!answer.toLowerCase().includes("antwoord:")) {
+      answer = `Antwoord:\nEr kon geen duidelijk antwoord worden gegenereerd.\n\nToelichting:\n- Controleer de vraagformulering.`;
+    }
+
+    const sourcesBlock = formatSourcesBlock(sources);
+
+    const final = `${answer}\n\n${sourcesBlock}`;
+
+    return res.status(200).json({
+      answer: final,
+      sources
+    });
+
+  } catch (err) {
+    return res.status(500).json({ error: "Interne fout" });
+  }
 }
