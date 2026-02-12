@@ -1,34 +1,18 @@
-// /api/chat.js — Beleidsbank V1 (stable, practical version)
+// /api/chat.js — Beleidsbank V1 (robust + debug-friendly)
 
 const MAX_SOURCES_RETURN = 4;
 const OMGEVINGSWET_ID = "BWBR0037885";
 
-const BANNED_IDS = new Set([
-  "BWBR0024779",
-  "BWBR0047270"
-]);
-
-// ---------------------------
-// Helpers
-// ---------------------------
+// WABO hard ban
+const BANNED_IDS = new Set(["BWBR0024779", "BWBR0047270"]);
 
 function normalize(s) {
   return (s || "").toLowerCase().trim();
 }
 
-function dedupeByLink(arr) {
-  const seen = new Set();
-  return (arr || []).filter(s => {
-    if (!s?.link) return false;
-    if (seen.has(s.link)) return false;
-    seen.add(s.link);
-    return true;
-  });
-}
-
 function isBanned(item) {
-  const id = (item?.id || "").toUpperCase();
-  const title = normalize(item?.title);
+  const id = (item?.id || "").toString().trim().toUpperCase();
+  const title = normalize(item?.title || "");
   if (BANNED_IDS.has(id)) return true;
   if (title.includes("wabo")) return true;
   if (title.includes("wet algemene bepalingen omgevingsrecht")) return true;
@@ -39,23 +23,40 @@ function removeBanned(items) {
   return (items || []).filter(x => !isBanned(x));
 }
 
+function dedupeByLink(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const s of arr || []) {
+    if (!s?.link) continue;
+    if (seen.has(s.link)) continue;
+    seen.add(s.link);
+    out.push(s);
+  }
+  return out;
+}
+
 function stripSourcesFromAnswer(answer) {
-  const re = /bronnen\s*:/i;
-  const m = re.exec(answer);
-  if (!m) return answer.trim();
-  return answer.slice(0, m.index).trim();
+  const a = (answer || "").trim();
+  if (!a) return a;
+  const m = /bronnen\s*:/i.exec(a); // FIXED regex
+  if (!m) return a;
+  return a.slice(0, m.index).trim();
 }
 
 function formatSourcesBlock(sources) {
-  const lines = sources.map(s =>
-    `- ${s.title} (${s.type} · ${s.id}) — ${s.link}`
-  );
+  const lines = (sources || []).map(s => {
+    const title = (s?.title || "").toString().trim();
+    const type = (s?.type || "").toString().trim();
+    const id = (s?.id || "").toString().trim();
+    const link = (s?.link || "").toString().trim();
+    return `- ${title}${type || id ? ` (${[type, id].filter(Boolean).join(" · ")})` : ""}${link ? ` — ${link}` : ""}`;
+  });
 
-  return ["Bronnen:", lines.join("\n")].join("\n");
+  return ["Bronnen:", lines.length ? lines.join("\n") : "- (geen bronnen)"].join("\n");
 }
 
 function makeFetchWithTimeout() {
-  return async (url, options = {}, ms = 15000) => {
+  return async (url, options = {}, ms = 20000) => {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), ms);
     try {
@@ -66,42 +67,31 @@ function makeFetchWithTimeout() {
   };
 }
 
-// ---------------------------
-// Basic National Source (V1 simplified)
-// ---------------------------
-
 async function getNationalSources() {
-  return [{
-    id: OMGEVINGSWET_ID,
-    title: "Omgevingswet",
-    link: `https://wetten.overheid.nl/${OMGEVINGSWET_ID}`,
-    type: "BWB"
-  }];
+  return [
+    {
+      id: OMGEVINGSWET_ID,
+      title: "Omgevingswet",
+      link: `https://wetten.overheid.nl/${OMGEVINGSWET_ID}`,
+      type: "BWB"
+    }
+  ];
 }
 
-// ---------------------------
-// OpenAI
-// ---------------------------
-
 async function callOpenAI({ apiKey, fetchWithTimeout, question }) {
-
   const system = `
 Je bent een juridisch assistent voor Nederlandse wetgeving.
 
 Regels:
 - Nooit Wabo noemen.
-- Geef een praktisch en duidelijk antwoord.
-- Noem indien mogelijk de relevante wet.
-- Output EXACT dit format:
+- Geef een praktisch en duidelijk antwoord (geen lange disclaimers).
+- Output exact dit format (ALLEEN deze twee koppen):
 
 Antwoord:
 Toelichting:
-`;
+`.trim();
 
-  const user = `
-Vraag:
-${question}
-`;
+  const user = `Vraag:\n${question}`.trim();
 
   const resp = await fetchWithTimeout(
     "https://api.openai.com/v1/chat/completions",
@@ -116,67 +106,93 @@ ${question}
         temperature: 0.2,
         max_tokens: 600,
         messages: [
-          { role: "system", content: system.trim() },
-          { role: "user", content: user.trim() }
+          { role: "system", content: system },
+          { role: "user", content: user }
         ]
       })
-    }
+    },
+    20000
   );
 
-  const data = await resp.json();
-  return data?.choices?.[0]?.message?.content || "";
+  const raw = await resp.text();
+
+  if (!resp.ok) {
+    // Return detailed error upstream
+    return { ok: false, status: resp.status, raw };
+  }
+
+  try {
+    const data = JSON.parse(raw);
+    const content = data?.choices?.[0]?.message?.content || "";
+    return { ok: true, content: content.trim() };
+  } catch (e) {
+    return { ok: false, status: 500, raw: `JSON parse failed: ${String(e)}\nRAW:\n${raw}` };
+  }
 }
 
-// ---------------------------
-// MAIN
-// ---------------------------
-
 export default async function handler(req, res) {
+  // ---- CORS / OPTIONS ----
+  const origin = (req.headers.origin || "").toString();
+  const allow = "https://app.beleidsbank.nl"; // pas aan indien nodig
+  res.setHeader("Access-Control-Allow-Origin", origin === allow ? origin : allow);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Max-Age", "86400");
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Only POST allowed" });
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
 
+  // ---- body ----
   const { message } = req.body || {};
-  if (!message) {
-    return res.status(400).json({ error: "Missing message" });
-  }
+  const q = (message || "").toString().trim();
+  if (!q) return res.status(400).json({ error: "Missing message" });
 
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: "Missing API key" });
-  }
+  if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY ontbreekt." });
 
   const fetchWithTimeout = makeFetchWithTimeout();
 
   try {
-
-    // --- V1: Only national source (expand in V2) ---
+    // Sources (V1)
     let sources = await getNationalSources();
     sources = removeBanned(dedupeByLink(sources)).slice(0, MAX_SOURCES_RETURN);
 
-    let answer = await callOpenAI({
-      apiKey,
-      fetchWithTimeout,
-      question: message
-    });
+    // OpenAI
+    const ai = await callOpenAI({ apiKey, fetchWithTimeout, question: q });
 
-    answer = stripSourcesFromAnswer(answer);
-
-    if (!answer.toLowerCase().includes("antwoord:")) {
-      answer = `Antwoord:\nEr kon geen duidelijk antwoord worden gegenereerd.\n\nToelichting:\n- Controleer de vraagformulering.`;
+    if (!ai.ok) {
+      // << DIT maakt je fout zichtbaar i.p.v. “load failed”
+      return res.status(502).json({
+        error: "OpenAI call failed",
+        status: ai.status,
+        details: ai.raw?.slice(0, 4000) // keep it bounded
+      });
     }
 
-    const sourcesBlock = formatSourcesBlock(sources);
+    let answer = stripSourcesFromAnswer(ai.content);
 
-    const final = `${answer}\n\n${sourcesBlock}`;
+    // Ensure 2 headings exist
+    const lc = answer.toLowerCase();
+    if (!lc.includes("antwoord:") || !lc.includes("toelichting:")) {
+      answer = [
+        "Antwoord:",
+        "Er kon geen goed geformatteerd antwoord worden gegenereerd.",
+        "",
+        "Toelichting:",
+        "- Probeer de vraag iets concreter te maken."
+      ].join("\n");
+    }
 
-    return res.status(200).json({
-      answer: final,
-      sources
+    // Append bronnen as 3rd heading
+    const final = `${answer}\n\n${formatSourcesBlock(sources)}`;
+
+    return res.status(200).json({ answer: final, sources });
+  } catch (e) {
+    // << ook hier: error zichtbaar maken
+    return res.status(500).json({
+      error: "Interne fout",
+      details: String(e?.stack || e)
     });
-
-  } catch (err) {
-    return res.status(500).json({ error: "Interne fout" });
   }
 }
