@@ -58,18 +58,16 @@ function stripSourcesFromAnswer(answer) {
   const a = (answer || "").trim();
   if (!a) return a;
 
-  const patterns = [
-    /\n\s*bronnen\s*:\s*[\s\S]*$/i,
-    /\n\s*sources\s*:\s*[\s\S]*$/i,
-    /\n\s*bronnen\s*\n[\s\S]*$/i, // no colon
-    /\n\s*sources\s*\n[\s\S]*$/i
-  ];
+  // Find earliest occurrence of "Bronnen" or "Sources" anywhere
+  const m = a.match(/\b(bronnen|sources)\b\s*:?\s*/i);
+  if (!m) return a;
 
-  let out = a;
-  for (const re of patterns) out = out.replace(re, "").trim();
+  const idx = m.index ?? -1;
+  if (idx >= 0) return a.slice(0, idx).trim();
 
-  return out;
+  return a;
 }
+
 
 function formatSourcesBlock(sources) {
   const lines = (sources || []).map(s => {
