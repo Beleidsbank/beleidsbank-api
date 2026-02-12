@@ -1,29 +1,22 @@
-// /api/chat.js  (Beleidsbank) — v1.1
+// /api/chat.js  (Beleidsbank) — v1.2 (Praktisch + actueel, zonder Canvas)
 //
-// Goals in this version
-// ✅ Always return ONLY 3 headings to the client:
+// Belangrijk (jouw wensen):
+// ✅ Altijd precies 3 koppen in response:
 //    Antwoord:
 //    Toelichting:
 //    Bronnen:
 //
-// ✅ No “speculative yes”: if there is no explicit normquote in the provided excerpts,
-//    the answer may NOT claim “vereist/verboden/nodig/verplicht/mag niet zonder vergunning”.
-//
-// ✅ Stronger post-validation:
-//    - If no normquote => Toelichting MUST contain placeholder line
-//    - If normquote exists => Toelichting MUST include it exactly
-//
-// ✅ Wabo hard-banned
-// ✅ National vs Municipal scope logic preserved
-// ✅ Caching for heavy Omgevingswet extraction
-// ✅ Cleanup for in-memory Maps to prevent slow growth
-// ✅ Backend appends Bronnen consistently (model never prints sources)
+// ✅ Actualiteit: Wabo is hard-banned (IDs + titel match) → komt nooit terug
+// ✅ Niet “kapot streng”: als er géén normquote is, geven we wél een bruikbaar antwoord als INDICATIE
+//    (dus niet hard “kan niet bevestigen”, tenzij er echt nul basis is)
+// ✅ Backend plakt Bronnen er altijd zelf onder (model mag geen Bronnen printen)
+// ✅ Prevent “dubbele Bronnen:” (fix regex + harde strip)
+// ✅ Cleanup van in-memory stores om traagheid te voorkomen
+// ✅ (Extra) Gemeentelijk: haal kleine uittreksels op van top CVDR/OEP bronnen zodat model iets heeft
 
 const rateStore = new Map();
 const pendingStore = new Map(); // sessionId -> { originalQuestion, missingSlots:[], collected:{}, createdAt, attempts }
-
-// Simple in-memory cache (best-effort, may reset in serverless cold starts)
-const cacheStore = new Map(); // key -> { value, expiresAt }
+const cacheStore = new Map();   // key -> { value, expiresAt }
 
 const MAX_SOURCES_RETURN = 4;
 
@@ -130,10 +123,10 @@ function makeFetchWithTimeout() {
 }
 
 // ---------------------------
-// Hard bans (Wabo never)
+// Actualiteit / Hard bans (Wabo NEVER)
 // ---------------------------
 const BANNED_BWBR_IDS = new Set([
-  "BWBR0024779", // Wabo official
+  "BWBR0024779", // Wabo
   "BWBR0047270"  // seen earlier
 ]);
 
@@ -233,7 +226,7 @@ function shouldAskMore(q, scope) {
 }
 
 // ---------------------------
-// Terms (generic)
+// Terms
 // ---------------------------
 function extractQueryTerms(q) {
   const qLc = normalize(q);
@@ -349,17 +342,17 @@ async function bwbSearchSmart({ q, fetchWithTimeout, forceOw }) {
     qLc.includes("afwijken van het omgevingsplan");
 
   if (looksOmgevingswet) {
+    // Prefer stable core set for the stelsel (less noise)
     const core = [
       `overheidbwb.titel any "Omgevingswet"`,
       `overheidbwb.titel any "Omgevingsbesluit"`,
       `overheidbwb.titel any "Besluit bouwwerken leefomgeving"`,
       `overheidbwb.titel any "Besluit kwaliteit leefomgeving"`,
-      `overheidbwb.titel any "Besluit activiteiten leefomgeving"`,
-      `overheidbwb.titel any "Invoeringswet Omgevingswet"`,
-      `overheidbwb.titel any "Invoeringsbesluit Omgevingswet"`
+      `overheidbwb.titel any "Besluit activiteiten leefomgeving"`
     ].join(" OR ");
 
     let items = await bwbSruSearch({ cql: `(${core})`, fetchWithTimeout, max: 25 });
+
     if (!items.some(x => (x.id || "").toUpperCase() === OMGEVINGSWET_ID)) {
       items.unshift({
         id: OMGEVINGSWET_ID,
@@ -368,6 +361,7 @@ async function bwbSearchSmart({ q, fetchWithTimeout, forceOw }) {
         type: "BWB"
       });
     }
+
     return items;
   }
 
@@ -386,7 +380,7 @@ async function bwbSearchSmart({ q, fetchWithTimeout, forceOw }) {
 }
 
 // ---------------------------
-// Ranking (simple, stable)
+// Ranking
 // ---------------------------
 function scoreSource({ s, q, scope }) {
   if (isBannedSource(s)) return -9999;
@@ -402,14 +396,22 @@ function scoreSource({ s, q, scope }) {
     if (s.type === "BWB") score += 2.5;
   }
 
-  if ((s.id || "").toUpperCase() === OMGEVINGSWET_ID) score += 60;
+  // Strong stelsel priorities
+  if ((s.id || "").toUpperCase() === OMGEVINGSWET_ID) score += 80;
+  if (title === "omgevingswet") score += 25;
   if (title.includes("omgevingswet")) score += 18;
-  if (title.includes("omgevingsbesluit")) score += 10;
-  if (title.includes("besluit bouwwerken leefomgeving")) score += 12;
-  if (title.includes("besluit kwaliteit leefomgeving")) score += 12;
-  if (title.includes("besluit activiteiten leefomgeving")) score += 11;
+  if (title.includes("omgevingsbesluit")) score += 16;
+  if (title.includes("besluit bouwwerken leefomgeving")) score += 16;
+  if (title.includes("besluit kwaliteit leefomgeving")) score += 16;
+  if (title.includes("besluit activiteiten leefomgeving")) score += 15;
 
-  if (title.includes("wijzig") || title.includes("aanvullings") || title.includes("verzamel")) score -= 4;
+  // Push down noise
+  if (title.includes("vaststelling tijdstip") || title.includes("bepaling termijn")) score -= 20;
+  if (title.includes("aanvullingswet") || title.includes("aanvullingsbesluit")) score -= 10;
+  if (title.includes("verzamel")) score -= 8;
+  if (title.includes("wijzig")) score -= 6;
+  if (title.includes("invoeringswet")) score -= 4;
+  if (title.includes("invoeringsbesluit")) score -= 4;
 
   const terms = extractQueryTerms(q);
   for (const t of terms) if (title.includes(t)) score += 1.0;
@@ -427,7 +429,7 @@ function rankSources({ sources, q, scope }) {
 }
 
 // ---------------------------
-// Omgevingswet norm extraction (strict: true norm sentence)
+// Text helpers
 // ---------------------------
 function htmlToTextLite(html) {
   return (html || "")
@@ -446,31 +448,18 @@ function htmlToTextLite(html) {
     .trim();
 }
 
-function sliceArticleSection(text, articleNumber /* "5.1" */) {
-  const low = text.toLowerCase();
-  const marker = `artikel ${articleNumber}`.toLowerCase();
-  let start = low.indexOf(marker);
-  if (start === -1) return null;
-
-  const parts = articleNumber.split(".");
-  const nextMarker = `artikel ${parts[0]}.${Number(parts[1]) + 1}`.toLowerCase();
-  let end = low.indexOf(nextMarker, start + marker.length);
-  if (end === -1) end = low.indexOf("\nartikel ", start + marker.length);
-  if (end === -1) end = Math.min(text.length, start + 9000);
-
-  const section = text.slice(start, end).trim();
-  return section.length ? section : null;
-}
-
 function trimQuoteWords(s, maxWords = 25) {
   const words = (s || "").replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
   return words.slice(0, maxWords).join(" ");
 }
 
+// ---------------------------
+// Omgevingswet norm extraction (try more than only 5.1)
+// ---------------------------
 function isHeaderLike(line) {
   const l = normalize(line);
   if (!l) return true;
-  if (l.startsWith("artikel 5.1")) return true;
+  if (l.startsWith("artikel")) return true;
   if (l.startsWith("hoofdstuk")) return true;
   if (l.startsWith("afdeling")) return true;
   if (l.startsWith("paragraaf")) return true;
@@ -478,7 +467,6 @@ function isHeaderLike(line) {
   return false;
 }
 
-// A “normquote” must contain at least one of these norm-patterns AND "omgevingsvergunning"
 function isNormSentence(line) {
   const l = normalize(line);
   if (!l.includes("omgevingsvergunning")) return false;
@@ -489,56 +477,48 @@ function isNormSentence(line) {
     /\bis\s+vereist\b/.test(l) ||
     /\bvereist\b/.test(l);
 
-  if (!normOk) return false;
-  return true;
+  return !!normOk;
 }
 
-function pickNormQuoteFromArticleSection(sectionText) {
-  if (!sectionText) return null;
-
-  const lines = sectionText
-    .replace(/\r/g, "\n")
-    .split("\n")
-    .map(x => x.trim())
-    .filter(Boolean);
-
-  const contentLines = lines.filter(l => !isHeaderLike(l));
-
-  // Best: contains "verboden" + "omgevingsvergunning" + (omgevingsplan/omgevingsplanactiviteit)
-  let best = contentLines.find(l => {
-    const lc = normalize(l);
-    return (
-      /\bverboden\b/.test(lc) &&
-      lc.includes("omgevingsvergunning") &&
-      (lc.includes("omgevingsplan") || lc.includes("omgevingsplanactiviteit"))
-    );
-  });
-
-  if (!best) best = contentLines.find(isNormSentence);
+function pickNormQuoteFromText(text) {
+  if (!text) return null;
+  const lines = text.replace(/\r/g, "\n").split("\n").map(x => x.trim()).filter(Boolean);
+  const content = lines.filter(l => !isHeaderLike(l));
+  let best = content.find(isNormSentence);
 
   if (!best) {
-    const flat = contentLines.join(" ").replace(/\s+/g, " ").trim();
+    const flat = content.join(" ").replace(/\s+/g, " ").trim();
     const idx = flat.toLowerCase().indexOf("omgevingsvergunning");
     if (idx !== -1) {
-      const start = Math.max(0, idx - 260);
-      const end = Math.min(flat.length, idx + 420);
-      const frag = flat.slice(start, end);
+      const frag = flat.slice(Math.max(0, idx - 260), Math.min(flat.length, idx + 420));
       if (isNormSentence(frag) && !isHeaderLike(frag)) best = frag;
     }
   }
 
   if (!best) return null;
-
   const quote = trimQuoteWords(best, 25);
   if (isHeaderLike(quote)) return null;
   if (!isNormSentence(quote)) return null;
-
   return `"${quote}"`;
 }
 
-async function fetchOmgevingswetArt51Norm(fetchWithTimeout) {
-  // Cache this heavy operation
-  const cacheKey = `ow:${OMGEVINGSWET_ID}:art5.1`;
+function sliceArticleSection(text, articleNumber /* "5.1" */) {
+  const low = (text || "").toLowerCase();
+  const marker = `artikel ${articleNumber}`.toLowerCase();
+  let start = low.indexOf(marker);
+  if (start === -1) return null;
+
+  // find next "artikel X.Y"
+  const tail = low.slice(start + marker.length);
+  const m = tail.match(/\nartikel\s+\d+\.\d+\b/i);
+  const end = m?.index != null ? (start + marker.length + m.index) : Math.min(text.length, start + 9000);
+
+  const section = text.slice(start, end).trim();
+  return section.length ? section : null;
+}
+
+async function fetchOmgevingswetNorm(fetchWithTimeout) {
+  const cacheKey = `ow:${OMGEVINGSWET_ID}:multi`;
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
 
@@ -547,17 +527,94 @@ async function fetchOmgevingswetArt51Norm(fetchWithTimeout) {
   const html = await resp.text();
   const text = htmlToTextLite(html);
 
-  const section = sliceArticleSection(text, "5.1");
-  const quote = pickNormQuoteFromArticleSection(section);
+  // Try multiple likely articles
+  const candidates = ["5.1", "5.2", "5.3", "5.4"].map(n => sliceArticleSection(text, n)).filter(Boolean);
+
+  let section = null;
+  let quote = null;
+
+  for (const sec of candidates) {
+    const q = pickNormQuoteFromText(sec);
+    if (q) { section = sec; quote = q; break; }
+  }
+
+  // broader fallback near first "omgevingsvergunning"
+  if (!quote) {
+    const idx = text.toLowerCase().indexOf("omgevingsvergunning");
+    if (idx !== -1) {
+      const frag = text.slice(Math.max(0, idx - 2000), Math.min(text.length, idx + 2500));
+      const q = pickNormQuoteFromText(frag);
+      if (q) { section = frag; quote = q; }
+    }
+  }
 
   const out = {
     section: section ? section.slice(0, 4200) : null,
-    quote // null if no true norm sentence was found
+    quote
   };
 
-  // 12 hours TTL
   cacheSet(cacheKey, out, 12 * 60 * 60 * 1000);
   return out;
+}
+
+// ---------------------------
+// Municipal excerpt enrichment (small + cached)
+// ---------------------------
+function pickRelevantLines(text, keywords, maxLines = 12) {
+  const lines = (text || "").split("\n").map(l => l.trim()).filter(Boolean);
+  const key = (keywords || []).map(k => normalize(k)).filter(Boolean);
+  const out = [];
+  for (const l of lines) {
+    const lc = normalize(l);
+    if (!lc) continue;
+    if (key.some(k => lc.includes(k))) out.push(l);
+    if (out.length >= maxLines) break;
+  }
+  return out;
+}
+
+function isMunicipalNormLine(line) {
+  const l = normalize(line);
+  if (!l.includes("vergunning")) return false;
+  return (
+    l.includes("verboden") ||
+    l.includes("verplicht") ||
+    l.includes("is vereist") ||
+    l.includes("vereist") ||
+    l.includes("zonder vergunning") ||
+    l.includes("mag niet")
+  );
+}
+
+function pickMunicipalNormQuote(text) {
+  const lines = (text || "").split("\n").map(x => x.trim()).filter(Boolean);
+  const hit = lines.find(isMunicipalNormLine);
+  if (!hit) return null;
+  return `"${trimQuoteWords(hit, 28)}"`;
+}
+
+async function fetchMunicipalExcerpt({ url, fetchWithTimeout, keywords }) {
+  const cacheKey = `mun:${url}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const resp = await fetchWithTimeout(url, {}, 15000);
+    const html = await resp.text();
+    const text = htmlToTextLite(html);
+
+    const quote = pickMunicipalNormQuote(text);
+    const lines = pickRelevantLines(text, keywords, 12);
+    const excerpt = lines.length ? lines.join("\n") : text.slice(0, 1400);
+
+    const out = { excerpt: excerpt.slice(0, 3200), quote };
+    cacheSet(cacheKey, out, 6 * 60 * 60 * 1000);
+    return out;
+  } catch {
+    const out = { excerpt: null, quote: null };
+    cacheSet(cacheKey, out, 30 * 60 * 1000);
+    return out;
+  }
 }
 
 // ---------------------------
@@ -581,14 +638,15 @@ function formatSourcesBlock(sources) {
 }
 
 function stripSourcesFromAnswer(answer) {
-  // Defensive: model should not print sources, but if it does, remove it.
+  // FIX: need double escaping in JS string for regex \s
   const a = (answer || "").trim();
   if (!a) return a;
-  const low = a.toLowerCase();
-  const idx = low.indexOf("\nbronnen:");
-  if (idx !== -1) return a.slice(0, idx).trim();
-  const idx2 = low.indexOf("bronnen:");
-  if (idx2 !== -1 && (idx2 === 0 || a[idx2 - 1] === "\n")) return a.slice(0, idx2).trim();
+
+  // remove everything from first "Bronnen:" (or "Sources:") onwards
+  const m = a.match(/\b(bronnen|sources)\s*:\s*/i);
+  if (!m) return a;
+  const idx = m.index ?? -1;
+  if (idx >= 0) return a.slice(0, idx).trim();
   return a;
 }
 
@@ -604,14 +662,12 @@ function extractSection(answer, header) {
 }
 
 function extractBewijsquoteFromToelichting(toelichting) {
-  // Accept formats like:
-  // Bewijsquote: "..."
-  // Bewijsquote: (geen normquote ...)
   const m = (toelichting || "").match(/bewijsquote\s*:\s*([\s\S]*?)(\n|$)/i);
   return (m?.[1] || "").trim();
 }
 
-function containsNormativeClaim(text) {
+function containsHardNormClaim(text) {
+  // hard/absolute claims we don't want when there is no quote
   const t = normalize(text);
   return (
     /\bvereist\b/.test(t) ||
@@ -623,26 +679,26 @@ function containsNormativeClaim(text) {
   );
 }
 
-function safeFallbackAnswer({ strictQuote }) {
-  // Returns only Antwoord + Toelichting. Bronnen are appended by backend.
-  const hasQuote = strictQuote && strictQuote !== NO_QUOTE_PLACEHOLDER;
+function safeFallbackAnswer({ strictQuote, mode /* 'firm'|'indicatie' */ }) {
+  const hasQuote = !!strictQuote && strictQuote !== NO_QUOTE_PLACEHOLDER;
+
+  const answerLine =
+    mode === "firm" && hasQuote
+      ? "Op basis van de aangeleverde normzin volgt dat (voor de beschreven situatie) een omgevingsvergunning vereist is / het verboden is zonder vergunning."
+      : "Indicatie: op basis van de geselecteerde bronnen lijkt dit in veel gevallen vergunningplichtig of aan voorwaarden gebonden. Zonder expliciete normzin in de uittreksels kan ik dit niet hard bevestigen.";
 
   return [
     "Antwoord:",
-    hasQuote
-      ? "Op basis van de aangeleverde normzin volgt dat (voor de beschreven situatie) een omgevingsvergunning vereist is / het verboden is zonder vergunning."
-      : "Ik kan niet bevestigen of dit vereist/verboden is op basis van de aangeleverde tekst, omdat er geen expliciete normzin is meegeleverd.",
+    answerLine,
     "",
     "Toelichting:",
-    hasQuote
-      ? `- Bewijsquote: ${strictQuote}`
-      : `- Bewijsquote: ${NO_QUOTE_PLACEHOLDER}`,
+    `- Bewijsquote: ${hasQuote ? strictQuote : NO_QUOTE_PLACEHOLDER}`,
     "- Alleen informatie die letterlijk in de aangeleverde bronnen/uittreksels staat kan worden gebruikt."
   ].join("\n");
 }
 
 // ---------------------------
-// OpenAI call (strict, 2 headings only)
+// OpenAI call (2 headings only; backend appends Bronnen)
 // ---------------------------
 async function callOpenAI({ apiKey, fetchWithTimeout, q, sourcesText, strictQuote }) {
   const system = `
@@ -650,15 +706,20 @@ Je beantwoordt vragen over beleid en wetgeving in Nederland.
 
 Je mag ALLEEN antwoorden op basis van de aangeleverde officiële bronnen (incl. uittreksels).
 
-STRICT:
-- Noem GEEN wet/regeling als die naam/titel niet in de bronvermelding/uittreksel staat.
-- Noem GEEN artikelnummer/bepaling als die niet letterlijk in de brontekst/uittreksel staat.
+ACTUALITEIT:
 - NOOIT Wabo noemen of gebruiken.
 
+Regels:
+- Noem GEEN wet/regeling als die naam/titel niet in de bronnen/uittreksels staat.
+- Noem GEEN artikelnummer/bepaling als die niet letterlijk in de uittreksels staat.
+- Print GEEN bronnenlijst; dat doet de backend.
+
 Bewijsquote-regel:
-- Als er een verplichte bewijsquote is meegegeven: neem die EXACT over in de Toelichting als: "- Bewijsquote: <quote>".
-- Als er géén verplichte bewijsquote is meegegeven: zet in de Toelichting EXACT: "- Bewijsquote: (geen normquote gevonden in aangeleverde tekst)".
-- Als er géén normquote is: doe géén stellige norm-claim (niet zeggen: vereist/verplicht/verboden/vergunning nodig).
+- Als er een verplichte bewijsquote is meegegeven: neem die EXACT over in Toelichting als: "- Bewijsquote: <quote>".
+- Als er géén verplichte bewijsquote is meegegeven: zet in Toelichting EXACT: "- Bewijsquote: (geen normquote gevonden in aangeleverde tekst)".
+
+Antwoord-regel:
+- Als er géén normquote is: geef wél een nuttig antwoord, maar als INDICATIE (begin Antwoord met "Indicatie:") en vermijd absolute zekerheid.
 
 Output-format (ALLEEN deze 2 kopjes, exact zo, elk op eigen regel):
 Antwoord:
@@ -680,7 +741,7 @@ Toelichting:
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        temperature: 0.05,
+        temperature: 0.1,
         max_tokens: 650,
         messages: [
           { role: "system", content: system.trim() },
@@ -704,10 +765,9 @@ Toelichting:
 // MAIN
 // ---------------------------
 export default async function handler(req, res) {
-  // Cleanup first (prevents slow growth)
   cleanupStores();
 
-  // ---- CORS / PREFLIGHT FIRST (Safari) ----
+  // ---- CORS / PREFLIGHT ----
   const origin = (req.headers.origin || "").toString();
   if (origin === "https://app.beleidsbank.nl") {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -740,9 +800,7 @@ export default async function handler(req, res) {
   const fetchWithTimeout = makeFetchWithTimeout();
 
   try {
-    // -----------------------------
     // 0) Follow-up flow
-    // -----------------------------
     const pending = sessionId ? pendingStore.get(sessionId) : null;
     const fresh = pending && (nowMs() - pending.createdAt) < 7 * 60 * 1000;
 
@@ -771,20 +829,26 @@ export default async function handler(req, res) {
         pending.collected = collected;
         pending.attempts = attempts + 1;
         pendingStore.set(sessionId, pending);
-        return res.status(200).json({
-          answer: ["Antwoord:", askForMissing(stillMissing), "", "Toelichting:", "- Geef kort antwoord op de vraag hierboven, dan zoek ik de juiste bronnen.", "", "Bronnen:", "- (nog niet beschikbaar)"]
-            .join("\n"),
-          sources: []
-        });
+
+        const answer = [
+          "Antwoord:",
+          askForMissing(stillMissing),
+          "",
+          "Toelichting:",
+          "- Geef kort antwoord op de vraag hierboven, dan selecteer ik de juiste officiële bronnen.",
+          "",
+          "Bronnen:",
+          "- (nog niet beschikbaar)"
+        ].join("\n");
+
+        return res.status(200).json({ answer, sources: [] });
       }
 
       q = pending.originalQuestion;
       pendingStore.delete(sessionId);
     }
 
-    // -----------------------------
     // 1) Scope decision
-    // -----------------------------
     const scope = decideScope(q);
     const qLc = normalize(q);
 
@@ -803,11 +867,18 @@ export default async function handler(req, res) {
         });
       }
 
-      return res.status(200).json({
-        answer: ["Antwoord:", askForMissing(need), "", "Toelichting:", "- Voor gemeentelijke regels heb ik minimaal de gemeente nodig.", "", "Bronnen:", "- (nog niet beschikbaar)"]
-          .join("\n"),
-        sources: []
-      });
+      const answer = [
+        "Antwoord:",
+        askForMissing(need),
+        "",
+        "Toelichting:",
+        "- Voor gemeentelijke regels heb ik minimaal de gemeente nodig.",
+        "",
+        "Bronnen:",
+        "- (nog niet beschikbaar)"
+      ].join("\n");
+
+      return res.status(200).json({ answer, sources: [] });
     }
 
     if (scope === "national" && shouldAskMore(q, scope) && !collected.topic_hint) {
@@ -821,16 +892,21 @@ export default async function handler(req, res) {
         });
       }
 
-      return res.status(200).json({
-        answer: ["Antwoord:", questionForSlot("topic_hint"), "", "Toelichting:", "- Met een kernbegrip kan ik de juiste landelijke bron selecteren.", "", "Bronnen:", "- (nog niet beschikbaar)"]
-          .join("\n"),
-        sources: []
-      });
+      const answer = [
+        "Antwoord:",
+        questionForSlot("topic_hint"),
+        "",
+        "Toelichting:",
+        "- Met een kernbegrip kan ik de juiste landelijke bron selecteren.",
+        "",
+        "Bronnen:",
+        "- (nog niet beschikbaar)"
+      ].join("\n");
+
+      return res.status(200).json({ answer, sources: [] });
     }
 
-    // -----------------------------
     // 2) Search sources
-    // -----------------------------
     const extra = [collected.topic_hint, collected.activity_hint, collected.location_hint].filter(hasMeaningfulDetail).join(" ");
     const topicText = `${q} ${extra}`.trim();
 
@@ -857,47 +933,49 @@ export default async function handler(req, res) {
         qLc.includes("tijdelijk afwijken") ||
         qLc.includes("tijdelijk");
 
-      const q2 = `${q} ${extra}`.trim();
-      sources = await bwbSearchSmart({ q: q2, fetchWithTimeout, forceOw });
+      sources = await bwbSearchSmart({ q: topicText, fetchWithTimeout, forceOw });
     }
 
     sources = removeBanned(dedupeByLink(sources));
-    sources = rankSources({ sources, q, scope }).slice(0, MAX_SOURCES_RETURN).map(({ _score, ...s }) => s);
+    sources = rankSources({ sources, q: topicText, scope })
+      .slice(0, MAX_SOURCES_RETURN)
+      .map(({ _score, ...s }) => s);
 
     if (!sources.length) {
-      return res.status(200).json({
-        answer: [
-          "Antwoord:",
-          "Geen officiële bronnen gevonden. Formuleer specifieker met kernbegrippen (en bij gemeentelijke vragen: de gemeente).",
-          "",
-          "Toelichting:",
-          "- Tip: noem het onderwerp (bv. bouwen/milieu/handhaving) en de activiteit (bv. kappen, bouwen, evenement).",
-          "",
-          "Bronnen:",
-          "- (geen bronnen)"
-        ].join("\n"),
-        sources: []
-      });
+      const answer = [
+        "Antwoord:",
+        "Geen officiële bronnen gevonden. Formuleer specifieker met kernbegrippen (en bij gemeentelijke vragen: de gemeente).",
+        "",
+        "Toelichting:",
+        "- Tip: noem het onderwerp (bv. bouwen/milieu/handhaving) en de activiteit (bv. kappen, bouwen, evenement).",
+        "",
+        "Bronnen:",
+        "- (geen bronnen)"
+      ].join("\n");
+
+      return res.status(200).json({ answer, sources: [] });
     }
 
-    // -----------------------------
-    // 3) Normquote (strict)
-    // -----------------------------
+    // 3) Build excerpts + optional strictQuote
+    let owNorm = { section: null, quote: null };
     const needsOwNorm =
       scope === "national" &&
-      (isLegalBasisQuestion(qLc) ||
-        qLc.includes("omgevingsplan") ||
-        qLc.includes("omgevingsplanactiviteit") ||
-        qLc.includes("afwijken") ||
-        qLc.includes("tijdelijk") ||
-        qLc.includes("bopa"));
+      (qLc.includes("omgevingsplan") || qLc.includes("omgevingsvergunning") || qLc.includes("bopa") || qLc.includes("afwijken") || qLc.includes("tijdelijk"));
 
-    let owNorm = { section: null, quote: null };
     if (needsOwNorm) {
       try {
-        owNorm = await fetchOmgevingswetArt51Norm(fetchWithTimeout);
+        owNorm = await fetchOmgevingswetNorm(fetchWithTimeout);
       } catch {
         owNorm = { section: null, quote: null };
+      }
+    }
+
+    // Municipal enrich: fetch excerpt for top 2 sources (so we actually have content)
+    let municipalEnrich = {};
+    if (scope === "municipal") {
+      const kw = ["vergunning", "toestemming", "verboden", "verplicht", "terras", "terrassen", "apv"].concat(extractQueryTerms(topicText));
+      for (const s of sources.slice(0, 2)) {
+        municipalEnrich[s.link] = await fetchMunicipalExcerpt({ url: s.link, fetchWithTimeout, keywords: kw });
       }
     }
 
@@ -905,14 +983,22 @@ export default async function handler(req, res) {
       .map((s, i) => {
         const head = `Bron ${i + 1}: ${s.title}\nType: ${s.type}\n${s.link}`;
         const isOw = (s.id || "").toUpperCase() === OMGEVINGSWET_ID || normalize(s.title) === "omgevingswet";
+
         if (isOw && owNorm.section) return `${head}\n\nUittreksel (relevant):\n${owNorm.section}`;
+
+        if (scope === "municipal") {
+          const ex = municipalEnrich[s.link];
+          if (ex?.excerpt) {
+            const cand = ex.quote ? `\n\nMogelijke normzin (kandidaat):\n${ex.quote}` : "";
+            return `${head}\n\nUittreksel (relevant):\n${ex.excerpt}${cand}`;
+          }
+        }
+
         return head;
       })
       .join("\n\n---\n\n");
 
-    // -----------------------------
-    // 4) Generate answer (2 headings only)
-    // -----------------------------
+    // 4) Generate answer
     let answer = await callOpenAI({
       apiKey,
       fetchWithTimeout,
@@ -921,77 +1007,58 @@ export default async function handler(req, res) {
       strictQuote: owNorm.quote // null if not found
     });
 
-    answer = stripSourcesFromAnswer(answer);
+    // 5) Post-validation
+    answer = stripSourcesFromAnswer(answer); // prevent duplicate Bronnen sections
 
-    // -----------------------------
-    // 5) Post-validation (hard)
-    // -----------------------------
     const ansLc = normalize(answer);
-
-    // Never mention Wabo
     if (ansLc.includes("wabo") || ansLc.includes("wet algemene bepalingen omgevingsrecht")) {
-      answer = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER });
+      answer = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER, mode: owNorm.quote ? "firm" : "indicatie" });
     }
 
-    // Must have core headings
     if (!hasCoreSections(answer)) {
-      answer = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER });
+      answer = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER, mode: owNorm.quote ? "firm" : "indicatie" });
     }
 
     const toelichting = extractSection(answer, "Toelichting");
     const bewijsquote = extractBewijsquoteFromToelichting(toelichting);
-    const bqLc = normalize(bewijsquote);
+    const hasQuote = !!owNorm.quote;
 
-    // If strictQuote exists, it MUST be included exactly in Toelichting
-    if (owNorm.quote && !answer.includes(owNorm.quote)) {
-      answer = safeFallbackAnswer({ strictQuote: owNorm.quote });
+    // Enforce quote rule
+    if (hasQuote && !answer.includes(owNorm.quote)) {
+      answer = safeFallbackAnswer({ strictQuote: owNorm.quote, mode: "firm" });
+    }
+    if (!hasQuote && normalize(bewijsquote) !== normalize(NO_QUOTE_PLACEHOLDER)) {
+      answer = safeFallbackAnswer({ strictQuote: NO_QUOTE_PLACEHOLDER, mode: "indicatie" });
     }
 
-    // If no strictQuote exists, Toelichting MUST include the placeholder
-    if (!owNorm.quote) {
-      if (!bqLc.includes(normalize(NO_QUOTE_PLACEHOLDER))) {
-        answer = safeFallbackAnswer({ strictQuote: NO_QUOTE_PLACEHOLDER });
+    // If no quote, enforce Indicatie and block hard norm-claims
+    if (!hasQuote) {
+      const ant = extractSection(answer, "Antwoord");
+      const antLc = normalize(ant);
+
+      if (!antLc.startsWith("indicatie:")) {
+        answer = safeFallbackAnswer({ strictQuote: NO_QUOTE_PLACEHOLDER, mode: "indicatie" });
+      } else {
+        // if it still contains hard norm claims, fallback to safer indicative text
+        if (containsHardNormClaim(ant) && !antLc.includes("kan ik dit niet hard bevestigen")) {
+          answer = safeFallbackAnswer({ strictQuote: NO_QUOTE_PLACEHOLDER, mode: "indicatie" });
+        }
       }
     }
 
-    // Reject header-like quotes ALWAYS
-    if (bqLc.includes("artikel 5.1") || bqLc.includes("hoofdstuk") || bqLc.includes("omgevingsvergunningplichtige activiteiten")) {
-      if (!owNorm.quote || !answer.includes(owNorm.quote)) {
-        answer = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER });
-      }
-    }
-
-    // New: If placeholder => no normative claims in Antwoord
-    const antwoordText = extractSection(answer, "Antwoord");
-    const hasPlaceholder = !owNorm.quote && bqLc.includes(normalize(NO_QUOTE_PLACEHOLDER));
-    if (hasPlaceholder && containsNormativeClaim(antwoordText)) {
-      answer = safeFallbackAnswer({ strictQuote: NO_QUOTE_PLACEHOLDER });
-    }
-
-    // Never allow “impliceert” reasoning when no quote
-    if (!owNorm.quote && ansLc.includes("impliceert")) {
-      answer = safeFallbackAnswer({ strictQuote: NO_QUOTE_PLACEHOLDER });
-    }
-
-    // -----------------------------
     // 6) Append Bronnen (backend authoritative)
-    // -----------------------------
     const safeSources = removeBanned(sources).slice(0, MAX_SOURCES_RETURN);
     const sourcesBlock = formatSourcesBlock(safeSources);
 
-    // Ensure final response always has 3 headings
     let final = answer.trim();
-    if (!final.toLowerCase().includes("antwoord:")) {
-      final = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER });
-    }
-    if (!final.toLowerCase().includes("toelichting:")) {
-      final = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER });
+    if (!final.toLowerCase().includes("antwoord:") || !final.toLowerCase().includes("toelichting:")) {
+      final = safeFallbackAnswer({ strictQuote: owNorm.quote || NO_QUOTE_PLACEHOLDER, mode: owNorm.quote ? "firm" : "indicatie" });
     }
 
     final = `${final}\n\n${sourcesBlock}`;
 
     return res.status(200).json({ answer: final, sources: safeSources });
-  } catch (e) {
+  } catch {
     return res.status(500).json({ error: "Interne fout" });
   }
 }
