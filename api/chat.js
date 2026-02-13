@@ -1,15 +1,5 @@
-// /api/chat.js — Beleidsbank V1 (FIXED: juiste bronnen, stabiele nummers, minder ruis, beter voor “evenement” vs “betoging”)
+// /api/chat.js — Beleidsbank V1 (robust excerpts + stabiele bronnen + minder duplicaten)
 // Next.js API route (Node runtime)
-//
-// Fixes t.o.v. jouw laatste output:
-// 1) Bronnummering is nu 100% stabiel: sources[] bevat altijd n=1..N, uniek per bron (geen duplicaten).
-// 2) AI móét citeren met [n] (en als hij een bron noemt, móét er een nummer bij).
-// 3) “Evenement” ≠ “betoging”: WOM alleen als het duidelijk om betoging/demonstratie gaat.
-// 4) We sturen géén stapels algemene wetten mee tenzij ze echt relevant zijn (anders wordt AI vaag).
-// 5) We selecteren eerst top-bronnen met AI, daarna antwoorden we alleen met die bronnen.
-//
-// Input:  { session_id?: string, message: string }
-// Output: { answer: string, sources: [{n,id,title,link,type,excerpt}] }
 
 const SRU_BWB_ENDPOINT = "https://zoekservice.overheid.nl/sru/Search"; // x-connection=BWB
 const SRU_CVDR_ENDPOINT = "https://zoekdienst.overheid.nl/sru/Search"; // x-connection=cvdr
@@ -19,10 +9,9 @@ const RATE_LIMIT = 30;
 const RATE_WINDOW_MS = 60_000;
 const MAX_MESSAGE_CHARS = 2000;
 
-// Retrieval tuning (V1: snel maar bruikbaar)
 const SRU_MAX_RECORDS = 50;
 const MAX_CANDIDATES = 60;
-const EXCERPTS_FETCH = 14;
+const EXCERPTS_FETCH = 12;      // minder fetches, maar wél betere excerpts
 const UI_SOURCES_MAX = 8;
 
 const EXCERPT_TTL_MS = 2 * 60 * 60 * 1000;
@@ -30,10 +19,9 @@ const EXCERPT_TTL_MS = 2 * 60 * 60 * 1000;
 const rateStore = new Map();
 const excerptCache = new Map();
 
-// --------------------- utils ---------------------
-function nowMs() {
-  return Date.now();
-}
+// ---------------- utils ----------------
+function nowMs() { return Date.now(); }
+
 function cleanupStores() {
   const now = nowMs();
   for (const [ip, v] of rateStore.entries()) {
@@ -43,6 +31,7 @@ function cleanupStores() {
     if (!v || now > v.expiresAt) excerptCache.delete(k);
   }
 }
+
 function rateLimit(ip) {
   const now = nowMs();
   const item = rateStore.get(ip) || { count: 0, resetAt: now + RATE_WINDOW_MS };
@@ -54,6 +43,7 @@ function rateLimit(ip) {
   rateStore.set(ip, item);
   return item.count <= RATE_LIMIT;
 }
+
 function makeFetchWithTimeout() {
   return async (url, options = {}, ms = 15000) => {
     const controller = new AbortController();
@@ -65,6 +55,7 @@ function makeFetchWithTimeout() {
         signal: controller.signal,
         headers: {
           "User-Agent": "Beleidsbank/1.0 (+https://beleidsbank.nl)",
+          "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.7",
           ...(options.headers || {}),
         },
       });
@@ -73,27 +64,13 @@ function makeFetchWithTimeout() {
     }
   };
 }
-function safeJsonParse(s) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
-  }
-}
+
+function safeJsonParse(s) { try { return JSON.parse(s); } catch { return null; } }
+
 function normalize(s) {
   return (s || "").toString().toLowerCase().replace(/\s+/g, " ").trim();
 }
-function uniqBy(arr, keyFn) {
-  const out = [];
-  const seen = new Set();
-  for (const x of arr || []) {
-    const k = keyFn(x);
-    if (!k || seen.has(k)) continue;
-    seen.add(k);
-    out.push(x);
-  }
-  return out;
-}
+
 function decodeXmlEntities(str) {
   if (!str) return "";
   return str
@@ -105,24 +82,30 @@ function decodeXmlEntities(str) {
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
-      try {
-        return String.fromCodePoint(parseInt(hex, 16));
-      } catch {
-        return "";
-      }
+      try { return String.fromCodePoint(parseInt(hex, 16)); } catch { return ""; }
     })
     .replace(/&#([0-9]+);/g, (_, num) => {
-      try {
-        return String.fromCodePoint(parseInt(num, 10));
-      } catch {
-        return "";
-      }
+      try { return String.fromCodePoint(parseInt(num, 10)); } catch { return ""; }
     });
 }
+
 function firstMatch(text, regex) {
   const m = (text || "").match(regex);
   return m ? m[1] : null;
 }
+
+function uniqBy(arr, keyFn) {
+  const out = [];
+  const seen = new Set();
+  for (const x of arr || []) {
+    const k = keyFn(x);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(x);
+  }
+  return out;
+}
+
 function stripModelLeakage(text) {
   if (!text) return text;
   return text
@@ -132,6 +115,16 @@ function stripModelLeakage(text) {
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
+
+// verwijder “(bron )” en “bron ” zonder [n]
+function stripEmptySourceRefs(answer) {
+  return (answer || "")
+    .replace(/\(bron\s*\)/gi, "")
+    .replace(/\bbron\s*:\s*\)/gi, ")")
+    .replace(/\bbron\s*(?=[.,;:])/gi, "")
+    .trim();
+}
+
 function sanitizeInlineCitations(answer, maxN) {
   if (!answer) return answer;
   const cleaned = answer.replace(/\[(\d+)\]/g, (m, n) => {
@@ -142,84 +135,21 @@ function sanitizeInlineCitations(answer, maxN) {
   return cleaned.replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-// --------------------- stelsel routing ---------------------
-const DOMAIN = {
-  BUILD: "build",
-  LOCAL: "local",
-  GENERAL: "general",
-};
-
-function decideDomain(q) {
-  const t = normalize(q);
-
-  const buildSignals = [
-    "dakkapel",
-    "uitbouw",
-    "aanbouw",
-    "bouw",
-    "bouwen",
-    "bouwwerk",
-    "verbouwen",
-    "omgevingsvergunning",
-    "vergunningvrij",
-    "bopa",
-    "omgevingsplan",
-    "bouwactiviteit",
-    "dakopbouw",
-    "bijgebouw",
-    "welstand",
-    "monument",
-  ];
-
-  const localSignals = [
-    "apv",
-    "algemene plaatselijke verordening",
-    "evenement",
-    "festival",
-    "markt",
-    "braderie",
-    "kermis",
-    "terras",
-    "horeca",
-    "sluitingstijd",
-    "sluitingstijden",
-    "openbaar terrein",
-    "openbare ruimte",
-    "standplaats",
-  ];
-
-  if (buildSignals.some((w) => t.includes(w))) return DOMAIN.BUILD;
-  if (localSignals.some((w) => t.includes(w))) return DOMAIN.LOCAL;
-  return DOMAIN.GENERAL;
-}
-
+// ---------------- minimal gemeente extractie ----------------
 function titleCase(s) {
-  return (s || "")
-    .split(/\s+/)
-    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
-    .join(" ")
-    .trim();
+  return (s || "").split(/\s+/).map(w => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ").trim();
 }
 
 function extractMunicipality(message) {
   const text = (message || "").toString();
-
   let m = text.match(/\bgemeente\s+([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){0,3})/i);
   if (m?.[1]) return titleCase(m[1]);
-
   m = text.match(/\b(?:in|te|bij)\s+([A-ZÀ-Ý][A-Za-zÀ-ÿ'\-]+(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ'\-]+){0,3})/);
   if (m?.[1]) return titleCase(m[1]);
-
   return null;
 }
 
-// “Evenement” vs “betoging/demonstratie”
-function looksLikeDemonstration(message) {
-  const t = normalize(message);
-  return ["betoging", "demonstratie", "manifestatie", "protest", "mars", "optocht", "bijeenkomst"].some((w) => t.includes(w));
-}
-
-// --------------------- terms ---------------------
+// ---------------- term extraction ----------------
 const STOPWORDS = new Set([
   "de","het","een","en","of","maar","als","dan","dat","dit","die","er","hier","daar","waar","wanneer",
   "ik","jij","je","u","uw","we","wij","zij","ze","mijn","jouw","zijn","haar","hun","ons","onze",
@@ -235,7 +165,7 @@ function extractTerms(q, max = 10) {
     .replace(/\s+/g, " ")
     .trim();
 
-  const tokens = raw.split(" ").map((t) => normalize(t)).filter(Boolean);
+  const tokens = raw.split(" ").map(t => normalize(t)).filter(Boolean);
   const out = [];
   const seen = new Set();
   for (const t of tokens) {
@@ -250,7 +180,7 @@ function extractTerms(q, max = 10) {
   return out;
 }
 
-// --------------------- SRU ---------------------
+// ---------------- SRU ----------------
 async function sruSearch({ endpoint, connection, cql, fetchWithTimeout, maximumRecords = SRU_MAX_RECORDS }) {
   const url =
     `${endpoint}?version=1.2&operation=searchRetrieve` +
@@ -266,7 +196,6 @@ async function sruSearch({ endpoint, connection, cql, fetchWithTimeout, maximumR
 function parseSruRecords(xml, collectionType) {
   const records = (xml || "").match(/<record(?:\s[^>]*)?>[\s\S]*?<\/record>/g) || [];
   const out = [];
-
   for (const rec of records) {
     const id =
       firstMatch(rec, /<dcterms:identifier>([^<]+)<\/dcterms:identifier>/) ||
@@ -289,186 +218,106 @@ function parseSruRecords(xml, collectionType) {
 
     out.push({ id, title, link, type: collectionType });
   }
-
-  return uniqBy(out, (x) => `${x.type}:${x.id}`);
+  return out;
 }
 
-// --------------------- ranking / anti-ruis ---------------------
+// ---------------- scoring: vooral ruis voorkomen ----------------
 const TAX_NOISE = [
-  "inkomstenbelasting",
-  "kapitaalverzekering",
-  "spaarrekening",
-  "beleggingsrecht",
-  "box 3",
-  "overgangstermijn",
-  "kew",
-  "eigen woning",
+  "inkomstenbelasting","kapitaalverzekering","spaarrekening","beleggingsrecht","box 3","kew","overgangstermijn","eigen woning"
 ];
 
-// Belangrijk: we sturen niet alles “core” mee, alleen de écht juiste entry points per domein.
-const CORE_QUERY_TITLES = {
-  [DOMAIN.BUILD]: ["Omgevingswet", "Besluit bouwwerken leefomgeving", "Omgevingsbesluit"],
-  [DOMAIN.LOCAL]: ["Algemene plaatselijke verordening", "APV"], // lokale entry point
-  [DOMAIN.GENERAL]: ["Algemene wet bestuursrecht"],
-};
-
-function scoreSource(src, domain, message) {
+function scoreSource(src, terms, municipality) {
   const t = normalize(src.title);
   let score = 0;
-  score += src.type === "CVDR" ? 6 : 3; // bij lokale vragen is CVDR vaak belangrijker
 
-  for (const w of TAX_NOISE) if (t.includes(w)) score -= 100;
+  // CVDR/APV meestal beter bij lokale vragen
+  if (src.type === "CVDR") score += 30;
+  if (src.type === "BWB") score += 10;
 
-  // Domein-boost
-  if (domain === DOMAIN.LOCAL) {
-    if (t.includes("algemene plaatselijke verordening") || t === "apv" || t.includes(" apv")) score += 120;
-    if (t.includes("evenement")) score += 18;
-    if (t.includes("terras")) score += 18;
-    // WOM alleen als betoging/demonstratie
-    if (t.includes("wet openbare manifestaties")) score += looksLikeDemonstration(message) ? 40 : -40;
-    if (t.includes("gemeentewet") || t.includes("algemene wet bestuursrecht")) score -= 15; // meestal niet “het antwoord”
+  // APV boost
+  if (t.includes("algemene plaatselijke verordening") || t.includes(" apv")) score += 80;
+
+  // ruis hard omlaag
+  for (const w of TAX_NOISE) if (t.includes(w)) score -= 200;
+
+  // term match
+  const tt = terms || [];
+  for (const term of tt) {
+    const tn = normalize(term);
+    if (tn && t.includes(tn)) score += 8;
   }
 
-  if (domain === DOMAIN.BUILD) {
-    if (t.includes("omgevingswet")) score += 120;
-    if (t.includes("besluit bouwwerken leefomgeving") || t.includes("bbl")) score += 110;
-    if (t.includes("omgevingsbesluit")) score += 90;
-  }
+  // gemeente hint
+  if (municipality && src.type === "CVDR") score += 10;
 
   return score;
 }
 
-// --------------------- excerpt extraction (artikelblokken) ---------------------
+// ---------------- excerpt extraction: keyword windows (werkt voor APV’s) ----------------
 function htmlToTextLite(html) {
   return (html || "")
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
     .replace(/<\/(p|div|li|br|h1|h2|h3|h4|h5|h6|tr|td|section|article)>/gi, "\n")
     .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#0*39;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
     .replace(/\r/g, "")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-function chunkByArticles(text) {
-  const clean = (text || "").replace(/\u00a0/g, " ").trim();
-  if (!clean) return [];
+// Pak “windows” rond keyword hits (veel betrouwbaarder dan alleen artikelkoppen)
+function buildKeywordWindows(text, keywords, maxWindows = 4, windowLines = 10, maxChars = 2600) {
+  const lines = (text || "").split("\n").map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return "";
 
-  // APV’s gebruiken vaak “Artikel 2:24” etc.
-  const re = /(^|\n)(Artikel|Art\.)\s+([0-9]+(?::[0-9]+)?[0-9A-Za-z.\-]*)([^\n]*)/gmi;
-  const matches = [...clean.matchAll(re)];
-  if (matches.length < 2) return [];
+  const keys = (keywords || []).map(normalize).filter(k => k && k.length >= 3);
+  if (!keys.length) return lines.slice(0, 60).join("\n").slice(0, maxChars);
 
-  const blocks = [];
-  for (let i = 0; i < matches.length; i++) {
-    const start = matches[i].index + (matches[i][1] ? matches[i][1].length : 0);
-    const end = i + 1 < matches.length ? matches[i + 1].index : clean.length;
-    const block = clean.slice(start, end).trim();
-    if (block.length >= 80) blocks.push(block);
-  }
-  return blocks;
-}
-
-function scoreBlock(block, keywords) {
-  const b = normalize(block);
-  let s = 0;
-  for (const k of keywords) {
-    const kn = normalize(k);
-    if (!kn || kn.length < 3) continue;
-    if (b.includes(kn)) s += 2;
-  }
-  const legalSignals = ["vergunning","melding","toestemming","verbod","ontheffing","sluiting","opening","tijden","tijdstip","maximaal","verboden"];
-  for (const sig of legalSignals) if (b.includes(sig)) s += 1;
-  return s;
-}
-
-function pickBestArticleBlocks(text, keywords, maxChars = 2600) {
-  const blocks = chunkByArticles(text);
-  if (!blocks.length) return "";
-
-  const scored = blocks
-    .map((bl) => ({ bl, s: scoreBlock(bl, keywords) }))
-    .sort((a, b) => b.s - a.s);
-
-  const out = [];
-  let used = 0;
-
-  for (const it of scored.slice(0, 10)) {
-    if (it.s <= 0) continue;
-    const add = it.bl.trim();
-    if (!add) continue;
-    if (used + add.length + 8 > maxChars) continue;
-    out.push(add);
-    used += add.length + 2;
-    if (out.length >= 3) break;
+  const hits = [];
+  for (let i = 0; i < lines.length; i++) {
+    const lc = normalize(lines[i]);
+    if (keys.some(k => lc.includes(k))) hits.push(i);
   }
 
-  if (!out.length) {
-    for (const bl of blocks.slice(0, 2)) {
-      const add = bl.trim();
-      if (!add) continue;
-      if (used + add.length + 8 > maxChars) break;
-      out.push(add);
-      used += add.length + 2;
+  if (!hits.length) return lines.slice(0, 70).join("\n").slice(0, maxChars);
+
+  // kies verspreide hits
+  const picked = [];
+  for (const idx of hits) {
+    if (!picked.length || Math.abs(idx - picked[picked.length - 1]) > windowLines * 2) {
+      picked.push(idx);
+      if (picked.length >= maxWindows) break;
     }
   }
 
-  return out.join("\n\n---\n\n").slice(0, maxChars);
-}
-
-function buildLineExcerpt(text, terms, maxChars = 2400) {
-  const lines = (text || "").split("\n").map((l) => l.trim()).filter(Boolean);
-  if (!lines.length) return "";
-
-  const keys = uniqBy((terms || []).map(normalize), (x) => x).filter((x) => x && x.length >= 3);
-  if (!keys.length) return lines.slice(0, 35).join("\n").slice(0, maxChars);
-
-  const scored = [];
-  for (let i = 0; i < lines.length; i++) {
-    const ln = normalize(lines[i]);
-    let s = 0;
-    for (const k of keys) if (ln.includes(k)) s++;
-    if (s > 0) scored.push({ i, s });
+  const chunks = [];
+  for (const center of picked) {
+    const start = Math.max(0, center - windowLines);
+    const end = Math.min(lines.length, center + windowLines + 1);
+    chunks.push(lines.slice(start, end).join("\n"));
   }
 
-  if (!scored.length) return lines.slice(0, 40).join("\n").slice(0, maxChars);
-
-  scored.sort((a, b) => b.s - a.s);
-
-  const idx = new Set();
-  for (const it of scored.slice(0, 14)) {
-    idx.add(it.i);
-    if (it.i > 0) idx.add(it.i - 1);
-    if (it.i + 1 < lines.length) idx.add(it.i + 1);
-  }
-
-  const ordered = [...idx].sort((a, b) => a - b).map((i) => lines[i]);
-  let out = ordered.join("\n");
+  let out = chunks.join("\n\n---\n\n");
   if (out.length > maxChars) out = out.slice(0, maxChars);
   return out;
 }
 
-async function fetchExcerpt({ src, terms, fetchWithTimeout }) {
-  const cacheKey = `ex:${src.type}:${src.id}:${terms.map(normalize).join("|").slice(0, 160)}`;
+async function fetchExcerpt({ src, keywords, fetchWithTimeout }) {
+  const cacheKey = `ex:${src.type}:${src.id}:${keywords.map(normalize).join("|").slice(0, 200)}`;
   const cached = excerptCache.get(cacheKey);
   if (cached && nowMs() < cached.expiresAt) return cached.value;
 
   try {
-    const resp = await fetchWithTimeout(src.link, { headers: { Range: "bytes=0-900000" } }, 15000);
+    // KEY FIX: géén Range bij CVDR (APV’s missen anders vaak het juiste stuk)
+    const headers = src.type === "BWB" ? { Range: "bytes=0-1600000" } : {};
+    const resp = await fetchWithTimeout(src.link, { headers }, 18000);
     const html = await resp.text();
-    const cut = html.length > 1_300_000 ? html.slice(0, 1_300_000) : html;
-    const text = htmlToTextLite(cut);
 
-    const articleExcerpt = pickBestArticleBlocks(text, terms, 2600);
-    const excerpt = articleExcerpt || buildLineExcerpt(text, terms, 2400);
+    const cut = html.length > 2_000_000 ? html.slice(0, 2_000_000) : html;
+    const text = decodeXmlEntities(htmlToTextLite(cut));
 
+    const excerpt = buildKeywordWindows(text, keywords, 4, 10, 2600);
     const value = excerpt || "";
     excerptCache.set(cacheKey, { value, expiresAt: nowMs() + EXCERPT_TTL_MS });
     return value;
@@ -478,8 +327,8 @@ async function fetchExcerpt({ src, terms, fetchWithTimeout }) {
   }
 }
 
-// --------------------- OpenAI ---------------------
-async function callOpenAI({ apiKey, fetchWithTimeout, messages, max_tokens = 900, temperature = 0.2 }) {
+// ---------------- OpenAI ----------------
+async function callOpenAI({ apiKey, fetchWithTimeout, messages, max_tokens = 700, temperature = 0.2 }) {
   const resp = await fetchWithTimeout(
     "https://api.openai.com/v1/chat/completions",
     {
@@ -492,63 +341,48 @@ async function callOpenAI({ apiKey, fetchWithTimeout, messages, max_tokens = 900
 
   const raw = await resp.text();
   if (!resp.ok) return { ok: false, status: resp.status, raw };
-
   try {
     const json = JSON.parse(raw);
     return { ok: true, content: (json?.choices?.[0]?.message?.content || "").trim() };
-  } catch (e) {
-    return { ok: false, status: 500, raw: `JSON parse failed: ${String(e)}\nRAW:\n${raw}` };
+  } catch {
+    return { ok: false, status: 500, raw };
   }
 }
 
-// --------------------- CQL ---------------------
-function bwbCqlFromTerms(terms) {
-  const t = (terms || []).slice(0, 10).map((x) => (x || "").replaceAll('"', "").trim()).filter(Boolean);
-  if (!t.length) return `overheidbwb.titel any "Algemene wet bestuursrecht"`;
-  const clauses = t.map((x) => `overheidbwb.titel any "${x}"`);
-  return clauses.length === 1 ? clauses[0] : `(${clauses.join(" OR ")})`;
+// ---------------- prompts ----------------
+function answerSystemPrompt() {
+  return `
+Je bent Beleidsbank. Antwoord op basis van de meegeleverde bronnen met uittreksels.
+
+REGELS:
+- Elke inhoudelijke bewering die je baseert op een bron, citeer je met [n].
+- Als het detail NIET in de uittreksels staat: zeg dat expliciet en verwijs naar de relevante bron(nen) om na te lezen.
+- Geen "bron " zonder nummer. Noem nooit een bron zonder [n].
+- Verzin geen artikelen/lidnummers.
+
+FORMAT:
+1 korte alinea antwoord.
+Daarna "Wat te checken:" met 2–4 bullets.
+`.trim();
 }
 
-// CVDR: als gemeente bekend → zoek breed naar APV/verordening/beleidsregel, en laat excerpt extractor het juiste artikel pakken
-function cvdrCql({ municipality }) {
-  const mun = (municipality || "").replaceAll('"', "").trim();
-  const creatorClause = `(dcterms.creator="${mun}" OR dcterms.creator="Gemeente ${mun}")`;
-  const inner = `(title any "Algemene plaatselijke verordening" OR title any "APV" OR title any "verordening" OR title any "beleidsregel")`;
-  return `(${creatorClause} AND ${inner})`;
-}
-
-// --------------------- AI selector (top bronnen kiezen) ---------------------
-async function pickBestSourcesWithAI({ apiKey, fetchWithTimeout, question, domain, municipality, sources }) {
+async function pickBestSourcesWithAI({ apiKey, fetchWithTimeout, question, sources }) {
   const system = `
-Je bent een juridische retrieval-assistent.
-Kies de 2 tot 4 BESTE bronnen om de vraag te beantwoorden.
-
-Heel belangrijk:
-- Een “evenement” (vergunning/melding, APV evenementen) is NIET automatisch een “betoging/demonstratie”.
-- Gebruik Wet openbare manifestaties alleen als de vraag duidelijk over betoging/demonstratie/protest/optocht gaat.
-- Kies bronnen met concreet artikel/tekst (sluitingstijden, vergunningplicht, procedure), niet alleen algemene kaders.
-
-Output: ALLEEN JSON exact:
-{"pick":[1,2],"need_municipality":false}
+Kies de 2 tot 4 beste bronnen om de vraag te beantwoorden, op basis van hun uittreksel.
+Vermijd duplicaten (zelfde inhoud).
+Output ALLEEN JSON:
+{"pick":[1,2,3]}
 `.trim();
 
   const payload = {
     question,
-    domain,
-    municipality,
-    sources: sources.map((s) => ({
-      n: s.n,
-      title: s.title,
-      type: s.type,
-      id: s.id,
-      excerpt: (s.excerpt || "").slice(0, 2600),
-    })),
+    sources: sources.map(s => ({ n: s.n, title: s.title, type: s.type, excerpt: s.excerpt.slice(0, 2200) })),
   };
 
   const ai = await callOpenAI({
     apiKey,
     fetchWithTimeout,
-    max_tokens: 250,
+    max_tokens: 200,
     temperature: 0.1,
     messages: [
       { role: "system", content: system },
@@ -556,54 +390,39 @@ Output: ALLEEN JSON exact:
     ],
   });
 
-  if (!ai.ok) return { pick: sources.slice(0, 3).map((s) => s.n), need_municipality: false };
-
-  const parsed = safeJsonParse(ai.content);
-  if (!parsed || !Array.isArray(parsed.pick)) return { pick: sources.slice(0, 3).map((s) => s.n), need_municipality: false };
-
-  const pick = parsed.pick
-    .map((x) => parseInt(x, 10))
-    .filter((n) => Number.isFinite(n) && n >= 1 && n <= sources.length);
-
-  const uniqPick = [...new Set(pick)].slice(0, 4);
-  if (!uniqPick.length) return { pick: sources.slice(0, 3).map((s) => s.n), need_municipality: false };
-
-  return { pick: uniqPick, need_municipality: !!parsed.need_municipality };
+  const parsed = ai.ok ? safeJsonParse(ai.content) : null;
+  const pick = Array.isArray(parsed?.pick) ? parsed.pick.map(x => parseInt(x, 10)).filter(n => Number.isFinite(n)) : [];
+  const uniqPick = [...new Set(pick)].filter(n => n >= 1 && n <= sources.length).slice(0, 4);
+  return uniqPick.length ? uniqPick : sources.slice(0, 3).map(s => s.n);
 }
 
-// --------------------- FINAL ANSWER prompt ---------------------
-function buildAnswerSystemPrompt() {
-  return `
-Je bent Beleidsbank, een assistent voor Nederlandse wet- en regelgeving en beleid.
-
-Je krijgt:
-- een VRAAG
-- BRONNEN [1..N] met UITTREKSELS
-
-Harde regels:
-- CITEER ALTIJD MET [n] als je een bron gebruikt. Geen “(bron )” zonder nummer.
-- Gebruik [n] alleen als de claim echt steun heeft in het excerpt van [n].
-- Als excerpt het detail niet bevat: zeg dat en verwijs naar de bron om zelf na te lezen.
-- Verzin geen artikelnummers/lidnummers tenzij letterlijk aanwezig in excerpt.
-- Geen meta-tekst (“als AI”, trainingsdata, etc.).
-
-Stijl:
-- 1 korte alinea antwoord.
-- Daarna “Wat te checken:” met 2–4 bullets.
-`.trim();
+// ---------------- CQL builders ----------------
+function bwbCqlFromTerms(terms) {
+  const t = (terms || []).slice(0, 10).map(x => (x || "").replaceAll('"', "").trim()).filter(Boolean);
+  if (!t.length) return `overheidbwb.titel any "Algemene wet bestuursrecht"`;
+  const clauses = t.map(x => `overheidbwb.titel any "${x}"`);
+  return clauses.length === 1 ? clauses[0] : `(${clauses.join(" OR ")})`;
 }
 
-// --------------------- handler ---------------------
+function cvdrCql({ municipality }) {
+  const mun = (municipality || "").replaceAll('"', "").trim();
+  const creatorClause = `(dcterms.creator="${mun}" OR dcterms.creator="Gemeente ${mun}")`;
+  // Breed instappunt, excerpt-windows pakken daarna "evenement"/"terras" artikelen.
+  const inner = `(title any "Algemene plaatselijke verordening" OR title any "APV" OR title any "Horeca" OR title any "Evenement")`;
+  return `(${creatorClause} AND ${inner})`;
+}
+
+// ---------------- handler ----------------
 export default async function handler(req, res) {
   cleanupStores();
 
-  // CORS
   const origin = (req.headers.origin || "").toString();
   res.setHeader("Access-Control-Allow-Origin", origin === ALLOW_ORIGIN ? origin : ALLOW_ORIGIN);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
+
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
 
@@ -618,38 +437,40 @@ export default async function handler(req, res) {
 
   const body = typeof req.body === "string" ? safeJsonParse(req.body) || {} : req.body || {};
   const message = (body.message || body.messages?.at(-1)?.content || "").toString().trim();
+
   if (!message) return res.status(400).json({ error: "Missing message" });
   if (message.length > MAX_MESSAGE_CHARS) return res.status(413).json({ error: "Message too long" });
 
   const fetchWithTimeout = makeFetchWithTimeout();
-
-  const domain = decideDomain(message);
   const municipality = extractMunicipality(message);
-
-  // Search terms
   const userTerms = extractTerms(message, 10);
 
-  // Core query titles per domain (klein houden → minder ruis)
-  const coreTerms = (CORE_QUERY_TITLES[domain] || []).map((t) => normalize(t));
-  const searchTerms = uniqBy([...userTerms, ...coreTerms], (x) => normalize(x)).slice(0, 12);
+  // Keywords voor excerpt windows: userTerms + juridische signalen
+  const keywords = uniqBy(
+    [
+      ...userTerms,
+      "evenement","evenementenvergunning","melding","kennisgeving",
+      "terras","sluitingstijd","openingstijd","horeca","ontheffing",
+      "vergunning","verbod","toestemming","openbare orde","veiligheid",
+    ],
+    x => normalize(x)
+  ).filter(Boolean).slice(0, 18);
 
-  // 1) BWB search
-  let bwbResults = [];
+  // --- SRU fetch ---
+  let bwb = [];
+  let cvdr = [];
+
   try {
     const xml = await sruSearch({
       endpoint: SRU_BWB_ENDPOINT,
       connection: "BWB",
-      cql: bwbCqlFromTerms(searchTerms),
+      cql: bwbCqlFromTerms(userTerms),
       fetchWithTimeout,
       maximumRecords: SRU_MAX_RECORDS,
     });
-    bwbResults = parseSruRecords(xml, "BWB");
-  } catch {
-    bwbResults = [];
-  }
+    bwb = parseSruRecords(xml, "BWB");
+  } catch { bwb = []; }
 
-  // 2) CVDR search (als gemeente bekend)
-  let cvdrResults = [];
   if (municipality) {
     try {
       const xml = await sruSearch({
@@ -659,59 +480,35 @@ export default async function handler(req, res) {
         fetchWithTimeout,
         maximumRecords: SRU_MAX_RECORDS,
       });
-      cvdrResults = parseSruRecords(xml, "CVDR");
-    } catch {
-      cvdrResults = [];
-    }
+      cvdr = parseSruRecords(xml, "CVDR");
+    } catch { cvdr = []; }
   }
 
-  // 3) merge + rank
-  let candidates = uniqBy([...cvdrResults, ...bwbResults], (x) => `${x.type}:${x.id}`);
-  candidates = candidates
-    .map((s) => ({ ...s, _score: scoreSource(s, domain, message) }))
+  // --- merge + dedupe op (type + genormaliseerde titel) om CVDR duplicaten te killen ---
+  const merged = uniqBy(
+    [...cvdr, ...bwb],
+    x => `${x.type}:${normalize(x.title)}:${municipality ? normalize(municipality) : ""}`
+  );
+
+  const candidates = merged
+    .map(s => ({ ...s, _score: scoreSource(s, userTerms, municipality) }))
     .sort((a, b) => (b._score || 0) - (a._score || 0))
     .slice(0, MAX_CANDIDATES);
 
-  // 4) excerpt terms (extra signalwoorden)
-  const excerptTerms = uniqBy(
-    [
-      ...userTerms,
-      municipality ? normalize(municipality) : "",
-      "vergunning",
-      "evenement",
-      "evenementenvergunning",
-      "melding",
-      "kennisgeving",
-      "toestemming",
-      "ontheffing",
-      "sluiting",
-      "opening",
-      "tijden",
-      "terras",
-      "horeca",
-      "openbare orde",
-      "veiligheid",
-      looksLikeDemonstration(message) ? "betoging" : "",
-      looksLikeDemonstration(message) ? "demonstratie" : "",
-    ],
-    (x) => normalize(x)
-  ).filter(Boolean).slice(0, 18);
-
-  // 5) fetch excerpts
-  const toFetch = candidates.slice(0, EXCERPTS_FETCH);
+  // --- excerpt fetch ---
   const fetched = [];
-  for (const src of toFetch) {
-    const excerpt = await fetchExcerpt({ src, terms: excerptTerms, fetchWithTimeout });
+  for (const src of candidates.slice(0, EXCERPTS_FETCH)) {
+    const excerpt = await fetchExcerpt({ src, keywords, fetchWithTimeout });
     fetched.push({ ...src, excerpt: (excerpt || "").trim() });
   }
 
-  // 6) hard dedupe + number sources 1..N (STABIEL!)
-  const deduped = uniqBy(
-    fetched.filter((s) => s.excerpt && s.excerpt.trim().length > 50),
-    (s) => `${s.type}:${s.id}` // uniek per document
-  );
+  // keep only useful excerpts
+  const useful = uniqBy(
+    fetched.filter(s => (s.excerpt || "").length > 120),
+    s => `${s.type}:${normalize(s.title)}`
+  ).slice(0, UI_SOURCES_MAX);
 
-  const topForUI = deduped.slice(0, UI_SOURCES_MAX).map((s, idx) => ({
+  const numbered = useful.map((s, idx) => ({
     n: idx + 1,
     id: s.id,
     title: s.title,
@@ -720,83 +517,51 @@ export default async function handler(req, res) {
     excerpt: s.excerpt,
   }));
 
-  // fallback: als excerpt faalt, toch iets teruggeven
-  if (!topForUI.length) {
-    const fallbackSources = uniqBy(fetched, (s) => `${s.type}:${s.id}`).slice(0, UI_SOURCES_MAX).map((s, idx) => ({
-      n: idx + 1,
-      id: s.id,
-      title: s.title,
-      link: s.link,
-      type: s.type,
-      excerpt: s.excerpt || "",
-    }));
-
+  if (!numbered.length) {
     return res.status(200).json({
-      answer:
-        "Ik kon geen bruikbare uittreksels ophalen uit de officiële bronnen. Bekijk de bronnen hieronder en probeer de vraag iets specifieker te maken (bij lokale regels: noem de gemeente).",
-      sources: fallbackSources,
+      answer: "Ik kon geen bruikbare uittreksels ophalen uit de officiële bronnen. Probeer de vraag specifieker te maken en (bij lokale vragen) noem de gemeente.",
+      sources: [],
     });
   }
 
-  // 7) AI kiest 2–4 beste bronnen
-  const selection = await pickBestSourcesWithAI({
-    apiKey,
-    fetchWithTimeout,
-    question: message,
-    domain,
-    municipality,
-    sources: topForUI,
-  });
+  // AI kiest beste bronnen
+  const picks = await pickBestSourcesWithAI({ apiKey, fetchWithTimeout, question: message, sources: numbered });
+  const pickSet = new Set(picks);
+  const picked = numbered.filter(s => pickSet.has(s.n));
+  const pickedSources = picked.length ? picked : numbered.slice(0, 3);
 
-  const pickedSet = new Set(selection.pick);
-  const picked = topForUI.filter((s) => pickedSet.has(s.n));
-  const pickedSources = picked.length ? picked : topForUI.slice(0, 3);
-
-  // 8) Final answer on picked sources
+  // Final answer
   const userPayload = {
     question: message,
     municipality: municipality || null,
-    domain,
-    sources: pickedSources.map((s) => ({
-      n: s.n,
-      id: s.id,
-      title: s.title,
-      link: s.link,
-      type: s.type,
-      excerpt: s.excerpt,
+    sources: pickedSources.map(s => ({
+      n: s.n, title: s.title, link: s.link, type: s.type, excerpt: s.excerpt,
     })),
-    note:
-      domain === DOMAIN.LOCAL && !municipality
-        ? "Lokale regels verschillen per gemeente. Noem de gemeente voor exacte APV/beleid."
-        : null,
   };
 
   const ai = await callOpenAI({
     apiKey,
     fetchWithTimeout,
-    max_tokens: 800,
+    max_tokens: 700,
     temperature: 0.2,
     messages: [
-      { role: "system", content: buildAnswerSystemPrompt() },
+      { role: "system", content: answerSystemPrompt() },
       { role: "user", content: JSON.stringify(userPayload) },
     ],
   });
 
-  let answer = "";
-  if (ai.ok) {
-    answer = stripModelLeakage(ai.content);
-    answer = sanitizeInlineCitations(answer, pickedSources.length);
-    // Extra guard: verwijder “(bron )” zonder nummer
-    answer = answer.replace(/\(bron\s*\)/gi, "").replace(/bron\s*\)/gi, ")").trim();
-  } else {
-    answer =
-      "Ik kon op dit moment geen antwoord genereren op basis van de opgehaalde uittreksels. Bekijk de onderstaande bronnen om de relevante bepalingen te vinden.";
+  let answer = ai.ok ? stripModelLeakage(ai.content) : "";
+  answer = stripEmptySourceRefs(answer);
+  answer = sanitizeInlineCitations(answer, pickedSources.length);
+
+  if (!answer) {
+    answer = "Ik kon op basis van de opgehaalde uittreksels geen zeker antwoord formuleren. Bekijk de bronnen hieronder om de relevante artikelen te vinden.";
   }
 
-  // 9) Return sources: picked eerst (voor UX), maar nummering blijft hetzelfde (n blijft 1..N van topForUI)
+  // UX: picked eerst
   const orderedSources = [
     ...pickedSources,
-    ...topForUI.filter((s) => !pickedSources.some((p) => p.n === s.n)),
+    ...numbered.filter(s => !pickedSources.some(p => p.n === s.n)),
   ];
 
   return res.status(200).json({
