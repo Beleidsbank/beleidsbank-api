@@ -1,32 +1,53 @@
-// /api/chat.js — Beleidsbank V1 (vereenvoudigd, AI-gestuurd, conversational)
+// /api/chat.js — Beleidsbank V1 (clean, general, AI-assisted, all municipalities)
+//
+// Input:
+// {
+//   session_id: "abc123",                 // REQUIRED for memory; new chat must generate new id
+//   messages: [{ role:"user|assistant", content:"..." }],  // chat history for this session (frontend)
+//   // (optional legacy) message: "..."     // if you still send single message
+// }
+//
+// Output:
+// {
+//   answer: "Antwoord:\n...\n\nToelichting:\n...",
+//   sources: [{ title, link, type, id }]
+// }
 
-const rateStore = new Map();
-const pendingStore = new Map(); // sessionId -> { missing:[], collected:{}, messages:[...], createdAt }
-
-const cacheStore = new Map();   // key -> { value, expiresAt }
+const rateStore = new Map();     // ip -> {count, resetAt}
+const sessionStore = new Map();  // sessionId -> { history:[{role,content}], pending:{slotsNeeded:[], collected:{}}, updatedAt }
+const cacheStore = new Map();    // key -> { value, expiresAt }
 
 const ALLOW_ORIGIN = "https://app.beleidsbank.nl";
-const DEFAULT_MAX_SOURCES_RETURN = 6;     // UI: aantal bronnen mee terug
-const DEFAULT_MAX_EXCERPTS_FETCH = 6;     // “lezen” (adaptief) — niet hard 2
-const EXCERPT_TTL_MS = 2 * 60 * 60 * 1000;
 
-const WABO_ID = "BWBR0024779";
+// SRU endpoints
+const SRU_CVDR = "https://zoekdienst.overheid.nl/sru/Search";     // x-connection=cvdr
+const SRU_BWB  = "https://zoekservice.overheid.nl/sru/Search";    // x-connection=BWB
+
+// Limits
+const MAX_HISTORY_TURNS = 10;              // for session memory
+const MAX_SOURCES_RETURN = 8;              // UI sources returned
+const MIN_EXCERPTS_FETCH = 3;              // adaptively read at least this many if possible
+const MAX_EXCERPTS_FETCH = 8;              // cap heavy fetches
+const EXCERPT_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 
 function nowMs() { return Date.now(); }
 
 function cleanupStores() {
   const now = nowMs();
 
-  for (const [sid, v] of pendingStore.entries()) {
-    const createdAt = Number(v?.createdAt || 0);
-    if (!createdAt || (now - createdAt) > 10 * 60 * 1000) pendingStore.delete(sid);
+  // expire sessions after 30 minutes of inactivity (tweak)
+  for (const [sid, v] of sessionStore.entries()) {
+    const updatedAt = Number(v?.updatedAt || 0);
+    if (!updatedAt || (now - updatedAt) > 30 * 60 * 1000) sessionStore.delete(sid);
   }
 
+  // rateStore cleanup
   for (const [ip, v] of rateStore.entries()) {
     const resetAt = Number(v?.resetAt || 0);
     if (!resetAt || now > (resetAt + 2 * 60 * 1000)) rateStore.delete(ip);
   }
 
+  // cacheStore cleanup
   for (const [k, v] of cacheStore.entries()) {
     const expiresAt = Number(v?.expiresAt || 0);
     if (!expiresAt || now > expiresAt) cacheStore.delete(k);
@@ -64,14 +85,14 @@ function makeFetchWithTimeout() {
 
 function normalize(s) { return (s || "").toLowerCase().trim(); }
 
-function dedupeByLink(arr) {
+function dedupeByLink(items) {
   const seen = new Set();
   const out = [];
-  for (const s of arr || []) {
-    if (!s?.link) continue;
-    if (seen.has(s.link)) continue;
-    seen.add(s.link);
-    out.push(s);
+  for (const x of items || []) {
+    if (!x?.link) continue;
+    if (seen.has(x.link)) continue;
+    seen.add(x.link);
+    out.push(x);
   }
   return out;
 }
@@ -97,7 +118,7 @@ function htmlToTextLite(html) {
     .trim();
 }
 
-function pickRelevantLines(text, keywords, maxLines = 22) {
+function pickRelevantLines(text, keywords, maxLines = 24) {
   const lines = (text || "").split("\n").map(l => l.trim()).filter(Boolean);
   if (!lines.length) return null;
 
@@ -113,11 +134,29 @@ function pickRelevantLines(text, keywords, maxLines = 22) {
   return (hits.length ? hits : lines).slice(0, Math.min(maxLines, (hits.length ? hits : lines).length)).join("\n");
 }
 
+async function fetchExcerptForSource({ source, keywords, fetchWithTimeout }) {
+  const cacheKey = `ex:${source.id}:${(keywords || []).join("|").slice(0, 160)}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== null) return cached;
+
+  try {
+    const resp = await fetchWithTimeout(source.link, {}, 15000);
+    const html = await resp.text();
+    const text = htmlToTextLite(html);
+    const excerpt = pickRelevantLines(text, keywords, 24);
+    const out = excerpt ? excerpt.slice(0, 3600) : null;
+    cacheSet(cacheKey, out, EXCERPT_TTL_MS);
+    return out;
+  } catch {
+    cacheSet(cacheKey, null, 15 * 60 * 1000);
+    return null;
+  }
+}
+
 // ---------------------------
-// SRU searches
+// SRU: CVDR (lokale regelgeving) + BWB (landelijke wetgeving)
 // ---------------------------
 async function cvdrSearch({ municipalityName, topicText, fetchWithTimeout, max = 25 }) {
-  const base = "https://zoekdienst.overheid.nl/sru/Search";
   const creatorsToTry = [
     municipalityName,
     `Gemeente ${municipalityName}`,
@@ -125,11 +164,12 @@ async function cvdrSearch({ municipalityName, topicText, fetchWithTimeout, max =
   ].filter(Boolean);
 
   const safeTopic = (topicText || "").replaceAll('"', "").trim() || "";
+  if (!municipalityName || !safeTopic) return [];
 
   for (const creator of creatorsToTry) {
     const cql = `(dcterms.creator="${creator}") AND (keyword all "${safeTopic}")`;
     const url =
-      `${base}?version=1.2&operation=searchRetrieve&x-connection=cvdr&x-info-1-accept=any` +
+      `${SRU_CVDR}?version=1.2&operation=searchRetrieve&x-connection=cvdr&x-info-1-accept=any` +
       `&maximumRecords=${max}&startRecord=1&query=${encodeURIComponent(cql)}`;
 
     const resp = await fetchWithTimeout(url, {}, 15000);
@@ -152,9 +192,8 @@ async function cvdrSearch({ municipalityName, topicText, fetchWithTimeout, max =
 }
 
 async function bwbSruSearch({ cql, fetchWithTimeout, max = 25 }) {
-  const base = "https://zoekservice.overheid.nl/sru/Search";
   const url =
-    `${base}?version=1.2&operation=searchRetrieve&x-connection=BWB` +
+    `${SRU_BWB}?version=1.2&operation=searchRetrieve&x-connection=BWB` +
     `&maximumRecords=${max}&startRecord=1&query=${encodeURIComponent(cql)}`;
 
   const resp = await fetchWithTimeout(url, {}, 15000);
@@ -176,31 +215,9 @@ async function bwbSruSearch({ cql, fetchWithTimeout, max = 25 }) {
 }
 
 // ---------------------------
-// Excerpt fetching (cached)
+// OpenAI calls
 // ---------------------------
-async function fetchExcerptForSource({ source, keywords, fetchWithTimeout }) {
-  const cacheKey = `ex:${source.id}:${(keywords || []).join("|").slice(0, 120)}`;
-  const cached = cacheGet(cacheKey);
-  if (cached !== null) return cached;
-
-  try {
-    const resp = await fetchWithTimeout(source.link, {}, 15000);
-    const html = await resp.text();
-    const text = htmlToTextLite(html);
-    const excerpt = pickRelevantLines(text, keywords, 22);
-    const out = excerpt ? excerpt.slice(0, 3200) : null;
-    cacheSet(cacheKey, out, EXCERPT_TTL_MS);
-    return out;
-  } catch {
-    cacheSet(cacheKey, null, 15 * 60 * 1000);
-    return null;
-  }
-}
-
-// ---------------------------
-// OpenAI helpers
-// ---------------------------
-async function callOpenAI({ apiKey, fetchWithTimeout, model, messages, temperature = 0.2, max_tokens = 700 }) {
+async function callOpenAI({ apiKey, fetchWithTimeout, model, messages, temperature = 0.2, max_tokens = 800 }) {
   const resp = await fetchWithTimeout(
     "https://api.openai.com/v1/chat/completions",
     {
@@ -212,7 +229,6 @@ async function callOpenAI({ apiKey, fetchWithTimeout, model, messages, temperatu
   );
   const raw = await resp.text();
   if (!resp.ok) return { ok: false, status: resp.status, raw };
-
   try {
     const data = JSON.parse(raw);
     const content = (data?.choices?.[0]?.message?.content || "").trim();
@@ -222,61 +238,56 @@ async function callOpenAI({ apiKey, fetchWithTimeout, model, messages, temperatu
   }
 }
 
-function safeJsonParse(s) {
-  try { return JSON.parse(s); } catch { return null; }
+function safeJsonParse(s) { try { return JSON.parse(s); } catch { return null; } }
+
+function ensureTwoHeadings(text) {
+  const t = (text || "").trim();
+  const lc = t.toLowerCase();
+  if (lc.includes("antwoord:") && lc.includes("toelichting:")) return t;
+  return ["Antwoord:", t || "Ik kan hier nog geen goed antwoord op geven.", "", "Toelichting:", "- Kun je iets meer context geven?"].join("\n");
 }
 
-function ensureTwoHeadings(answer) {
-  const a = (answer || "").trim();
-  const lc = a.toLowerCase();
-  if (lc.includes("antwoord:") && lc.includes("toelichting:")) return a;
-  return ["Antwoord:", a || "Ik kan hier nog geen goed antwoord op geven.", "", "Toelichting:", "- Kun je iets meer context geven?"].join("\n");
-}
-
-// ---------------------------
-// 1) AI “planner”: bepaalt wat te doen + welke info ontbreekt
-// ---------------------------
-async function planQuery({ apiKey, fetchWithTimeout, chatMessages, pending }) {
+// 1) Planner: JSON-only, general, no city hardcode
+async function planner({ apiKey, fetchWithTimeout, history, pending }) {
   const system = `
-Je bent Beleidsbank: een hulpvaardige assistent voor Nederlandse wet- en regelgeving en beleid (landelijk + gemeentelijk).
-Je praat soepel (zoals ChatGPT): als de vraag duidelijk is, antwoord direct. Als de vraag te vaag is, stel 1–3 gerichte vragen.
+Je bent Beleidsbank: een conversational assistent voor Nederlandse wet- en regelgeving en beleid (landelijk + gemeentelijk).
+Gedrag:
+- Als de vraag duidelijk is: geef direct antwoord.
+- Als de vraag te vaag is: stel 1–3 gerichte vragen.
+- Als de vraag gemeentelijk kan zijn maar gemeente ontbreekt: geef een algemeen antwoord + vraag daarna om de gemeente.
+- Noem geen bronnen in de tekst; frontend toont sources[].
 
-Maak een PLAN in JSON (alleen JSON, geen tekst eromheen) met velden:
+Geef ALLEEN JSON, geen extra tekst. Schema:
 {
-  "scope": "national" | "municipal" | "mixed",
   "needs_followup": boolean,
   "followup_questions": string[],
-  "slots_needed": string[],               // bv ["municipality","timeframe"]
+  "slots_needed": string[],               // bv ["municipality","timeframe","location_detail"]
   "slots_collected": { "municipality"?: string, "timeframe"?: string },
-  "search": {
+  "search_plan": {
     "use_bwb": boolean,
     "use_cvdr": boolean,
-    "municipality": string|null,          // als scope municipal/mixed
-    "query_terms": string[],              // keywords voor zoeken + excerpt
-    "bwb_cql": string|null,               // optioneel (anders JS maakt simpele CQL)
+    "municipality": string|null,
+    "query_terms": string[],              // keywords voor SRU + excerpt select
+    "bwb_cql": string|null,               // optioneel
     "cvdr_topic": string|null
   },
-  "historical_mode": boolean,             // true als user expliciet oud recht/overgangsrecht vraagt of datum < 2024 relevant is
-  "allow_wabo": boolean                   // true als user Wabo noemt of historical_mode true
+  "answer_mode": "direct" | "general_then_ask" | "ask_only",
+  "historical_mode": boolean,
+  "allow_wabo": boolean
 }
-
 Regels:
-- Wabo NIET standaard gebruiken; alleen als allow_wabo true.
-- Als scope municipal/mixed en municipality ontbreekt: geef wel een algemeen antwoord, en vraag daarna om de gemeente.
-- Vraag niet onnodig door bij een duidelijke vraag.
+- Wabo niet standaard; alleen allow_wabo=true als user Wabo noemt of als historical_mode=true (oud recht / datum vóór 2024).
 `.trim();
 
   const user = `
-CHAT (laatste berichten):
-${JSON.stringify(chatMessages.slice(-8))}
+HISTORY (laatste turns):
+${JSON.stringify(history.slice(-MAX_HISTORY_TURNS), null, 2)}
 
-PENDING (als aanwezig):
-${JSON.stringify(pending || null)}
-
-Geef alleen het PLAN-JSON.
+PENDING (kan null zijn):
+${JSON.stringify(pending || null, null, 2)}
 `.trim();
 
-  const resp = await callOpenAI({
+  const r = await callOpenAI({
     apiKey,
     fetchWithTimeout,
     model: "gpt-4o-mini",
@@ -288,24 +299,21 @@ Geef alleen het PLAN-JSON.
     ]
   });
 
-  if (!resp.ok) return { ok: false, error: resp.raw };
-
-  const plan = safeJsonParse(resp.content);
-  if (!plan) return { ok: false, error: `Planner JSON ongeldig: ${resp.content}` };
+  if (!r.ok) return { ok: false, error: r.raw };
+  const plan = safeJsonParse(r.content);
+  if (!plan) return { ok: false, error: `Planner JSON ongeldig: ${r.content}` };
   return { ok: true, plan };
 }
 
-// ---------------------------
-// 2) AI “answerer”: antwoord op basis van bronnen+excerpts
-// ---------------------------
-async function answerWithEvidence({ apiKey, fetchWithTimeout, chatMessages, plan, sourcesPack }) {
+// 2) Answerer: uses excerpts, two headings only
+async function answerer({ apiKey, fetchWithTimeout, history, plan, sourcesPack }) {
   const system = `
 Je beantwoordt vragen over Nederlandse wet- en regelgeving en beleid.
 
 Belangrijk:
 - Noem ALLEEN artikel-/lidverwijzingen als die letterlijk in de aangeleverde uittreksels staan.
-- Als uittreksels geen expliciete norm tonen: geef wel een praktisch antwoord, maar formuleer voorzichtig en leg uit welke info ontbreekt.
-- Antwoord soepel en menselijk (zoals ChatGPT), maar compact.
+- Als uittreksels geen expliciete norm tonen: geef een praktisch antwoord, maar formuleer voorzichtig en zeg welke info ontbreekt.
+- Antwoord conversatie-achtig en helder (zoals ChatGPT), niet stijf.
 
 Output (ALLEEN):
 Antwoord:
@@ -319,8 +327,8 @@ ${JSON.stringify(plan, null, 2)}
 BRONNEN + UITTREKSELS:
 ${sourcesPack}
 
-CHAT:
-${JSON.stringify(chatMessages.slice(-8))}
+HISTORY:
+${JSON.stringify(history.slice(-MAX_HISTORY_TURNS), null, 2)}
 `.trim();
 
   return await callOpenAI({
@@ -328,7 +336,7 @@ ${JSON.stringify(chatMessages.slice(-8))}
     fetchWithTimeout,
     model: "gpt-4o-mini",
     temperature: 0.2,
-    max_tokens: 800,
+    max_tokens: 900,
     messages: [
       { role: "system", content: system },
       { role: "user", content: user }
@@ -336,8 +344,15 @@ ${JSON.stringify(chatMessages.slice(-8))}
   });
 }
 
+// Build a default CQL from terms if planner didn't provide one
+function buildDefaultBwbCql(terms) {
+  const safe = (terms || []).map(t => String(t).replaceAll('"', "").trim()).filter(Boolean).slice(0, 7);
+  if (!safe.length) return `overheidbwb.titel any "Omgevingswet"`;
+  return safe.map(t => `overheidbwb.titel any "${t}"`).join(" OR ");
+}
+
 // ---------------------------
-// MAIN
+// MAIN handler
 // ---------------------------
 export default async function handler(req, res) {
   cleanupStores();
@@ -352,115 +367,137 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
 
-  // IP + rate limit
   const ip =
     (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
     req.socket?.remoteAddress ||
     "unknown";
   if (!rateLimit(ip)) return res.status(429).json({ error: "Too many requests" });
 
-  // Input
-  const body = req.body || {};
-  const sessionId = (body.session_id || "").toString().trim();
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY ontbreekt." });
 
-  let messages = body.messages;
-  if (!Array.isArray(messages) || !messages.length) {
+  const body = req.body || {};
+  const sessionId = (body.session_id || "").toString().trim();
+  if (!sessionId) {
+    // Important: to avoid memory leaks across "new chat", require session_id for stateful chat
+    // If you want stateless operation, you can allow it, but then no pending/history.
+    // Here we allow stateless but keep it clean.
+  }
+
+  // Incoming messages
+  let incoming = body.messages;
+  if (!Array.isArray(incoming) || !incoming.length) {
     const msg = (body.message || "").toString().trim();
     if (!msg) return res.status(400).json({ error: "Missing messages/message" });
-    messages = [{ role: "user", content: msg }];
+    incoming = [{ role: "user", content: msg }];
   }
+
+  // Load session state (strict per sessionId)
+  const session = sessionId ? (sessionStore.get(sessionId) || { history: [], pending: null, updatedAt: nowMs() }) : null;
+  const history = session ? [...session.history] : [];
+
+  // Append incoming to history (keep last turns)
+  for (const m of incoming) {
+    if (!m?.role || !m?.content) continue;
+    history.push({ role: m.role, content: String(m.content) });
+  }
+  const trimmedHistory = history.slice(-MAX_HISTORY_TURNS);
 
   const fetchWithTimeout = makeFetchWithTimeout();
 
-  // Pending (slot-filling) koppelen
-  const pending = sessionId ? pendingStore.get(sessionId) : null;
-  const fresh = pending && (nowMs() - pending.createdAt) < 10 * 60 * 1000;
+  // Plan
+  const p = await planner({
+    apiKey,
+    fetchWithTimeout,
+    history: trimmedHistory,
+    pending: session?.pending || null
+  });
 
-  // Combineer chat met pending-messages (zodat gesprek voelt als “doorlopend”)
-  let chatMessages = messages;
-  if (fresh && Array.isArray(pending.messages)) {
-    chatMessages = [...pending.messages, ...messages].slice(-12);
+  if (!p.ok) {
+    const fallback = ensureTwoHeadings([
+      "Antwoord:",
+      "Ik kon je vraag net niet goed analyseren.",
+      "",
+      "Toelichting:",
+      "- Kun je je vraag net iets concreter maken?"
+    ].join("\n"));
+    return res.status(200).json({ answer: fallback, sources: [] });
   }
 
-  // 1) Plan
-  const planned = await planQuery({ apiKey, fetchWithTimeout, chatMessages, pending: fresh ? pending : null });
-  if (!planned.ok) {
-    return res.status(200).json({
-      answer: ensureTwoHeadings([
-        "Antwoord:",
-        "Ik liep vast bij het analyseren van je vraag.",
-        "",
-        "Toelichting:",
-        "- Probeer je vraag iets concreter te formuleren."
-      ].join("\n")),
-      sources: []
+  const plan = p.plan;
+
+  // Update pending + store session
+  if (sessionId) {
+    const collected = { ...(session.pending?.collected || {}), ...(plan.slots_collected || {}) };
+    const slotsNeeded = Array.isArray(plan.slots_needed) ? plan.slots_needed : [];
+
+    const pending =
+      plan.needs_followup && slotsNeeded.length
+        ? { slotsNeeded, collected }
+        : null;
+
+    sessionStore.set(sessionId, {
+      history: trimmedHistory,
+      pending,
+      updatedAt: nowMs()
     });
   }
-  const plan = planned.plan;
 
-  // Pending opslaan als follow-up nodig is (maar we kunnen ook alvast algemeen antwoorden)
-  if (sessionId) {
-    const collected = { ...(pending?.collected || {}), ...(plan?.slots_collected || {}) };
-    const missing = Array.isArray(plan?.slots_needed) ? plan.slots_needed : [];
-
-    if (plan.needs_followup && missing.length) {
-      pendingStore.set(sessionId, {
-        missing,
-        collected,
-        messages: chatMessages,
-        createdAt: nowMs()
-      });
-    } else {
-      pendingStore.delete(sessionId);
-    }
+  // If planner says ask-only, we can respond without searching
+  if (plan.answer_mode === "ask_only") {
+    const msg = ensureTwoHeadings([
+      "Antwoord:",
+      "Ik kan je helpen, maar ik mis nog een detail om dit precies te beantwoorden.",
+      "",
+      "Toelichting:",
+      ...(Array.isArray(plan.followup_questions) && plan.followup_questions.length
+        ? plan.followup_questions.map(q => `- ${q}`)
+        : ["- Kun je iets meer context geven?"])
+    ].join("\n"));
+    return res.status(200).json({ answer: msg, sources: [] });
   }
 
-  // 2) Sources zoeken (AI zegt welke systemen)
-  const useBwb = !!plan?.search?.use_bwb;
-  const useCvdr = !!plan?.search?.use_cvdr;
-  const municipality = plan?.search?.municipality || plan?.slots_collected?.municipality || pending?.collected?.municipality || null;
+  // Search plan
+  const sp = plan.search_plan || {};
+  const useBwb = !!sp.use_bwb;
+  const useCvdr = !!sp.use_cvdr;
 
-  const queryTerms = Array.isArray(plan?.search?.query_terms) ? plan.search.query_terms.filter(Boolean) : [];
-  const keywords = queryTerms.length ? queryTerms.slice(0, 12) : ["vergunning", "verordening", "beleidsregel"];
+  const municipality =
+    sp.municipality ||
+    plan?.slots_collected?.municipality ||
+    session?.pending?.collected?.municipality ||
+    null;
 
+  const queryTerms = Array.isArray(sp.query_terms) ? sp.query_terms.filter(Boolean) : [];
+  const keywords = queryTerms.length ? queryTerms.slice(0, 12) : [];
+
+  // Search sources
   let sources = [];
 
-  // BWB
   if (useBwb) {
-    // Simpele default CQL als planner geen cql geeft
-    const cql =
-      plan?.search?.bwb_cql ||
-      (queryTerms.length
-        ? queryTerms.slice(0, 6).map(t => `overheidbwb.titel any "${String(t).replaceAll('"', "")}"`).join(" OR ")
-        : `overheidbwb.titel any "Omgevingswet"`);
-
+    const cql = sp.bwb_cql || buildDefaultBwbCql(queryTerms);
     const bwb = await bwbSruSearch({ cql, fetchWithTimeout, max: 25 });
 
-    // Wabo: niet bannen, maar filteren tenzij allow_wabo
-    const allowWabo = !!plan?.allow_wabo;
-    const filtered = allowWabo ? bwb : bwb.filter(x => (x.id || "").toUpperCase() !== WABO_ID);
+    // Wabo: not banned. Filter only if planner says not allowed.
+    const allowWabo = !!plan.allow_wabo;
+    const filtered = allowWabo ? bwb : bwb.filter(x => String(x.id || "").toUpperCase() !== "BWBR0024779");
 
     sources.push(...filtered);
   }
 
-  // CVDR
   if (useCvdr) {
-    const topic = plan?.search?.cvdr_topic || queryTerms.join(" ") || chatMessages.at(-1)?.content || "";
+    // Only possible when municipality known. If not known, we still can answer generally.
     if (municipality) {
-      const cvdr = await cvdrSearch({ municipalityName: municipality, topicText: topic, fetchWithTimeout });
+      const topic = sp.cvdr_topic || queryTerms.join(" ") || trimmedHistory.at(-1)?.content || "";
+      const cvdr = await cvdrSearch({ municipalityName: municipality, topicText: topic, fetchWithTimeout, max: 25 });
       sources.push(...cvdr);
     }
   }
 
   sources = dedupeByLink(sources);
 
-  // Limit wat we teruggeven in UI
-  const safeSources = sources.slice(0, DEFAULT_MAX_SOURCES_RETURN);
-
-  // 3) Excerpts ophalen (adaptief, max 6)
-  const toRead = sources.slice(0, DEFAULT_MAX_EXCERPTS_FETCH);
+  // Pick how many to read (adapt)
+  const toRead = sources.slice(0, Math.min(MAX_EXCERPTS_FETCH, Math.max(MIN_EXCERPTS_FETCH, sources.length)));
   const excerpts = [];
   for (const s of toRead) {
     const ex = await fetchExcerptForSource({ source: s, keywords, fetchWithTimeout });
@@ -474,30 +511,30 @@ export default async function handler(req, res) {
     return `${head}${ex}`;
   }).join("\n\n---\n\n");
 
-  // 4) Antwoord genereren
-  const ai = await answerWithEvidence({ apiKey, fetchWithTimeout, chatMessages, plan, sourcesPack });
+  // Answer with evidence
+  const a = await answerer({
+    apiKey,
+    fetchWithTimeout,
+    history: trimmedHistory,
+    plan,
+    sourcesPack
+  });
 
-  if (!ai.ok) {
+  if (!a.ok) {
     const fallback = ensureTwoHeadings([
       "Antwoord:",
-      "Ik kan nu geen volledig antwoord genereren door een tijdelijke fout, maar ik kan het opnieuw proberen als je je vraag herhaalt of iets specifieker maakt.",
+      "Ik kon nu geen volledig antwoord genereren door een tijdelijke fout.",
       "",
       "Toelichting:",
-      "- Voeg eventueel context toe (locatie/gemeente, activiteit, periode)."
+      "- Probeer het opnieuw of geef iets meer context (bijv. gemeente, periode, locatie)."
     ].join("\n"));
-    return res.status(200).json({ answer: fallback, sources: safeSources });
+    return res.status(200).json({ answer: fallback, sources: sources.slice(0, MAX_SOURCES_RETURN) });
   }
 
-  // Als follow-up nodig: voeg die vragen toe in Toelichting (zonder hardcode onderwerp)
-  let answer = ensureTwoHeadings(ai.content);
-  const followups = Array.isArray(plan?.followup_questions) ? plan.followup_questions.filter(Boolean) : [];
-  if (plan?.needs_followup && followups.length) {
-    answer += `\n\nToelichting:\n- ${followups.join("\n- ")}`;
-    answer = ensureTwoHeadings(answer); // her-ensure (simpel)
-  }
+  const answer = ensureTwoHeadings(a.content);
 
-  return res.status(200).json({
-    answer,
-    sources: safeSources
-  });
+  // UI sources: return a bit broader than read set (still capped)
+  const uiSources = sources.slice(0, MAX_SOURCES_RETURN);
+
+  return res.status(200).json({ answer, sources: uiSources });
 }
