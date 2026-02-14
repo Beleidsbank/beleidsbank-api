@@ -1,14 +1,12 @@
-// /api/chat.js — Beleidsbank V1 (algemeen, bron-gedreven, stabiele citations, geen hardcoded “terras/evenement” antwoorden)
+// /api/chat.js — Beleidsbank V1 (algemeen, bron-gedreven, NO [n] placeholders, stabiele bronnummering)
 // Next.js API route (Node runtime)
 //
-// Doel V1:
-// - Vraag → haal officiële bronnen op (BWB + CVDR als gemeente herleidbaar)
-// - Haal excerpts (tekstsnippets) uit die bronnen
-// - Laat AI: (1) beste bronnen kiezen, (2) antwoord formuleren met echte [1]..[N] citations
-// - Output: { answer, sources:[{n,id,title,link,type,excerpt}] }
+// Output: { answer: string, sources: [{n,id,title,link,type,excerpt}] }
 //
-// Belangrijk: dit is algemeen. Er zitten geen “dakkapel/markt/terras” hardcoded antwoorden in.
-// Enige “sturing” is generiek retrieval (stopwoorden, dedupe, excerpt windows, citation enforcement).
+// Wat dit oplost t.o.v. jouw output:
+// 1) AI mag NIET meer [n] typen: we valideren en doen automatisch een retry.
+// 2) Bronnummering is nu altijd 1..K (contiguous) in de answer-fase, zodat citations kloppen.
+// 3) Minder ruisbronnen: we houden bronnen over waarvan het excerpt ook echt query-termen bevat (algemeen, niet topic-hardcoded).
 
 const SRU_BWB_ENDPOINT = "https://zoekservice.overheid.nl/sru/Search"; // x-connection=BWB
 const SRU_CVDR_ENDPOINT = "https://zoekdienst.overheid.nl/sru/Search"; // x-connection=cvdr
@@ -18,10 +16,10 @@ const RATE_LIMIT = 30;
 const RATE_WINDOW_MS = 60_000;
 const MAX_MESSAGE_CHARS = 2000;
 
-// Retrieval tuning (V1)
+// Retrieval tuning (algemeen)
 const SRU_MAX_RECORDS = 60;
-const MAX_CANDIDATES = 80;
-const EXCERPTS_FETCH = 16;
+const MAX_CANDIDATES = 90;
+const EXCERPTS_FETCH = 18;      // fetch iets meer om ruis eruit te kunnen filteren
 const UI_SOURCES_MAX = 8;
 
 const EXCERPT_TTL_MS = 2 * 60 * 60 * 1000;
@@ -126,6 +124,7 @@ function stripModelLeakage(text) {
     .trim();
 }
 
+// Remove placeholders + invalid citations
 function sanitizeInlineCitations(answer, maxN) {
   if (!answer) return answer;
   const cleaned = answer
@@ -136,6 +135,10 @@ function sanitizeInlineCitations(answer, maxN) {
       return "";
     });
   return cleaned.replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function hasPlaceholderCites(text) {
+  return /\[n\]/i.test(text || "");
 }
 
 function hasRealCitations(text) {
@@ -154,11 +157,9 @@ function titleCase(s) {
 function extractMunicipality(message) {
   const text = (message || "").toString();
 
-  // “gemeente X”
   let m = text.match(/\bgemeente\s+([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){0,3})/i);
   if (m?.[1]) return titleCase(m[1]);
 
-  // “in X” (kapitalisatie)
   m = text.match(/\b(?:in|te|bij)\s+([A-ZÀ-Ý][A-Za-zÀ-ÿ'\-]+(?:\s+[A-ZÀ-Ý][A-Za-zÀ-ÿ'\-]+){0,3})/);
   if (m?.[1]) return titleCase(m[1]);
 
@@ -172,11 +173,10 @@ const STOPWORDS = new Set([
   "mag","mogen","moet","moeten","kun","kunnen","kan","zal","zullen","wil","willen",
   "zonder","met","voor","van","op","in","aan","bij","naar","tot","tegen","over","door","om","uit","binnen",
   "wat","welke","wie","waarom","hoe","hoelang","hoeveel","wel","niet","geen","ja",
-  // generieke juridische woorden die vaak ruis geven in titel-search
   "wet","beleid","regels","regel","verordening","toestemming","vergunning","aanvraag","aanvragen",
 ]);
 
-function extractTerms(q, max = 10) {
+function extractTerms(q, max = 12) {
   const raw = (q || "")
     .toString()
     .replace(/[^\p{L}\p{N}\s'-]+/gu, " ")
@@ -242,7 +242,6 @@ function parseSruRecords(xml, collectionType) {
 }
 
 // --------------------- scoring (algemeen) ---------------------
-// Hard ruisfilter voor bekende mis-hits (belasting etc.)
 const TITLE_NOISE = [
   "inkomstenbelasting",
   "kapitaalverzekering",
@@ -257,7 +256,7 @@ function scoreSource(src, terms, municipality) {
   const t = normalize(src.title);
   let score = 0;
 
-  // basisgewicht
+  // basis
   score += src.type === "CVDR" ? 6 : 3;
 
   // ruis hard omlaag
@@ -269,18 +268,17 @@ function scoreSource(src, terms, municipality) {
     if (tn && t.includes(tn)) score += 8;
   }
 
-  // algemene preferentie: APV/verordening is vaak “regelset” bij CVDR
-  if (src.type === "CVDR" && (t.includes("verordening") || t.includes("algemene plaatselijke verordening") || t.includes(" apv"))) {
-    score += 25;
-  }
+  // regelsets (algemene boost, geen onderwerp-hardcode)
+  if (src.type === "CVDR" && (t.includes("verordening") || t.includes("beleidsregel"))) score += 12;
+  if (src.type === "CVDR" && (t.includes("algemene plaatselijke verordening") || t.includes(" apv"))) score += 25;
 
-  // als er een gemeente is en het is CVDR: iets hoger
+  // gemeente hint
   if (municipality && src.type === "CVDR") score += 8;
 
   return score;
 }
 
-// --------------------- excerpt extraction (algemeen: keyword-windows) ---------------------
+// --------------------- excerpt extraction (algemeen: keyword windows) ---------------------
 function htmlToTextLite(html) {
   return (html || "")
     .replace(/<script[\s\S]*?<\/script>/gi, "")
@@ -334,7 +332,7 @@ async function fetchExcerpt({ src, keywords, fetchWithTimeout }) {
   if (cached && nowMs() < cached.expiresAt) return cached.value;
 
   try {
-    // Key: geen Range bij CVDR (client-side/structuur issues)
+    // Geen Range bij CVDR (werkt betrouwbaarder)
     const headers = src.type === "BWB" ? { Range: "bytes=0-1600000" } : {};
     const resp = await fetchWithTimeout(src.link, { headers }, 18000);
     const html = await resp.text();
@@ -366,7 +364,6 @@ async function callOpenAI({ apiKey, fetchWithTimeout, messages, max_tokens = 700
 
   const raw = await resp.text();
   if (!resp.ok) return { ok: false, status: resp.status, raw };
-
   try {
     const json = JSON.parse(raw);
     return { ok: true, content: (json?.choices?.[0]?.message?.content || "").trim() };
@@ -375,7 +372,16 @@ async function callOpenAI({ apiKey, fetchWithTimeout, messages, max_tokens = 700
   }
 }
 
-function answerSystemPrompt() {
+function answerSystemPrompt(strict = false) {
+  const extra = strict
+    ? `
+EXTRA HARD:
+- Het gebruik van [n], [bron], [source] of andere placeholders is VERBODEN.
+- Je output wordt weggegooid als je placeholders gebruikt.
+- Gebruik minimaal 1 geldige citation [1]..[N] als je iets uit de bronnen noemt.
+`.trim()
+    : "";
+
   return `
 Je bent Beleidsbank. Antwoord uitsluitend op basis van de meegeleverde officiële bronnen met uittreksels.
 
@@ -389,6 +395,8 @@ Harde regels:
 Stijl:
 - 1 korte alinea antwoord.
 - Daarna "Wat te checken:" met 2–4 bullets.
+
+${extra}
 `.trim();
 }
 
@@ -443,6 +451,18 @@ function cvdrCql({ municipality }) {
   return `(${creatorClause} AND ${inner})`;
 }
 
+// --------------------- excerpt relevance filter (algemeen) ---------------------
+function excerptHitCount(excerpt, terms) {
+  const ex = normalize(excerpt || "");
+  if (!ex) return 0;
+  let c = 0;
+  for (const t of (terms || [])) {
+    const tn = normalize(t);
+    if (tn && ex.includes(tn)) c++;
+  }
+  return c;
+}
+
 // --------------------- handler ---------------------
 export default async function handler(req, res) {
   cleanupStores();
@@ -474,10 +494,9 @@ export default async function handler(req, res) {
 
   const fetchWithTimeout = makeFetchWithTimeout();
   const municipality = extractMunicipality(message);
+  const terms = extractTerms(message, 12);
 
-  const terms = extractTerms(message, 10);
-
-  // Keywords voor excerpt windows (algemeen: vraagtermen + juridische signaalwoorden)
+  // Keywords voor excerpt windows (algemeen: query-termen + juridische signaalwoorden)
   const keywords = uniqBy(
     [...terms, "vergunning", "melding", "ontheffing", "verbod", "toestemming", "voorwaarden", "procedure", "termijn", "kosten", "sanctie", "boete"],
     x => normalize(x)
@@ -494,9 +513,7 @@ export default async function handler(req, res) {
       maximumRecords: SRU_MAX_RECORDS,
     });
     bwb = parseSruRecords(xml, "BWB");
-  } catch {
-    bwb = [];
-  }
+  } catch { bwb = []; }
 
   // 2) SRU search CVDR (als gemeente herleidbaar)
   let cvdr = [];
@@ -510,12 +527,10 @@ export default async function handler(req, res) {
         maximumRecords: SRU_MAX_RECORDS,
       });
       cvdr = parseSruRecords(xml, "CVDR");
-    } catch {
-      cvdr = [];
-    }
+    } catch { cvdr = []; }
   }
 
-  // 3) merge + dedupe (type+id eerst)
+  // 3) merge + dedupe
   let merged = uniqBy([...cvdr, ...bwb], s => `${s.type}:${s.id}`);
 
   // 4) rank + cut
@@ -524,26 +539,31 @@ export default async function handler(req, res) {
     .sort((a, b) => (b._score || 0) - (a._score || 0))
     .slice(0, MAX_CANDIDATES);
 
-  // 5) fetch excerpts
+  // 5) fetch excerpts (top N candidates)
   const fetched = [];
   for (const src of merged.slice(0, EXCERPTS_FETCH)) {
     const excerpt = await fetchExcerpt({ src, keywords, fetchWithTimeout });
-    fetched.push({ ...src, excerpt: (excerpt || "").trim() });
+    const hits = excerptHitCount(excerpt, terms);
+    fetched.push({ ...src, excerpt: (excerpt || "").trim(), _hits: hits });
   }
 
-  // 6) keep useful, dedupe by normalized title to avoid repeated “APV Utrecht” entries
+  // 6) dedupe by normalized title to avoid repeats
   let useful = uniqBy(
     fetched.filter(s => (s.excerpt || "").length > 120),
     s => `${s.type}:${normalize(s.title)}`
-  ).slice(0, UI_SOURCES_MAX);
+  );
 
-  // fallback: if excerpts are weak, still return top titles
-  if (!useful.length) {
-    useful = merged.slice(0, UI_SOURCES_MAX).map(s => ({ ...s, excerpt: "" }));
-  }
+  // 7) keep sources whose excerpt actually matches query terms (general)
+  // allow some “0 hit” items only if we have too few results
+  const withHits = useful.filter(s => (s._hits || 0) >= 1);
+  useful = (withHits.length >= 3 ? withHits : useful);
 
-  // 7) stable numbering 1..N
-  const sourcesNumbered = useful.map((s, idx) => ({
+  // 8) sort by (hits, score)
+  useful.sort((a, b) => ((b._hits || 0) - (a._hits || 0)) || ((b._score || 0) - (a._score || 0)));
+  useful = useful.slice(0, UI_SOURCES_MAX);
+
+  // 9) stable numbering for UI sources 1..N
+  const uiSources = useful.map((s, idx) => ({
     n: idx + 1,
     id: s.id,
     title: s.title,
@@ -552,60 +572,69 @@ export default async function handler(req, res) {
     excerpt: s.excerpt || "",
   }));
 
-  // 8) AI selects 2–4 best sources (based on excerpts)
+  if (!uiSources.length) {
+    return res.status(200).json({
+      answer: "Ik kon geen bruikbare uittreksels ophalen uit de officiële bronnen. Maak de vraag specifieker en noem (bij lokale vragen) de gemeente.",
+      sources: [],
+    });
+  }
+
+  // 10) AI selects 2–4 best sources (based on excerpts)
   const picks = await pickBestSourcesWithAI({
     apiKey,
     fetchWithTimeout,
     question: message,
-    sources: sourcesNumbered,
+    sources: uiSources,
   });
 
   const pickSet = new Set(picks);
-  const picked = sourcesNumbered.filter(s => pickSet.has(s.n));
-  const pickedSources = picked.length ? picked : sourcesNumbered.slice(0, 3);
+  const picked = uiSources.filter(s => pickSet.has(s.n));
+  const pickedSources = picked.length ? picked : uiSources.slice(0, 3);
 
-  // 9) final answer
+  // IMPORTANT: reindex picked sources to 1..K for the answer-stage (so citations are always valid)
+  const pickedReindexed = pickedSources.map((s, i) => ({
+    n: i + 1,
+    id: s.id,
+    title: s.title,
+    link: s.link,
+    type: s.type,
+    excerpt: s.excerpt,
+  }));
+
+  // 11) final answer (with strict validation)
   const userPayload = {
     question: message,
     municipality: municipality || null,
-    sources: pickedSources.map(s => ({
+    sources: pickedReindexed.map(s => ({
       n: s.n, title: s.title, link: s.link, type: s.type, excerpt: s.excerpt,
     })),
     note: !municipality ? "Let op: lokale regels kunnen per gemeente verschillen. Noem de gemeente voor lokale regelgeving." : null,
   };
 
-  const ai = await callOpenAI({
-    apiKey,
-    fetchWithTimeout,
-    max_tokens: 750,
-    temperature: 0.2,
-    messages: [
-      { role: "system", content: answerSystemPrompt() },
-      { role: "user", content: JSON.stringify(userPayload) },
-    ],
-  });
-
-  let answer = ai.ok ? stripModelLeakage(ai.content) : "";
-  answer = sanitizeInlineCitations(answer, pickedSources.length);
-
-  // If AI failed to cite at all, retry once with stricter instruction (general, not topic-specific)
-  if (ai.ok && !hasRealCitations(answer)) {
-    const retry = await callOpenAI({
+  const runAnswer = async (strict) => {
+    const ai = await callOpenAI({
       apiKey,
       fetchWithTimeout,
-      max_tokens: 650,
-      temperature: 0.1,
+      max_tokens: 800,
+      temperature: strict ? 0.1 : 0.2,
       messages: [
-        { role: "system", content: answerSystemPrompt() + "\n\nEXTRA: Gebruik minstens 1 geldige citation [1]..[N] als je iets uit bronnen noemt. Geen placeholders." },
+        { role: "system", content: answerSystemPrompt(strict) },
         { role: "user", content: JSON.stringify(userPayload) },
       ],
     });
 
-    if (retry.ok) {
-      let a2 = stripModelLeakage(retry.content);
-      a2 = sanitizeInlineCitations(a2, pickedSources.length);
-      if (a2) answer = a2;
-    }
+    if (!ai.ok) return "";
+    let ans = stripModelLeakage(ai.content);
+    ans = sanitizeInlineCitations(ans, pickedReindexed.length);
+    return ans;
+  };
+
+  let answer = await runAnswer(false);
+
+  // Retry if placeholders or no real citations while referencing sources
+  if (!answer || hasPlaceholderCites(answer) || !hasRealCitations(answer)) {
+    const retry = await runAnswer(true);
+    if (retry) answer = retry;
   }
 
   if (!answer) {
@@ -614,14 +643,16 @@ export default async function handler(req, res) {
       "Bekijk de bronnen hieronder om de relevante bepalingen te vinden.";
   }
 
-  // UX: picked eerst (maar nummering blijft van sourcesNumbered)
-  const orderedSources = [
+  // 12) Output:
+  // - answer uses pickedReindexed citations [1]..[K]
+  // - sources for UI: show picked first, then rest (original UI numbering)
+  const uiPickedFirst = [
     ...pickedSources,
-    ...sourcesNumbered.filter(s => !pickedSources.some(p => p.n === s.n)),
+    ...uiSources.filter(s => !pickedSources.some(p => p.n === s.n)),
   ];
 
   return res.status(200).json({
     answer,
-    sources: orderedSources,
+    sources: uiPickedFirst,
   });
 }
