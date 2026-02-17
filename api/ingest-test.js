@@ -1,38 +1,26 @@
-import { createClient } from "@supabase/supabase-js";
+// /api/ingest-test.js
+// Test: kan ik Supabase bereiken + 1 rij uit documents lezen?
 
-export default async function handler(req, res) {
+module.exports = async (req, res) => {
   try {
+    const SUPABASE_URL = process.env.SUPABASE_URL;
+    const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-    const url = process.env.SUPABASE_URL;
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!SUPABASE_URL) return res.status(500).json({ error: "SUPABASE_URL missing" });
+    if (!SERVICE_KEY) return res.status(500).json({ error: "SUPABASE_SERVICE_ROLE_KEY missing" });
 
-    if (!url) {
-      return res.status(500).json({ error: "SUPABASE_URL missing" });
-    }
+    const url = `${SUPABASE_URL}/rest/v1/documents?select=id,title&limit=1`;
 
-    if (!key) {
-      return res.status(500).json({ error: "SUPABASE_SERVICE_ROLE_KEY missing" });
-    }
-
-    const supabase = createClient(url, key);
-
-    const { data, error } = await supabase
-      .from("documents")
-      .select("*")
-      .limit(1);
-
-    if (error) {
-      return res.status(500).json({ error: error.message });
-    }
-
-    return res.status(200).json({
-      ok: true,
-      foundRows: data.length
+    const r = await fetch(url, {
+      headers: {
+        apikey: SERVICE_KEY,
+        Authorization: `Bearer ${SERVICE_KEY}`,
+      },
     });
 
+    const text = await r.text();
+    return res.status(r.status).send(text);
   } catch (e) {
-    return res.status(500).json({
-      crash: String(e.message || e)
-    });
+    return res.status(500).json({ crash: String(e?.message || e) });
   }
-}
+};
