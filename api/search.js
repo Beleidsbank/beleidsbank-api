@@ -23,7 +23,7 @@ module.exports = async (req, res) => {
     const embJson = await embResp.json();
     if (!embResp.ok) return res.status(500).json({ error: "OpenAI embedding failed", details: embJson });
 
-    const query_embedding = embJson.data[0].embedding;
+    const query_embedding = JSON.stringify(embJson.data[0].embedding);
 
     // call Supabase RPC
     const rpcResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`, {
@@ -34,9 +34,10 @@ module.exports = async (req, res) => {
         Authorization: `Bearer ${SERVICE_KEY}`,
       },
       body: JSON.stringify({
-        query_embedding,
-        match_count: 5,
-      }),
+  query_embedding: query_embedding,
+  match_count: 5
+}),
+
     });
 
     const dataText = await rpcResp.text();
