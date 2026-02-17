@@ -5,6 +5,8 @@ module.exports = async (req, res) => {
   try {
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    const SUPABASE_URL = "https://irgqihvzqdszreblajcs.supabase.co";
+
 
     if (!SUPABASE_URL) return res.status(500).json({ error: "SUPABASE_URL missing" });
     if (!SERVICE_KEY) return res.status(500).json({ error: "SUPABASE_SERVICE_ROLE_KEY missing" });
