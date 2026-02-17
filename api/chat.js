@@ -20,10 +20,14 @@ module.exports = async (req, res) => {
     // ---------------------------
     // 1. Zoek passages uit eigen DB
     // ---------------------------
-    const searchResp = await fetch(
-      `${req.headers.origin}/api/search?q=` +
-      encodeURIComponent(question)
-    );
+    const base = process.env.VERCEL_URL
+  ? `https://${process.env.VERCEL_URL}`
+  : "https://beleidsbank-api.vercel.app";
+
+const searchResp = await fetch(
+  `${base}/api/search?q=` + encodeURIComponent(question)
+);
+
 
     const searchJson = await searchResp.json();
 
