@@ -1,10 +1,16 @@
-// /api/chat.js
-// Beleidsbank PRO chat — gebruikt eigen Supabase search
+// /pages/api/chat.js
+// Beleidsbank PRO chat — direct Supabase search call (GEEN interne fetch meer)
 
-module.exports = async (req, res) => {
+import { createClient } from "@supabase/supabase-js";
+
+export default async function handler(req, res) {
   try {
 
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
+
+    if (!OPENAI_KEY) {
+      return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
+    }
 
     const body =
       typeof req.body === "string"
@@ -18,20 +24,38 @@ module.exports = async (req, res) => {
     }
 
     // ---------------------------
-    // 1. Zoek passages uit eigen DB
+    // 1. EMBEDDING VAN DE VRAAG
     // ---------------------------
-    const base = process.env.VERCEL_URL
-  ? `https://${process.env.VERCEL_URL}`
-  : "https://beleidsbank-api.vercel.app";
+    const embResp = await fetch("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_KEY}`
+      },
+      body: JSON.stringify({
+        model: "text-embedding-3-small",
+        input: question
+      })
+    });
 
-const searchResp = await fetch(
-  `${base}/api/search?q=` + encodeURIComponent(question)
-);
+    const embJson = await embResp.json();
+    const embedding = embJson.data[0].embedding;
 
+    // ---------------------------
+    // 2. SUPABASE VECTOR SEARCH
+    // ---------------------------
+    const supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_KEY
+    );
 
-    const searchJson = await searchResp.json();
+    const { data } = await supabase.rpc("match_chunks", {
+      query_embedding: embedding,
+      match_threshold: 0.2,
+      match_count: 5
+    });
 
-    const results = (searchJson.results || []).slice(0,5);
+    const results = data || [];
 
     if (!results.length) {
       return res.json({
@@ -42,14 +66,14 @@ const searchResp = await fetch(
     }
 
     // ---------------------------
-    // 2. Maak context voor AI
+    // 3. CONTEXT MAKEN
     // ---------------------------
     const context = results
-      .map((r,i)=>`[${i+1}] ${r.excerpt}`)
+      .map((r,i)=>`[${i+1}] ${r.text}`)
       .join("\n\n");
 
     // ---------------------------
-    // 3. Vraag OpenAI antwoord
+    // 4. OPENAI ANTWOORD
     // ---------------------------
     const ai = await fetch("https://api.openai.com/v1/chat/completions", {
       method:"POST",
@@ -70,10 +94,9 @@ Je bent Beleidsbank.
 Regels:
 - Gebruik ALLEEN de gegeven bronpassages.
 - Als info ontbreekt → zeg dat expliciet.
-- Citeer bronnen met [1], [2], ...
+- Citeer bronnen met [1], [2].
 - Verzin niets.
-- Geen artikelnummers verzinnen.
-- Antwoord in helder Nederlands.
+- Antwoord zakelijk Nederlands.
 `
           },
           {
@@ -87,7 +110,7 @@ Bronpassages:
 
 ${context}
 
-Geef een concreet antwoord met bronverwijzingen.
+Geef antwoord met bronverwijzingen.
 `
           }
         ]
@@ -98,20 +121,22 @@ Geef een concreet antwoord met bronverwijzingen.
     const answer = aiJson?.choices?.[0]?.message?.content || "";
 
     // ---------------------------
-    // 4. Return antwoord + bronnen
+    // 5. RETURN
     // ---------------------------
     return res.json({
       answer,
       sources: results.map((r,i)=>({
         n:i+1,
-        title: r.label || r.doc_id,
-        link: r.source_url
+        title: r.doc_id || "Wetgeving",
+        link: r.source_url || ""
       }))
     });
 
   } catch(e) {
+
     return res.status(500).json({
       crash:String(e)
     });
+
   }
-};
+}
