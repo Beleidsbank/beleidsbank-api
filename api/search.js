@@ -39,7 +39,16 @@ module.exports = async (req, res) => {
     // --- 2) haal chunks op uit Supabase ---
     // V1: simpel alles (limit) ophalen. Later optimaliseren naar db-side vector search + filters.
     const rowsResp = await fetch(
-      `${SUPABASE_URL}/rest/v1/chunks?select=id,doc_id,label,text,source_url,embedding&limit=2000`,
+      const rowsResp = await fetch(
+  `${SUPABASE_URL}/rest/v1/chunks?select=id,doc_id,label,text,source_url,embedding&doc_id=eq.BWBR0005537&order=id.asc&limit=5000`,
+  {
+    headers: {
+      apikey: SERVICE_KEY,
+      Authorization: `Bearer ${SERVICE_KEY}`,
+    },
+  }
+);
+
       {
         headers: {
           apikey: SERVICE_KEY,
