@@ -86,6 +86,7 @@ module.exports = async (req, res) => {
       ok: true,
       query: q,
       results: ranked.map((r, i) => ({
+        id: r.id,
         n: i + 1,
         label: r.label,
         doc_id: r.doc_id,
