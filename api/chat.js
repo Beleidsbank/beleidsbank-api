@@ -1,29 +1,7 @@
 // /pages/api/chat.js
-// Beleidsbank PRO (V1) — Chat op basis van eigen Supabase-index (geen SRU, geen scraping)
-// Response: { answer: string, sources: [{n,title,link}] }
-
 export const config = { api: { bodyParser: true } };
 
 const ALLOW_ORIGIN = "https://app.beleidsbank.nl";
-
-function cosine(a, b) {
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) {
-    const x = a[i], y = b[i];
-    dot += x * y;
-    na += x * x;
-    nb += y * y;
-  }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb));
-}
-
-function toVector(v) {
-  if (Array.isArray(v)) return v;
-  if (typeof v === "string") {
-    try { return JSON.parse(v); } catch { return null; }
-  }
-  return null;
-}
 
 export default async function handler(req, res) {
   // CORS
@@ -36,94 +14,54 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
 
   try {
-    const SUPABASE_URL = process.env.SUPABASE_URL;
-    const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
-
-    if (!SUPABASE_URL) return res.status(500).json({ error: "Missing SUPABASE_URL" });
-    if (!SERVICE_KEY) return res.status(500).json({ error: "Missing SUPABASE_SERVICE_ROLE_KEY" });
     if (!OPENAI_KEY) return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
 
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     const question = (body.message || "").toString().trim();
     if (!question) return res.status(400).json({ error: "Missing message" });
 
-    // 1) Embedding van de vraag
-    const embResp = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "text-embedding-3-small",
-        input: question,
-      }),
-    });
-    const embJson = await embResp.json();
-    if (!embResp.ok) return res.status(500).json({ error: "OpenAI embeddings failed", details: embJson });
+    // 1) haal passages via je eigen search endpoint
+    const base =
+      process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "https://beleidsbank-api.vercel.app";
 
-    const qvec = toVector(embJson?.data?.[0]?.embedding);
-    if (!qvec) return res.status(500).json({ error: "Invalid embedding from OpenAI" });
+    const s = await fetch(`${base}/api/search?q=${encodeURIComponent(question)}`);
+    const sj = await s.json();
 
-    // 2) Haal chunks op uit Supabase (V1: simpel, later optimaliseren)
-    // Tip: als je later veel data hebt, bouwen we echte DB-side vector search.
-    const chunksResp = await fetch(
-      `${SUPABASE_URL}/rest/v1/chunks?select=id,doc_id,label,text,source_url,embedding&limit=500`,
-      {
-        headers: {
-          apikey: SERVICE_KEY,
-          Authorization: `Bearer ${SERVICE_KEY}`,
-        },
-      }
-    );
-
-    const chunks = await chunksResp.json();
-    if (!chunksResp.ok) {
-      return res.status(500).json({ error: "Supabase chunks fetch failed", details: chunks });
-    }
-    if (!Array.isArray(chunks) || chunks.length === 0) {
+    if (!s.ok || !sj?.ok) {
       return res.status(200).json({
-        answer: "Ik heb nog geen wetgeving in de database staan om op te zoeken.",
+        answer: `Search faalde: ${sj?.error || "unknown error"}`,
         sources: [],
+        debug: { search_status: s.status, search: sj },
       });
     }
 
-    // 3) Rank op cosine similarity
-    const ranked = chunks
-      .map((c) => {
-        const emb = toVector(c.embedding);
-        if (!emb) return null;
-        return { ...c, _sim: cosine(qvec, emb) };
-      })
-      .filter(Boolean)
-      .sort((a, b) => b._sim - a._sim)
-      .slice(0, 8);
+    const results = (sj.results || []).slice(0, 8);
 
-    if (ranked.length === 0) {
+    if (!results.length) {
       return res.status(200).json({
-        answer: "Ik kon geen relevante passages vinden in de officiële databronnen.",
+        answer: "Ik heb nog geen relevante passages in de database gevonden.",
         sources: [],
+        debug: { labels: [] },
       });
     }
 
-    // 4) Context voor AI
-    const context = ranked
-      .map((r, i) => `[${i + 1}] ${r.text}`)
-      .join("\n\n");
+    // DEBUG: laat zien welke labels chat echt ontvangt
+    const debugLabels = results.map(r => r.label);
+
+    // 2) context
+    const context = results.map((r, i) => `[${i + 1}] ${r.excerpt}`).join("\n\n");
 
     const system = `
 Je bent Beleidsbank.
-Beantwoord kort en zakelijk in het Nederlands.
-
-Harde regels:
+Regels:
 - Gebruik ALLEEN de meegeleverde bronpassages.
 - Citeer met [1], [2], ...
 - Als iets niet in de passages staat: zeg dat expliciet.
-- Verzin geen artikel-/lidnummers.
+- Verzin geen artikelen/lidnummers.
+- Antwoord kort, zakelijk, zonder marketing.
 `.trim();
 
-    // 5) Chat completion
     const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -136,28 +74,32 @@ Harde regels:
         max_tokens: 650,
         messages: [
           { role: "system", content: system },
-          {
-            role: "user",
-            content: `Vraag:\n${question}\n\nBronpassages:\n${context}\n\nGeef antwoord met bronverwijzingen.`,
-          },
+          { role: "user", content: `Vraag:\n${question}\n\nBronpassages:\n${context}` },
         ],
       }),
     });
 
     const aiJson = await aiResp.json();
-    if (!aiResp.ok) return res.status(500).json({ error: "OpenAI chat failed", details: aiJson });
+    if (!aiResp.ok) {
+      return res.status(200).json({
+        answer: "OpenAI chat faalde.",
+        sources: [],
+        debug: { openai: aiJson },
+      });
+    }
 
     const answer = (aiJson?.choices?.[0]?.message?.content || "").trim();
 
     return res.status(200).json({
       answer,
-      sources: ranked.map((r, i) => ({
+      sources: results.map((r, i) => ({
         n: i + 1,
-        title: r.label || r.doc_id || "Wetgeving",
-        link: r.source_url || "",
+        title: r.label,
+        link: r.source_url,
       })),
+      debug: { labels: debugLabels }, // <- tijdelijk
     });
   } catch (e) {
-    return res.status(500).json({ crash: String(e?.message || e) });
+    return res.status(500).json({ error: "chat crashed", details: String(e?.message || e) });
   }
 }
