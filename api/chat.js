@@ -104,8 +104,9 @@ Regels:
 
     return res.status(200).json({
       answer,
-      sources: results.map((r, i) => ({
-        n: i + 1,
+      sources: results.map((r,i)=>({
+        n: i+1,
+        id: r.id,
         title: r.label,
         link: r.source_url
       })),
