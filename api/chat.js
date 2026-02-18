@@ -98,7 +98,7 @@ export default async function handler(req, res) {
       })
       .filter(Boolean)
       .sort((a, b) => b._sim - a._sim)
-      .slice(0, 5);
+      .slice(0, 8);
 
     if (ranked.length === 0) {
       return res.status(200).json({
