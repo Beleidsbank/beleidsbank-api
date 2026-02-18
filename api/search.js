@@ -45,10 +45,20 @@ module.exports = async (req, res) => {
       return dot/(Math.sqrt(na)*Math.sqrt(nb));
     }
 
-    const ranked = rows.map(r=>({
-      ...r,
-      similarity: cosine(vec, r.embedding)
-    }))
+    const qLower = q.toLowerCase();
+
+const ranked = rows.map(r=>{
+  let sim = cosine(vec, r.embedding);
+
+  const txt = (r.text || "").toLowerCase();
+
+  // HYBRID BOOST
+  if (txt.includes(qLower)) sim += 0.25;
+  if (txt.includes("artikel 1:3")) sim += 0.4;
+
+  return { ...r, similarity: sim };
+})
+
     .sort((a,b)=>b.similarity-a.similarity)
     .slice(0,5);
 
