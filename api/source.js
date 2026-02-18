@@ -1,7 +1,11 @@
-// /api/source.js  (Vercel serverless function)
-// GET /api/source?id=64
-
+// beleidsbank-api/api/source.js
 module.exports = async (req, res) => {
+  // ✅ CORS
+  res.setHeader("Access-Control-Allow-Origin", "https://app.beleidsbank.nl");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.status(200).end();
+
   try {
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -19,10 +23,7 @@ module.exports = async (req, res) => {
       `&limit=1`;
 
     const r = await fetch(url, {
-      headers: {
-        apikey: SERVICE_KEY,
-        Authorization: `Bearer ${SERVICE_KEY}`,
-      },
+      headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}` },
     });
 
     const data = await r.json();
