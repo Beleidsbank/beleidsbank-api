@@ -1,15 +1,26 @@
 // beleidsbank-api/api/search.js
-// Search: exact-first voor "artikel X" + fallback naar embeddings/cosine.
-// Fix: exact lookup mag NIET 5:10 matchen op query 5:1 (boundary matching).
+// Generic search voor Beleidsbank:
+// 1) exact-first voor "artikel X" (met document-detectie op basis van documents.title)
+// 2) fallback semantisch (embeddings + cosine)
+//
+// Let op: semantisch deel is MVP en schaalt niet naar "alle wetten" (limit=5000).
+// Exact-first is wél generiek en werkt voor elke geïngeste wet.
 
 function safeJsonParse(s){ try{ return JSON.parse(s); } catch { return null; } }
+function escapeRegExp(str){ return (str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 
-function escapeRegExp(str){
-  return (str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function normalizeText(s){
+  return (s || "")
+    .toString()
+    .toLowerCase()
+    .replace(/[’']/g, "")      // apostrof varianten
+    .replace(/[^a-z0-9\s:.-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function extractRequestedArticle(q) {
-  const s = (q || "").toLowerCase();
+  const s = normalizeText(q);
 
   // match: "artikel 5.1", "art. 5.1", "artikel 5:1", "artikel 16:25a"
   const m = s.match(/\b(artikel|art\.)\s+([0-9]{1,3}(?:[.:][0-9]{1,3}[a-z]?)?(?:[a-z])?)\b/);
@@ -20,17 +31,51 @@ function extractRequestedArticle(q) {
   return art;
 }
 
-function inferDocIdFromQuery(qLower){
-  if (qLower.includes("omgevingswet")) return "BWBR0037885";
-  if (qLower.includes("awb") || qLower.includes("algemene wet bestuursrecht")) return "BWBR0005537";
-  if (qLower.includes("bal")) return "BWBR0041330";
-  if (qLower.includes("bbl")) return "BWBR0041297";
-  if (qLower.includes("bkl")) return "BWBR0041313";
+function scoreDocMatch(questionNorm, docTitleNorm){
+  // simpele maar robuuste scoring:
+  // +3 als volledige titel als substring voorkomt
+  // +1 per woord (>=4 chars) dat in vraag voorkomt
+  if (!docTitleNorm) return 0;
+  let score = 0;
+
+  if (questionNorm.includes(docTitleNorm)) score += 3;
+
+  const words = docTitleNorm.split(" ").filter(w => w.length >= 4);
+  for (const w of words){
+    if (questionNorm.includes(w)) score += 1;
+  }
+  return score;
+}
+
+async function supabaseFetchDocuments({ supabaseUrl, serviceKey }){
+  const url = `${supabaseUrl}/rest/v1/documents?select=id,title&limit=10000`;
+  const r = await fetch(url, {
+    headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` }
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(`Supabase documents fetch failed: ${JSON.stringify(data).slice(0,300)}`);
+  return Array.isArray(data) ? data : [];
+}
+
+function pickBestDocumentId(question, documents){
+  const qn = normalizeText(question);
+  let best = null;
+
+  for (const d of documents){
+    const titleNorm = normalizeText(d.title || "");
+    const s = scoreDocMatch(qn, titleNorm);
+    if (!best || s > best.score){
+      best = { id: d.id, title: d.title, score: s };
+    }
+  }
+
+  // drempel: score >= 2 betekent "redelijk zeker"
+  if (best && best.score >= 2) return best;
   return null;
 }
 
 async function supabaseExactArticleCandidates({ supabaseUrl, serviceKey, article, docId }) {
-  // Kandidaten ophalen (iets ruimer), daarna strikte filtering in JS.
+  // Kandidaten ophalen (ruimer), daarna strikte filtering.
   let url =
     `${supabaseUrl}/rest/v1/chunks` +
     `?select=id,doc_id,label,text,source_url` +
@@ -52,10 +97,10 @@ async function supabaseExactArticleCandidates({ supabaseUrl, serviceKey, article
 }
 
 function strictFilterExactArticle(rows, article){
-  // Doel: match "Artikel 5:1" maar NIET "Artikel 5:10" of "Artikel 15:10".
-  // Regex: Artikel <spaties> 5:1 gevolgd door NIET een cijfer/letter (boundary)
+  // Match "Artikel 5:1" maar NIET "Artikel 5:10" / "Artikel 15:10"
+  // en accepteer ook "Artikel 5:1." (punt erachter)
   const art = escapeRegExp(article);
-  const re = new RegExp(`\\bArtikel\\s+${art}(?![0-9A-Za-z])`, "i");
+  const re = new RegExp(`\\bArtikel\\s+${art}(?:(?![0-9A-Za-z]).|$)`, "i");
   return (rows || []).filter(r => re.test((r.label || "").toString()));
 }
 
@@ -78,20 +123,22 @@ module.exports = async (req, res) => {
     const q = (req.query.q || "").toString().trim();
     if (!q) return res.status(400).json({ error: "missing q" });
 
-    const qLower = q.toLowerCase();
+    // -------------------------
+    // Load docs index (generic)
+    // -------------------------
+    const documents = await supabaseFetchDocuments({ supabaseUrl: SUPABASE_URL, serviceKey: SERVICE_KEY });
+    const bestDoc = pickBestDocumentId(q, documents); // {id,title,score} of null
 
     // -------------------------
     // 0) EXACT-FIRST: "artikel X"
     // -------------------------
     const requestedArticle = extractRequestedArticle(q);
     if (requestedArticle) {
-      const docId = inferDocIdFromQuery(qLower);
-
       const candidates = await supabaseExactArticleCandidates({
         supabaseUrl: SUPABASE_URL,
         serviceKey: SERVICE_KEY,
         article: requestedArticle,
-        docId
+        docId: bestDoc?.id || null
       });
 
       const exactHits = strictFilterExactArticle(candidates, requestedArticle);
@@ -101,6 +148,7 @@ module.exports = async (req, res) => {
           ok: true,
           query: q,
           mode: "exact-article",
+          detected_document: bestDoc ? { id: bestDoc.id, title: bestDoc.title, score: bestDoc.score } : null,
           results: exactHits.slice(0, 8).map((r, i) => ({
             id: r.id,
             n: i + 1,
@@ -113,24 +161,11 @@ module.exports = async (req, res) => {
         });
       }
 
-      // Als we candidates hadden maar geen exact match, is dit waardevolle debug:
-      // (laat dit gerust staan voor nu)
-      if (candidates.length) {
-        return res.status(200).json({
-          ok: true,
-          query: q,
-          mode: "exact-article-not-found",
-          requested: requestedArticle,
-          hint: "Candidates matched substring; no strict Artikel <nr> match found. Likely artikel ontbreekt in chunks of label-format wijkt af.",
-          candidates_preview: candidates.slice(0, 8).map(r => ({ id: r.id, label: r.label, doc_id: r.doc_id })),
-          results: [] // force chat om te zeggen dat het niet gevonden is
-        });
-      }
-      // anders: val door naar semantisch
+      // Geen hit -> laat semantisch proberen
     }
 
     // -------------------------
-    // 1) embedding maken
+    // 1) Embedding (semantic fallback)
     // -------------------------
     const embResp = await fetch("https://api.openai.com/v1/embeddings", {
       method: "POST",
@@ -146,40 +181,31 @@ module.exports = async (req, res) => {
 
     const embText = await embResp.text();
     const embJson = safeJsonParse(embText);
-
     if (!embResp.ok || !embJson?.data?.[0]?.embedding) {
       return res.status(500).json({
         error: "Embedding failed",
         details: embJson || embText
       });
     }
-
     const qvec = embJson.data[0].embedding;
 
     // -------------------------
-    // 2) chunks ophalen uit Supabase (MVP)
+    // 2) Fetch chunks (MVP)
+    // TIP: als bestDoc bekend is, filter op doc_id om veel sneller/zuiverder te zoeken
     // -------------------------
-    const rowsResp = await fetch(
-      `${SUPABASE_URL}/rest/v1/chunks?select=id,doc_id,label,text,source_url,embedding&limit=5000`,
-      {
-        headers: {
-          apikey: SERVICE_KEY,
-          Authorization: `Bearer ${SERVICE_KEY}`
-        }
-      }
-    );
+    const chunkUrl = bestDoc?.id
+      ? `${SUPABASE_URL}/rest/v1/chunks?select=id,doc_id,label,text,source_url,embedding&doc_id=eq.${encodeURIComponent(bestDoc.id)}&limit=5000`
+      : `${SUPABASE_URL}/rest/v1/chunks?select=id,doc_id,label,text,source_url,embedding&limit=5000`;
+
+    const rowsResp = await fetch(chunkUrl, {
+      headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}` }
+    });
 
     const rows = await rowsResp.json();
     if (!rowsResp.ok) {
-      return res.status(500).json({
-        error: "Supabase fetch failed",
-        details: rows
-      });
+      return res.status(500).json({ error: "Supabase fetch failed", details: rows });
     }
 
-    // -------------------------
-    // cosine similarity
-    // -------------------------
     function cosine(a,b){
       let dot=0, na=0, nb=0;
       for(let i=0;i<a.length;i++){
@@ -198,9 +224,8 @@ module.exports = async (req, res) => {
       return null;
     }
 
-    // -------------------------
-    // 3) ranking
-    // -------------------------
+    const qLower = q.toLowerCase();
+
     const ranked = rows
       .map(r=>{
         const emb = toVec(r.embedding);
@@ -209,15 +234,8 @@ module.exports = async (req, res) => {
         let sim = cosine(qvec, emb);
 
         const txt = (r.text||"").toLowerCase();
-        const label = (r.label||"").toLowerCase();
 
-        if(qLower.includes("besluit") && txt.includes("besluit")) sim += 0.12;
-
-        if(qLower.includes("wat is")){
-          if(txt.includes("wordt verstaan")) sim += 0.7;
-        }
-
-        if(qLower.includes("besluit") && label.includes("1:3")) sim += 2.5;
+        if(qLower.includes("wat is") && txt.includes("wordt verstaan")) sim += 0.7;
 
         return {...r, similarity: sim};
       })
@@ -229,6 +247,7 @@ module.exports = async (req, res) => {
       ok: true,
       query: q,
       mode: "semantic",
+      detected_document: bestDoc ? { id: bestDoc.id, title: bestDoc.title, score: bestDoc.score } : null,
       results: ranked.map((r,i)=>({
         id: r.id,
         n: i+1,
