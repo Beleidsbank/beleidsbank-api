@@ -1,43 +1,25 @@
 // beleidsbank-api/api/ingest-bwb-xml.js
-// XML ingest ZONDER dependencies (werkt direct op Vercel)
-
-function safeJsonParse(s){ try{return JSON.parse(s);}catch{return null;} }
+// OFFICIËLE SRU ingest via overheid zoekservice (werkt server-side)
 
 function stripTags(s){
-  return (s||"")
-    .replace(/<[^>]+>/g," ")
-    .replace(/\s+/g," ")
-    .trim();
+  return (s||"").replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();
 }
 
 function extractArticles(xml){
 
   const out=[];
 
-  // pak alles tussen <artikel ...> en </artikel>
-  const blocks=xml.match(/<artikel[\s\S]*?<\/artikel>/gi)||[];
+  // overheid SRU XML gebruikt <artikel> maar kan namespace bevatten
+  const blocks=xml.match(/<[^>]*artikel[^>]*>[\s\S]*?<\/[^>]*artikel>/gi)||[];
 
   for(const b of blocks){
 
-    // nummer uit <label>Artikel 5.1</label>
     let nr="";
 
-    const m=b.match(/<label[^>]*>(.*?)<\/label>/i);
-    if(m){
-      const t=m[1]
-        .replace(/<[^>]+>/g," ")
-        .replace(/\s+/g," ")
-        .trim();
+    const m=b.match(/Artikel\s+([0-9.:a-z]+)/i);
+    if(m) nr=m[1].replace(".",":");
 
-      // pak alleen het nummer uit "Artikel 5.1"
-      const n=t.match(/([0-9]+(?:\.[0-9a-z]+)?)/i);
-      if(n) nr=n[1].replace(".",":");
-    }
-
-    const text=b
-      .replace(/<[^>]+>/g," ")
-      .replace(/\s+/g," ")
-      .trim();
+    const text=stripTags(b);
 
     if(text.length>80){
       out.push({nummer:nr,text});
@@ -63,11 +45,7 @@ async function embedBatch(texts,key){
     })
   });
 
-  const t=await r.text();
-  const j=safeJsonParse(t);
-
-  if(!r.ok) throw new Error("OpenAI "+t.slice(0,200));
-
+  const j=await r.json();
   return j.data.map(x=>x.embedding);
 }
 
@@ -115,7 +93,8 @@ module.exports=async(req,res)=>{
     const KEY=process.env.SUPABASE_SERVICE_ROLE_KEY;
     const OPENAI=process.env.OPENAI_API_KEY;
 
-    const xmlUrl=`https://wetten.overheid.nl/${id}?view=xml`;
+    // ✅ OFFICIËLE SRU API
+    const xmlUrl=`https://zoekservice.overheid.nl/sru/Search?operation=searchRetrieve&query=bwb-id=${id}&version=1.2&recordSchema=xml`;
 
     const r=await fetch(xmlUrl);
     const xml=await r.text();
@@ -127,7 +106,10 @@ module.exports=async(req,res)=>{
     const articles=extractArticles(xml);
 
     if(!articles.length){
-      return res.status(500).json({error:"no articles parsed"});
+      return res.status(500).json({
+        error:"no articles parsed",
+        debug_first_1000_chars: xml.slice(0,1000)
+      });
     }
 
     await upsertDocument(
@@ -137,7 +119,6 @@ module.exports=async(req,res)=>{
     );
 
     const texts=articles.map(a=>a.text);
-
     const embeds=await embedBatch(texts,OPENAI);
 
     const rows=articles.map((a,i)=>({
