@@ -39,7 +39,10 @@ function splitArticles(text){
 
     const chunk=text.slice(start,end).trim();
 
-    if(chunk.length>120) blocks.push(chunk);
+   // alleen echte artikelen: moet een lidnummer bevatten ("1 ")
+if(chunk.length>120 && /\b1\s/.test(chunk)){
+  blocks.push(chunk);
+}
   }
 
   return blocks;
