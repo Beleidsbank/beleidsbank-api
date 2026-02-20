@@ -1,8 +1,12 @@
 // beleidsbank-api/api/search.js
 // Search: exact-first voor "artikel X" + fallback naar embeddings/cosine.
-// Response: { ok:true, query, results:[...] }
+// Fix: exact lookup mag NIET 5:10 matchen op query 5:1 (boundary matching).
 
 function safeJsonParse(s){ try{ return JSON.parse(s); } catch { return null; } }
+
+function escapeRegExp(str){
+  return (str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function extractRequestedArticle(q) {
   const s = (q || "").toLowerCase();
@@ -17,7 +21,6 @@ function extractRequestedArticle(q) {
 }
 
 function inferDocIdFromQuery(qLower){
-  // Minimal mapping (jij kunt later uitbreiden)
   if (qLower.includes("omgevingswet")) return "BWBR0037885";
   if (qLower.includes("awb") || qLower.includes("algemene wet bestuursrecht")) return "BWBR0005537";
   if (qLower.includes("bal")) return "BWBR0041330";
@@ -26,18 +29,15 @@ function inferDocIdFromQuery(qLower){
   return null;
 }
 
-async function supabaseExactArticleLookup({ supabaseUrl, serviceKey, article, docId }) {
-  // label bevat "... — Artikel 5:1"
-  // We zoeken robust met ilike op alleen artikelnummer.
+async function supabaseExactArticleCandidates({ supabaseUrl, serviceKey, article, docId }) {
+  // Kandidaten ophalen (iets ruimer), daarna strikte filtering in JS.
   let url =
     `${supabaseUrl}/rest/v1/chunks` +
     `?select=id,doc_id,label,text,source_url` +
     `&label=ilike.${encodeURIComponent(`%Artikel%${article}%`)}` +
-    `&limit=8`;
+    `&limit=50`;
 
-  if (docId) {
-    url += `&doc_id=eq.${encodeURIComponent(docId)}`;
-  }
+  if (docId) url += `&doc_id=eq.${encodeURIComponent(docId)}`;
 
   const r = await fetch(url, {
     headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` }
@@ -49,6 +49,14 @@ async function supabaseExactArticleLookup({ supabaseUrl, serviceKey, article, do
   }
 
   return Array.isArray(data) ? data : [];
+}
+
+function strictFilterExactArticle(rows, article){
+  // Doel: match "Artikel 5:1" maar NIET "Artikel 5:10" of "Artikel 15:10".
+  // Regex: Artikel <spaties> 5:1 gevolgd door NIET een cijfer/letter (boundary)
+  const art = escapeRegExp(article);
+  const re = new RegExp(`\\bArtikel\\s+${art}(?![0-9A-Za-z])`, "i");
+  return (rows || []).filter(r => re.test((r.label || "").toString()));
 }
 
 module.exports = async (req, res) => {
@@ -79,30 +87,46 @@ module.exports = async (req, res) => {
     if (requestedArticle) {
       const docId = inferDocIdFromQuery(qLower);
 
-      const hits = await supabaseExactArticleLookup({
+      const candidates = await supabaseExactArticleCandidates({
         supabaseUrl: SUPABASE_URL,
         serviceKey: SERVICE_KEY,
         article: requestedArticle,
         docId
       });
 
-      if (hits.length) {
+      const exactHits = strictFilterExactArticle(candidates, requestedArticle);
+
+      if (exactHits.length) {
         return res.status(200).json({
           ok: true,
           query: q,
           mode: "exact-article",
-          results: hits.slice(0, 8).map((r, i) => ({
+          results: exactHits.slice(0, 8).map((r, i) => ({
             id: r.id,
             n: i + 1,
             label: r.label,
             doc_id: r.doc_id,
-            similarity: 999, // force top
+            similarity: 999,
             source_url: r.source_url,
             excerpt: (r.text || "").slice(0, 1200)
           }))
         });
       }
-      // als exact lookup niets vindt: val door naar semantisch
+
+      // Als we candidates hadden maar geen exact match, is dit waardevolle debug:
+      // (laat dit gerust staan voor nu)
+      if (candidates.length) {
+        return res.status(200).json({
+          ok: true,
+          query: q,
+          mode: "exact-article-not-found",
+          requested: requestedArticle,
+          hint: "Candidates matched substring; no strict Artikel <nr> match found. Likely artikel ontbreekt in chunks of label-format wijkt af.",
+          candidates_preview: candidates.slice(0, 8).map(r => ({ id: r.id, label: r.label, doc_id: r.doc_id })),
+          results: [] // force chat om te zeggen dat het niet gevonden is
+        });
+      }
+      // anders: val door naar semantisch
     }
 
     // -------------------------
@@ -133,8 +157,7 @@ module.exports = async (req, res) => {
     const qvec = embJson.data[0].embedding;
 
     // -------------------------
-    // 2) chunks ophalen uit Supabase
-    // LET OP: dit schaalt niet naar "alle wetten", maar werkt voor MVP.
+    // 2) chunks ophalen uit Supabase (MVP)
     // -------------------------
     const rowsResp = await fetch(
       `${SUPABASE_URL}/rest/v1/chunks?select=id,doc_id,label,text,source_url,embedding&limit=5000`,
@@ -188,15 +211,12 @@ module.exports = async (req, res) => {
         const txt = (r.text||"").toLowerCase();
         const label = (r.label||"").toLowerCase();
 
-        // kleine keyword boost
         if(qLower.includes("besluit") && txt.includes("besluit")) sim += 0.12;
 
-        // definitie boost
         if(qLower.includes("wat is")){
           if(txt.includes("wordt verstaan")) sim += 0.7;
         }
 
-        // legacy boost Awb 1:3 (kan je later vervangen door exacte-lookup)
         if(qLower.includes("besluit") && label.includes("1:3")) sim += 2.5;
 
         return {...r, similarity: sim};
