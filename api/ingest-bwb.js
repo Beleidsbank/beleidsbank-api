@@ -31,8 +31,6 @@ function htmlToTextLite(html){
     .trim();
 }
 
-// Splits op "Artikel X" headings.
-// Let op: wetten.overheid.nl kan headings dubbel bevatten (bijv. TOC/navigatie).
 function splitIntoArticleBlocks(plainText){
   const t = (plainText || "").replace(/\u00a0/g," ");
   const re = /(^|\n)(Artikel\s+\d+[a-zA-Z]?(?::\d+[a-zA-Z]?)?)/g;
@@ -67,6 +65,9 @@ function articleLabel(docShort, block){
 }
 
 async function embedBatch(texts, apiKey){
+  // ✅ Guard: OpenAI embeddings mogen niet met lege input
+  if (!texts || texts.length === 0) return [];
+
   const resp = await fetch("https://api.openai.com/v1/embeddings",{
     method:"POST",
     headers:{
@@ -88,8 +89,6 @@ async function embedBatch(texts, apiKey){
 }
 
 async function supabaseUpsertDocument({ supabaseUrl, serviceKey, doc }){
-  // documents schema (jouw Supabase):
-  // id (text, PK), title (text), source_url (text), created_at (timestamp)
   const url = `${supabaseUrl}/rest/v1/documents?on_conflict=id`;
 
   const resp = await fetch(url, {
@@ -109,8 +108,6 @@ async function supabaseUpsertDocument({ supabaseUrl, serviceKey, doc }){
   }
 }
 
-// ✅ BELANGRIJK: Postgres kan NIET in 1 upsert-statement twee keer dezelfde conflict-key updaten.
-// Dus: rows eerst deduplicaten op (doc_id,label). Bewaar langste tekst (meestal de echte inhoud).
 function dedupeRowsByDocLabel(rows){
   const map = new Map();
   for (const r of rows){
@@ -131,6 +128,9 @@ function dedupeRowsByDocLabel(rows){
 
 async function supabaseUpsertChunks({ supabaseUrl, serviceKey, rows }){
   const uniqueRows = dedupeRowsByDocLabel(rows);
+
+  // ✅ Guard: geen request doen als er niks te schrijven is
+  if (uniqueRows.length === 0) return { sent: rows.length, unique: 0 };
 
   const url = `${supabaseUrl}/rest/v1/chunks?on_conflict=doc_id,label`;
   const resp = await fetch(url, {
@@ -196,6 +196,18 @@ module.exports = async (req, res) => {
 
     const batch = allBlocks.slice(offset, offset + limit);
     const docShort = inferDocShort(id);
+
+    // ✅ Als batch leeg is: klaar, niet embeden, niet schrijven.
+    if (!batch.length) {
+      return res.status(200).json({
+        ok: true,
+        id,
+        total_articles_found: allBlocks.length,
+        blocks_prepared: 0,
+        saved_or_updated: 0,
+        done: true
+      });
+    }
 
     // 3) Upsert document (FK basis) — GEEN 'type'
     await supabaseUpsertDocument({
