@@ -115,7 +115,7 @@ module.exports=async(req,res)=>{
     const KEY=process.env.SUPABASE_SERVICE_ROLE_KEY;
     const OPENAI=process.env.OPENAI_API_KEY;
 
-    const xmlUrl=`https://wetten.overheid.nl/${id}/tekst.xml`;
+    const xmlUrl=`https://wetten.overheid.nl/${id}?view=xml`;
 
     const r=await fetch(xmlUrl);
     const xml=await r.text();
