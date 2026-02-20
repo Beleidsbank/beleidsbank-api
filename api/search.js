@@ -1,20 +1,64 @@
 // beleidsbank-api/api/search.js
+// Search: exact-first voor "artikel X" + fallback naar embeddings/cosine.
+// Response: { ok:true, query, results:[...] }
+
+function safeJsonParse(s){ try{ return JSON.parse(s); } catch { return null; } }
+
+function extractRequestedArticle(q) {
+  const s = (q || "").toLowerCase();
+
+  // match: "artikel 5.1", "art. 5.1", "artikel 5:1", "artikel 16:25a"
+  const m = s.match(/\b(artikel|art\.)\s+([0-9]{1,3}(?:[.:][0-9]{1,3}[a-z]?)?(?:[a-z])?)\b/);
+  if (!m) return null;
+
+  let art = m[2].trim();
+  art = art.replace(".", ":"); // normalize 5.1 -> 5:1
+  return art;
+}
+
+function inferDocIdFromQuery(qLower){
+  // Minimal mapping (jij kunt later uitbreiden)
+  if (qLower.includes("omgevingswet")) return "BWBR0037885";
+  if (qLower.includes("awb") || qLower.includes("algemene wet bestuursrecht")) return "BWBR0005537";
+  if (qLower.includes("bal")) return "BWBR0041330";
+  if (qLower.includes("bbl")) return "BWBR0041297";
+  if (qLower.includes("bkl")) return "BWBR0041313";
+  return null;
+}
+
+async function supabaseExactArticleLookup({ supabaseUrl, serviceKey, article, docId }) {
+  // label bevat "... — Artikel 5:1"
+  // We zoeken robust met ilike op alleen artikelnummer.
+  let url =
+    `${supabaseUrl}/rest/v1/chunks` +
+    `?select=id,doc_id,label,text,source_url` +
+    `&label=ilike.${encodeURIComponent(`%Artikel%${article}%`)}` +
+    `&limit=8`;
+
+  if (docId) {
+    url += `&doc_id=eq.${encodeURIComponent(docId)}`;
+  }
+
+  const r = await fetch(url, {
+    headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` }
+  });
+
+  const data = await r.json();
+  if (!r.ok) {
+    throw new Error(`Supabase exact lookup failed: ${JSON.stringify(data).slice(0,300)}`);
+  }
+
+  return Array.isArray(data) ? data : [];
+}
 
 module.exports = async (req, res) => {
-
-  // -------------------------
-  // CORS (HEEL BELANGRIJK)
-  // -------------------------
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "https://app.beleidsbank.nl");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
 
   try {
-
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
@@ -26,8 +70,43 @@ module.exports = async (req, res) => {
     const q = (req.query.q || "").toString().trim();
     if (!q) return res.status(400).json({ error: "missing q" });
 
+    const qLower = q.toLowerCase();
+
     // -------------------------
-    // 1. embedding maken
+    // 0) EXACT-FIRST: "artikel X"
+    // -------------------------
+    const requestedArticle = extractRequestedArticle(q);
+    if (requestedArticle) {
+      const docId = inferDocIdFromQuery(qLower);
+
+      const hits = await supabaseExactArticleLookup({
+        supabaseUrl: SUPABASE_URL,
+        serviceKey: SERVICE_KEY,
+        article: requestedArticle,
+        docId
+      });
+
+      if (hits.length) {
+        return res.status(200).json({
+          ok: true,
+          query: q,
+          mode: "exact-article",
+          results: hits.slice(0, 8).map((r, i) => ({
+            id: r.id,
+            n: i + 1,
+            label: r.label,
+            doc_id: r.doc_id,
+            similarity: 999, // force top
+            source_url: r.source_url,
+            excerpt: (r.text || "").slice(0, 1200)
+          }))
+        });
+      }
+      // als exact lookup niets vindt: val door naar semantisch
+    }
+
+    // -------------------------
+    // 1) embedding maken
     // -------------------------
     const embResp = await fetch("https://api.openai.com/v1/embeddings", {
       method: "POST",
@@ -41,19 +120,21 @@ module.exports = async (req, res) => {
       })
     });
 
-    const embJson = await embResp.json();
+    const embText = await embResp.text();
+    const embJson = safeJsonParse(embText);
 
-    if (!embResp.ok) {
+    if (!embResp.ok || !embJson?.data?.[0]?.embedding) {
       return res.status(500).json({
         error: "Embedding failed",
-        details: embJson
+        details: embJson || embText
       });
     }
 
     const qvec = embJson.data[0].embedding;
 
     // -------------------------
-    // 2. chunks ophalen uit Supabase
+    // 2) chunks ophalen uit Supabase
+    // LET OP: dit schaalt niet naar "alle wetten", maar werkt voor MVP.
     // -------------------------
     const rowsResp = await fetch(
       `${SUPABASE_URL}/rest/v1/chunks?select=id,doc_id,label,text,source_url,embedding&limit=5000`,
@@ -66,7 +147,6 @@ module.exports = async (req, res) => {
     );
 
     const rows = await rowsResp.json();
-
     if (!rowsResp.ok) {
       return res.status(500).json({
         error: "Supabase fetch failed",
@@ -95,10 +175,8 @@ module.exports = async (req, res) => {
       return null;
     }
 
-    const qLower = q.toLowerCase();
-
     // -------------------------
-    // 3. ranking
+    // 3) ranking
     // -------------------------
     const ranked = rows
       .map(r=>{
@@ -118,7 +196,7 @@ module.exports = async (req, res) => {
           if(txt.includes("wordt verstaan")) sim += 0.7;
         }
 
-        // harde boost artikel 1:3
+        // legacy boost Awb 1:3 (kan je later vervangen door exacte-lookup)
         if(qLower.includes("besluit") && label.includes("1:3")) sim += 2.5;
 
         return {...r, similarity: sim};
@@ -127,12 +205,10 @@ module.exports = async (req, res) => {
       .sort((a,b)=>b.similarity-a.similarity)
       .slice(0,8);
 
-    // -------------------------
-    // 4. response
-    // -------------------------
     return res.status(200).json({
-      ok:true,
-      query:q,
+      ok: true,
+      query: q,
+      mode: "semantic",
       results: ranked.map((r,i)=>({
         id: r.id,
         n: i+1,
@@ -145,11 +221,9 @@ module.exports = async (req, res) => {
     });
 
   } catch(e){
-
     return res.status(500).json({
       error:"search crashed",
       details:String(e?.message||e)
     });
-
   }
 };
