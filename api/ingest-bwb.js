@@ -1,5 +1,5 @@
 // beleidsbank-api/api/ingest-bwb.js
-// Snelle generieke ingest voor landelijke wetgeving (BWBR) via wetten.overheid.nl
+// Generieke ingest voor landelijke wetgeving (BWBR) via wetten.overheid.nl
 // GET /api/ingest-bwb?id=BWBR0037885&limit=20&offset=0
 //
 // Env nodig:
@@ -86,8 +86,10 @@ async function embedBatch(texts, apiKey){
 }
 
 async function supabaseUpsertDocument({ supabaseUrl, serviceKey, doc }){
-  // Prefer: resolution=merge-duplicates + on_conflict=id
+  // documents schema (jouw Supabase):
+  // id (text, PK), title (text), source_url (text), created_at (timestamp)
   const url = `${supabaseUrl}/rest/v1/documents?on_conflict=id`;
+
   const resp = await fetch(url, {
     method: "POST",
     headers: {
@@ -105,33 +107,40 @@ async function supabaseUpsertDocument({ supabaseUrl, serviceKey, doc }){
   }
 }
 
-async function supabaseInsertChunks({ supabaseUrl, serviceKey, rows }){
-  const url = `${supabaseUrl}/rest/v1/chunks`;
+async function supabaseUpsertChunks({ supabaseUrl, serviceKey, rows }){
+  // Retry-safe / idempotent:
+  // Upsert op (doc_id, label) zodat herhaald draaien geen duplicaten maakt.
+  // Voorwaarde in DB: unieke constraint of unique index op (doc_id, label).
+  const url = `${supabaseUrl}/rest/v1/chunks?on_conflict=doc_id,label`;
+
   const resp = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type":"application/json",
       "apikey": serviceKey,
       "Authorization": `Bearer ${serviceKey}`,
-      "Prefer": "return=minimal"
+      "Prefer": "resolution=merge-duplicates,return=minimal"
     },
     body: JSON.stringify(rows)
   });
 
   const text = await resp.text();
   if (!resp.ok) {
-    throw new Error(`Supabase insert failed ${resp.status}: ${text.slice(0,300)}`);
+    throw new Error(`Supabase upsert chunks failed ${resp.status}: ${text.slice(0,300)}`);
   }
 }
 
 module.exports = async (req, res) => {
   try{
     const SUPABASE_URL = process.env.SUPABASE_URL;
-    const SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+    const SERVICE_KEY =
+      process.env.SUPABASE_SERVICE_KEY ||
+      process.env.SUPABASE_SERVICE_ROLE_KEY;
+
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
     if (!SUPABASE_URL) return res.status(500).json({ error: "SUPABASE_URL missing" });
-    if (!SERVICE_KEY) return res.status(500).json({ error: "SUPABASE_SERVICE_KEY missing" });
+    if (!SERVICE_KEY) return res.status(500).json({ error: "SUPABASE_SERVICE_KEY (of SUPABASE_SERVICE_ROLE_KEY) missing" });
     if (!OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY missing" });
 
     const id = (req.query.id || "").toString().trim();
@@ -144,35 +153,44 @@ module.exports = async (req, res) => {
 
     const sourceUrl = `https://wetten.overheid.nl/${encodeURIComponent(id)}`;
 
-    // 1) fetch html
+    // 1) Fetch HTML
     const htmlResp = await fetch(sourceUrl, { redirect:"follow" });
     const html = await htmlResp.text();
-    if (!htmlResp.ok) return res.status(500).json({ error:"Fetch wetten.overheid.nl failed", status: htmlResp.status });
+    if (!htmlResp.ok) {
+      return res.status(500).json({ error:"Fetch wetten.overheid.nl failed", status: htmlResp.status });
+    }
 
+    // 2) Extract + split into "Artikel ..." blocks
     const plain = decodeHtml(htmlToTextLite(html));
     const allBlocks = splitIntoArticleBlocks(plain);
 
     if (!allBlocks.length){
-      return res.status(200).json({ error:"Geen artikelen gevonden", hint:"HTML structuur onverwacht", id });
+      return res.status(200).json({
+        error:"Geen artikelen gevonden",
+        hint:"HTML structuur onverwacht of tekst bevat geen 'Artikel ...' headings",
+        id
+      });
     }
 
     const batch = allBlocks.slice(offset, offset + limit);
     const docShort = inferDocShort(id);
 
+    // 3) Upsert document record (FK basis)
+    // ✅ GEEN 'type' kolom, dus NIET meesturen
     await supabaseUpsertDocument({
-  supabaseUrl: SUPABASE_URL,
-  serviceKey: SERVICE_KEY,
-  doc: {
-    id,
-    title: docShort,
-    source_url: sourceUrl
-  }
-});
+      supabaseUrl: SUPABASE_URL,
+      serviceKey: SERVICE_KEY,
+      doc: {
+        id,
+        title: docShort,
+        source_url: sourceUrl
+      }
+    });
 
-    // 3) embeddings in 1 call
+    // 4) Embeddings in 1 call (batch)
     const embeddings = await embedBatch(batch, OPENAI_API_KEY);
 
-    // 4) rows
+    // 5) Build chunk rows
     const rows = batch.map((block, i) => ({
       doc_id: id,
       label: articleLabel(docShort, block),
@@ -181,19 +199,26 @@ module.exports = async (req, res) => {
       embedding: embeddings[i]
     }));
 
-    // 5) insert chunks
-    await supabaseInsertChunks({ supabaseUrl: SUPABASE_URL, serviceKey: SERVICE_KEY, rows });
+    // 6) Upsert chunks (retry-safe)
+    await supabaseUpsertChunks({
+      supabaseUrl: SUPABASE_URL,
+      serviceKey: SERVICE_KEY,
+      rows
+    });
 
     return res.status(200).json({
       ok: true,
       id,
       total_articles_found: allBlocks.length,
       blocks_prepared: batch.length,
-      saved: batch.length,
+      saved_or_updated: batch.length,
       next: `/api/ingest-bwb?id=${encodeURIComponent(id)}&limit=${limit}&offset=${offset + limit}`
     });
 
   } catch(e){
-    return res.status(500).json({ error:"ingest-bwb crashed", details: String(e?.message || e) });
+    return res.status(500).json({
+      error:"ingest-bwb crashed",
+      details: String(e?.message || e)
+    });
   }
 };
