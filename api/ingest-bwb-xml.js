@@ -94,7 +94,7 @@ module.exports=async(req,res)=>{
     const OPENAI=process.env.OPENAI_API_KEY;
 
     // ✅ OFFICIËLE SRU API
-    const xmlUrl=`https://zoekservice.overheid.nl/sru/Search?operation=searchRetrieve&query=bwb-id=${id}&version=1.2&recordSchema=xml`;
+  const xmlUrl=`https://zoekservice.overheid.nl/sru/Search?operation=searchRetrieve&version=1.2&query=dc.identifier=${id}&recordSchema=dc&maximumRecords=1`;
 
     const r=await fetch(xmlUrl);
     const xml=await r.text();
