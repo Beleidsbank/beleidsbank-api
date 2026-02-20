@@ -8,7 +8,6 @@
 // OPENAI_API_KEY
 
 function safeInt(v, d){ const n = parseInt(v,10); return Number.isFinite(n)?n:d; }
-
 function safeJsonParse(s){ try{ return JSON.parse(s); }catch{ return null; } }
 
 function decodeHtml(s){
@@ -32,7 +31,6 @@ function htmlToTextLite(html){
     .trim();
 }
 
-// split op "Artikel X" blokken
 function splitIntoArticleBlocks(plainText){
   const t = (plainText || "").replace(/\u00a0/g," ");
   const re = /(^|\n)(Artikel\s+\d+[a-zA-Z]?(?::\d+[a-zA-Z]?)?)/g;
@@ -67,7 +65,6 @@ function articleLabel(docShort, block){
 }
 
 async function embedBatch(texts, apiKey){
-  // 1 API call met meerdere inputs = veel sneller
   const resp = await fetch("https://api.openai.com/v1/embeddings",{
     method:"POST",
     headers:{
@@ -88,8 +85,27 @@ async function embedBatch(texts, apiKey){
   return arr;
 }
 
+async function supabaseUpsertDocument({ supabaseUrl, serviceKey, doc }){
+  // Prefer: resolution=merge-duplicates + on_conflict=id
+  const url = `${supabaseUrl}/rest/v1/documents?on_conflict=id`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type":"application/json",
+      "apikey": serviceKey,
+      "Authorization": `Bearer ${serviceKey}`,
+      "Prefer": "resolution=merge-duplicates,return=minimal"
+    },
+    body: JSON.stringify(doc)
+  });
+
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`Supabase upsert documents failed ${resp.status}: ${text.slice(0,300)}`);
+  }
+}
+
 async function supabaseInsertChunks({ supabaseUrl, serviceKey, rows }){
-  // Supabase REST insert
   const url = `${supabaseUrl}/rest/v1/chunks`;
   const resp = await fetch(url, {
     method: "POST",
@@ -123,12 +139,12 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: "Use ?id=BWBR..." });
     }
 
-    // Vercel-safe defaults: klein beginnen
     const limit = Math.min(60, Math.max(5, safeInt(req.query.limit, 20)));
     const offset = Math.max(0, safeInt(req.query.offset, 0));
 
-    // 1) haal geconsolideerde tekst HTML op
     const sourceUrl = `https://wetten.overheid.nl/${encodeURIComponent(id)}`;
+
+    // 1) fetch html
     const htmlResp = await fetch(sourceUrl, { redirect:"follow" });
     const html = await htmlResp.text();
     if (!htmlResp.ok) return res.status(500).json({ error:"Fetch wetten.overheid.nl failed", status: htmlResp.status });
@@ -143,10 +159,22 @@ module.exports = async (req, res) => {
     const batch = allBlocks.slice(offset, offset + limit);
     const docShort = inferDocShort(id);
 
-    // 2) embeddings in 1 call
+    // 2) ✅ upsert document record (zodat foreign key klopt)
+    await supabaseUpsertDocument({
+      supabaseUrl: SUPABASE_URL,
+      serviceKey: SERVICE_KEY,
+      doc: {
+        id,
+        title: docShort,         // V1: later echte titel
+        type: "BWB",
+        source_url: sourceUrl
+      }
+    });
+
+    // 3) embeddings in 1 call
     const embeddings = await embedBatch(batch, OPENAI_API_KEY);
 
-    // 3) prepare rows
+    // 4) rows
     const rows = batch.map((block, i) => ({
       doc_id: id,
       label: articleLabel(docShort, block),
@@ -155,7 +183,7 @@ module.exports = async (req, res) => {
       embedding: embeddings[i]
     }));
 
-    // 4) insert
+    // 5) insert chunks
     await supabaseInsertChunks({ supabaseUrl: SUPABASE_URL, serviceKey: SERVICE_KEY, rows });
 
     return res.status(200).json({
