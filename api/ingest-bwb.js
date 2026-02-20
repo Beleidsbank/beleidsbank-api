@@ -31,6 +31,8 @@ function htmlToTextLite(html){
     .trim();
 }
 
+// Splits op "Artikel X" headings.
+// Let op: wetten.overheid.nl kan headings dubbel bevatten (bijv. TOC/navigatie).
 function splitIntoArticleBlocks(plainText){
   const t = (plainText || "").replace(/\u00a0/g," ");
   const re = /(^|\n)(Artikel\s+\d+[a-zA-Z]?(?::\d+[a-zA-Z]?)?)/g;
@@ -107,12 +109,30 @@ async function supabaseUpsertDocument({ supabaseUrl, serviceKey, doc }){
   }
 }
 
-async function supabaseUpsertChunks({ supabaseUrl, serviceKey, rows }){
-  // Retry-safe / idempotent:
-  // Upsert op (doc_id, label) zodat herhaald draaien geen duplicaten maakt.
-  // Voorwaarde in DB: unieke constraint of unique index op (doc_id, label).
-  const url = `${supabaseUrl}/rest/v1/chunks?on_conflict=doc_id,label`;
+// ✅ BELANGRIJK: Postgres kan NIET in 1 upsert-statement twee keer dezelfde conflict-key updaten.
+// Dus: rows eerst deduplicaten op (doc_id,label). Bewaar langste tekst (meestal de echte inhoud).
+function dedupeRowsByDocLabel(rows){
+  const map = new Map();
+  for (const r of rows){
+    const key = `${r.doc_id}||${r.label}`;
+    const prev = map.get(key);
+    if (!prev){
+      map.set(key, r);
+      continue;
+    }
+    const prevLen = (prev.text || "").length;
+    const curLen  = (r.text || "").length;
+    if (curLen > prevLen){
+      map.set(key, r);
+    }
+  }
+  return Array.from(map.values());
+}
 
+async function supabaseUpsertChunks({ supabaseUrl, serviceKey, rows }){
+  const uniqueRows = dedupeRowsByDocLabel(rows);
+
+  const url = `${supabaseUrl}/rest/v1/chunks?on_conflict=doc_id,label`;
   const resp = await fetch(url, {
     method: "POST",
     headers: {
@@ -121,13 +141,15 @@ async function supabaseUpsertChunks({ supabaseUrl, serviceKey, rows }){
       "Authorization": `Bearer ${serviceKey}`,
       "Prefer": "resolution=merge-duplicates,return=minimal"
     },
-    body: JSON.stringify(rows)
+    body: JSON.stringify(uniqueRows)
   });
 
   const text = await resp.text();
   if (!resp.ok) {
     throw new Error(`Supabase upsert chunks failed ${resp.status}: ${text.slice(0,300)}`);
   }
+
+  return { sent: rows.length, unique: uniqueRows.length };
 }
 
 module.exports = async (req, res) => {
@@ -160,7 +182,7 @@ module.exports = async (req, res) => {
       return res.status(500).json({ error:"Fetch wetten.overheid.nl failed", status: htmlResp.status });
     }
 
-    // 2) Extract + split into "Artikel ..." blocks
+    // 2) Extract + split
     const plain = decodeHtml(htmlToTextLite(html));
     const allBlocks = splitIntoArticleBlocks(plain);
 
@@ -175,8 +197,7 @@ module.exports = async (req, res) => {
     const batch = allBlocks.slice(offset, offset + limit);
     const docShort = inferDocShort(id);
 
-    // 3) Upsert document record (FK basis)
-    // ✅ GEEN 'type' kolom, dus NIET meesturen
+    // 3) Upsert document (FK basis) — GEEN 'type'
     await supabaseUpsertDocument({
       supabaseUrl: SUPABASE_URL,
       serviceKey: SERVICE_KEY,
@@ -187,10 +208,10 @@ module.exports = async (req, res) => {
       }
     });
 
-    // 4) Embeddings in 1 call (batch)
+    // 4) Embeddings
     const embeddings = await embedBatch(batch, OPENAI_API_KEY);
 
-    // 5) Build chunk rows
+    // 5) Build rows
     const rows = batch.map((block, i) => ({
       doc_id: id,
       label: articleLabel(docShort, block),
@@ -199,8 +220,8 @@ module.exports = async (req, res) => {
       embedding: embeddings[i]
     }));
 
-    // 6) Upsert chunks (retry-safe)
-    await supabaseUpsertChunks({
+    // 6) Upsert chunks (dedupe-safe)
+    const info = await supabaseUpsertChunks({
       supabaseUrl: SUPABASE_URL,
       serviceKey: SERVICE_KEY,
       rows
@@ -211,7 +232,8 @@ module.exports = async (req, res) => {
       id,
       total_articles_found: allBlocks.length,
       blocks_prepared: batch.length,
-      saved_or_updated: batch.length,
+      saved_or_updated: info.unique,
+      deduped_in_batch: info.sent - info.unique,
       next: `/api/ingest-bwb?id=${encodeURIComponent(id)}&limit=${limit}&offset=${offset + limit}`
     });
 
