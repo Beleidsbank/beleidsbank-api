@@ -159,17 +159,15 @@ module.exports = async (req, res) => {
     const batch = allBlocks.slice(offset, offset + limit);
     const docShort = inferDocShort(id);
 
-    // 2) ✅ upsert document record (zodat foreign key klopt)
     await supabaseUpsertDocument({
-      supabaseUrl: SUPABASE_URL,
-      serviceKey: SERVICE_KEY,
-      doc: {
-        id,
-        title: docShort,         // V1: later echte titel
-        type: "BWB",
-        source_url: sourceUrl
-      }
-    });
+  supabaseUrl: SUPABASE_URL,
+  serviceKey: SERVICE_KEY,
+  doc: {
+    id,
+    title: docShort,
+    source_url: sourceUrl
+  }
+});
 
     // 3) embeddings in 1 call
     const embeddings = await embedBatch(batch, OPENAI_API_KEY);
