@@ -1,62 +1,62 @@
 // beleidsbank-api/api/ingest-bwb-xml.js
-// Production XML ingest voor wetten.overheid.nl
-// GET /api/ingest-bwb-xml?id=BWBR0037885
-
-const { XMLParser } = require("fast-xml-parser");
+// XML ingest ZONDER dependencies (werkt direct op Vercel)
 
 function safeJsonParse(s){ try{return JSON.parse(s);}catch{return null;} }
 
-async function embedBatch(texts, apiKey){
-  if (!texts.length) return [];
+function stripTags(s){
+  return (s||"")
+    .replace(/<[^>]+>/g," ")
+    .replace(/\s+/g," ")
+    .trim();
+}
 
-  const r = await fetch("https://api.openai.com/v1/embeddings",{
+// Pak alle <Artikel>...</Artikel>
+function extractArticles(xml){
+
+  const out=[];
+  const re=/<Artikel[\s\S]*?<\/Artikel>/g;
+
+  const blocks=xml.match(re)||[];
+
+  for(const b of blocks){
+
+    // nummer zoeken
+    let nr="";
+    const m=b.match(/<Nummer>(.*?)<\/Nummer>/);
+    if(m) nr=stripTags(m[1]);
+
+    const text=stripTags(b);
+
+    if(text.length>40){
+      out.push({nummer:nr,text});
+    }
+  }
+
+  return out;
+}
+
+async function embedBatch(texts,key){
+
+  if(!texts.length) return [];
+
+  const r=await fetch("https://api.openai.com/v1/embeddings",{
     method:"POST",
     headers:{
       "Content-Type":"application/json",
-      "Authorization":`Bearer ${apiKey}`
+      "Authorization":`Bearer ${key}`
     },
-    body: JSON.stringify({
+    body:JSON.stringify({
       model:"text-embedding-3-small",
       input:texts.map(t=>t.slice(0,8000))
     })
   });
 
-  const t = await r.text();
-  const j = safeJsonParse(t);
+  const t=await r.text();
+  const j=safeJsonParse(t);
 
-  if(!r.ok) throw new Error("OpenAI failed: "+t.slice(0,200));
+  if(!r.ok) throw new Error("OpenAI "+t.slice(0,200));
+
   return j.data.map(x=>x.embedding);
-}
-
-function collectArticles(node, out=[]){
-
-  if(!node || typeof node!=="object") return out;
-
-  if(node.Artikel){
-
-    const arr = Array.isArray(node.Artikel)
-      ? node.Artikel
-      : [node.Artikel];
-
-    for(const a of arr){
-
-      let nummer = "";
-
-      if(a.Kop?.Nummer){
-        nummer = String(a.Kop.Nummer).trim();
-      }
-
-      let text = JSON.stringify(a);
-
-      out.push({ nummer, text });
-    }
-  }
-
-  for(const k in node){
-    collectArticles(node[k], out);
-  }
-
-  return out;
 }
 
 async function upsertDocument(url,key,doc){
@@ -89,11 +89,12 @@ async function upsertChunks(url,key,rows){
   });
 }
 
-module.exports = async (req,res)=>{
+module.exports=async(req,res)=>{
 
   try{
 
-    const id = (req.query.id||"").trim();
+    const id=(req.query.id||"").trim();
+
     if(!id.startsWith("BWBR")){
       return res.status(400).json({error:"use ?id=BWBR..."});
     }
@@ -102,7 +103,6 @@ module.exports = async (req,res)=>{
     const KEY=process.env.SUPABASE_SERVICE_ROLE_KEY;
     const OPENAI=process.env.OPENAI_API_KEY;
 
-    // officiële XML bron
     const xmlUrl=`https://wetten.overheid.nl/${id}/tekst.xml`;
 
     const r=await fetch(xmlUrl);
@@ -112,15 +112,9 @@ module.exports = async (req,res)=>{
       return res.status(500).json({error:"xml fetch failed"});
     }
 
-    const parser=new XMLParser({
-      ignoreAttributes:false
-    });
+    const articles=extractArticles(xml);
 
-    const j=parser.parse(xml);
-
-    const arts=collectArticles(j);
-
-    if(!arts.length){
+    if(!articles.length){
       return res.status(500).json({error:"no articles parsed"});
     }
 
@@ -130,11 +124,11 @@ module.exports = async (req,res)=>{
       {id,title:id,source_url:xmlUrl}
     );
 
-    const texts=arts.map(a=>a.text);
+    const texts=articles.map(a=>a.text);
 
     const embeds=await embedBatch(texts,OPENAI);
 
-    const rows=arts.map((a,i)=>({
+    const rows=articles.map((a,i)=>({
       doc_id:id,
       label:`${id} — Artikel ${a.nummer}`,
       text:a.text,
