@@ -10,24 +10,36 @@ function stripTags(s){
     .trim();
 }
 
-// Pak alle <Artikel>...</Artikel>
 function extractArticles(xml){
 
   const out=[];
-  const re=/<Artikel[\s\S]*?<\/Artikel>/g;
 
-  const blocks=xml.match(re)||[];
+  // pak alles tussen <artikel ...> en </artikel>
+  const blocks=xml.match(/<artikel[\s\S]*?<\/artikel>/gi)||[];
 
   for(const b of blocks){
 
-    // nummer zoeken
+    // nummer uit <label>Artikel 5.1</label>
     let nr="";
-    const m=b.match(/<Nummer>(.*?)<\/Nummer>/);
-    if(m) nr=stripTags(m[1]);
 
-    const text=stripTags(b);
+    const m=b.match(/<label[^>]*>(.*?)<\/label>/i);
+    if(m){
+      const t=m[1]
+        .replace(/<[^>]+>/g," ")
+        .replace(/\s+/g," ")
+        .trim();
 
-    if(text.length>40){
+      // pak alleen het nummer uit "Artikel 5.1"
+      const n=t.match(/([0-9]+(?:\.[0-9a-z]+)?)/i);
+      if(n) nr=n[1].replace(".",":");
+    }
+
+    const text=b
+      .replace(/<[^>]+>/g," ")
+      .replace(/\s+/g," ")
+      .trim();
+
+    if(text.length>80){
       out.push({nummer:nr,text});
     }
   }
