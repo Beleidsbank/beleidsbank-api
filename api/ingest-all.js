@@ -1,8 +1,6 @@
 // beleidsbank-api/api/ingest-all.js
-// Bulk driver: haalt BWBR IDs uit SRU (BWB) en kan optioneel ingest-bwb triggeren.
-//
-// GET /api/ingest-all?startRecord=1&maximumRecords=25
-// Optioneel: &ingest=1&maxCalls=2&limit=60&offset=0
+// Stap 1: haal BWBR IDs uit SRU (BWB) en (optioneel) trigger ingest-bwb.
+// Compatibel met jouw Supabase schema: documents(id, title, source_url) -> GEEN 'type'.
 
 function safeInt(v, d) {
   const n = parseInt(v, 10);
@@ -12,12 +10,8 @@ function toBool(v) {
   const s = (v ?? "").toString().toLowerCase().trim();
   return s === "1" || s === "true" || s === "yes";
 }
+function uniq(arr) { return [...new Set(arr)]; }
 
-function uniq(arr) {
-  return [...new Set(arr)];
-}
-
-// Namespace-safe tag matcher
 function allTagBlocksRe(tag) {
   return new RegExp(`<\\s*(?:[a-z0-9_-]+:)?${tag}\\b[\\s\\S]*?<\\s*\\/\\s*(?:[a-z0-9_-]+:)?${tag}\\s*>`, "gi");
 }
@@ -33,12 +27,10 @@ function firstTagValue(xml, tag) {
 function parseSruRecords(xml) {
   const ids = [];
   const titles = new Map();
-  const types = new Map();
 
   const recordBlocks = xml.match(allTagBlocksRe("record")) || [];
 
   for (const rec of recordBlocks) {
-    // identifier kan in dcterms:identifier zitten (in recordData gzd)
     const identRaw = firstTagValue(rec, "identifier");
     if (identRaw) {
       const m = identRaw.match(/\b(BWBR|BWBV)\d+\b/i);
@@ -47,12 +39,9 @@ function parseSruRecords(xml) {
 
     const t = firstTagValue(rec, "title");
     if (t && ids.length) titles.set(ids[ids.length - 1], t.replace(/\s+/g, " ").trim());
-
-    const ty = firstTagValue(rec, "type");
-    if (ty && ids.length) types.set(ids[ids.length - 1], ty.replace(/\s+/g, " ").trim());
   }
 
-  // Fallback: scan hele xml op BWBR ids als record parsing niets oplevert
+  // fallback: scan hele XML
   if (!ids.length) {
     const m = xml.match(/\bBWBR\d+\b/gi) || [];
     ids.push(...m.map(x => x.toUpperCase()));
@@ -64,13 +53,7 @@ function parseSruRecords(xml) {
   const numberOfRecords = numberOfRecordsRaw ? safeInt(numberOfRecordsRaw.trim(), null) : null;
   const nextRecordPosition = nextRecordPositionRaw ? safeInt(nextRecordPositionRaw.trim(), null) : null;
 
-  return {
-    ids: uniq(ids),
-    titles,
-    types,
-    numberOfRecords,
-    nextRecordPosition,
-  };
+  return { ids: uniq(ids), titles, numberOfRecords, nextRecordPosition };
 }
 
 async function supabaseUpsertDocuments({ supabaseUrl, serviceKey, docs }) {
@@ -89,7 +72,9 @@ async function supabaseUpsertDocuments({ supabaseUrl, serviceKey, docs }) {
   });
 
   const text = await resp.text();
-  if (!resp.ok) throw new Error(`Supabase upsert documents failed ${resp.status}: ${text.slice(0, 300)}`);
+  if (!resp.ok) {
+    throw new Error(`Supabase upsert documents failed ${resp.status}: ${text.slice(0, 300)}`);
+  }
 }
 
 async function fetchText(url, ms = 25000) {
@@ -124,8 +109,7 @@ module.exports = async (req, res) => {
     const offset = Math.max(0, safeInt(req.query.offset, 0));
     const maxCalls = Math.min(10, Math.max(1, safeInt(req.query.maxCalls, 2)));
 
-    // ✅ Correcte "alles" query in SRU/CQL
-    // ✅ x-info-1-accept=any helpt bij “accept”/schema issues
+    // Correcte SRU "alles" query + accept param
     const sruUrl =
       `https://zoekservice.overheid.nl/sru/Search` +
       `?operation=searchRetrieve` +
@@ -147,21 +131,21 @@ module.exports = async (req, res) => {
 
     const parsed = parseSruRecords(sruResp.text);
 
-    const ids = parsed.ids.filter(id =>
-      includeVerdrag ? /^(BWBR|BWBV)\d+/i.test(id) : /^BWBR\d+/i.test(id)
-    ).slice(0, maximumRecords);
+    // BWBR = regelingen, BWBV = verdragen
+    const ids = parsed.ids
+      .filter(id => includeVerdrag ? /^(BWBR|BWBV)\d+/i.test(id) : /^BWBR\d+/i.test(id))
+      .slice(0, maximumRecords);
 
-    // Upsert metadata (ook handig voor stap 5 routing later)
+    // ✅ Alleen kolommen die jij hebt
     const docs = ids.map(id => ({
       id,
       title: parsed.titles.get(id) || id,
-      type: parsed.types.get(id) || "BWB",
       source_url: `https://wetten.overheid.nl/${id}`,
     }));
 
     await supabaseUpsertDocuments({ supabaseUrl: SUPABASE_URL, serviceKey: SERVICE_KEY, docs });
 
-    // Optional: ingest-bwb trigger (bounded)
+    // Optional: trigger ingest-bwb per id (bounded)
     const ingestResults = [];
     if (doIngest) {
       const proto = (req.headers["x-forwarded-proto"] || "https").toString();
@@ -202,9 +186,9 @@ module.exports = async (req, res) => {
         nextRecordPosition: parsed.nextRecordPosition,
       },
       batch: { count: ids.length, ids },
-      ingest: doIngest ? { called: ingestResults.length, maxCalls, limit, offset, results: ingestResults } : { enabled: false },
-      // Debug ONLY als het weer 0 is (dan zien we precies wat SRU teruggeeft)
-      debug_sru_preview: ids.length ? null : sruResp.text.slice(0, 1200),
+      ingest: doIngest
+        ? { called: ingestResults.length, maxCalls, limit, offset, results: ingestResults }
+        : { enabled: false },
       next: parsed.nextRecordPosition
         ? `/api/ingest-all?startRecord=${parsed.nextRecordPosition}&maximumRecords=${maximumRecords}&include_verdrag=${includeVerdrag ? 1 : 0}&ingest=${doIngest ? 1 : 0}&limit=${limit}&offset=${offset}&maxCalls=${maxCalls}`
         : null,
