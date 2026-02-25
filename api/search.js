@@ -221,7 +221,7 @@ const rpcResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`, {
   body: JSON.stringify({
   query_embedding: qvec,
   match_count: 8,
-  ...(detected?.id ? { doc_filter: detected.id } : {})
+  doc_filter: detected?.id || null
 })
 });
 
