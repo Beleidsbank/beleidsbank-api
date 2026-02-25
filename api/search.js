@@ -184,83 +184,64 @@ module.exports = async (req, res) => {
     }
 
     // -------------------------
-    // SEMANTIC FALLBACK (MVP)
-    // -------------------------
-    const embResp = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_KEY}`
-      },
-      body: JSON.stringify({
-        model: "text-embedding-3-small",
-        input: q
-      })
-    });
+// SEMANTIC FALLBACK (VECTOR DB)
+// -------------------------
+const embResp = await fetch("https://api.openai.com/v1/embeddings", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${OPENAI_KEY}`
+  },
+  body: JSON.stringify({
+    model: "text-embedding-3-small",
+    input: q
+  })
+});
 
-    const embText = await embResp.text();
-    const embJson = safeJsonParse(embText);
-    if (!embResp.ok || !embJson?.data?.[0]?.embedding) {
-      return res.status(500).json({ error: "Embedding failed", details: embJson || embText });
-    }
-    const qvec = embJson.data[0].embedding;
+const embText = await embResp.text();
+const embJson = safeJsonParse(embText);
 
-    // filter op doc_id als detected
-    const chunkUrl = detected?.id
-      ? `${SUPABASE_URL}/rest/v1/chunks?select=id,doc_id,label,text,source_url,embedding&doc_id=eq.${encodeURIComponent(detected.id)}&limit=5000`
-      : `${SUPABASE_URL}/rest/v1/chunks?select=id,doc_id,label,text,source_url,embedding&limit=5000`;
+if (!embResp.ok || !embJson?.data?.[0]?.embedding) {
+  return res.status(500).json({ error: "Embedding failed", details: embJson || embText });
+}
 
-    const rowsResp = await fetch(chunkUrl, {
-      headers: { apikey: SERVICE_KEY, Authorization: `Bearer ${SERVICE_KEY}` }
-    });
+const qvec = embJson.data[0].embedding;
 
-    const rows = await rowsResp.json();
-    if (!rowsResp.ok) return res.status(500).json({ error: "Supabase fetch failed", details: rows });
+// 🔥 Supabase vector RPC call
+const rpcResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    apikey: SERVICE_KEY,
+    Authorization: `Bearer ${SERVICE_KEY}`
+  },
+  body: JSON.stringify({
+    query_embedding: qvec,
+    match_count: 8
+  })
+});
 
-    function cosine(a,b){
-      let dot=0, na=0, nb=0;
-      for(let i=0;i<a.length;i++){
-        dot+=a[i]*b[i];
-        na+=a[i]*a[i];
-        nb+=b[i]*b[i];
-      }
-      return dot/(Math.sqrt(na)*Math.sqrt(nb));
-    }
+const rows = await rpcResp.json();
 
-    function toVec(v){
-      if(Array.isArray(v)) return v;
-      if(typeof v==="string"){
-        try { return JSON.parse(v); } catch { return null; }
-      }
-      return null;
-    }
+if (!rpcResp.ok) {
+  return res.status(500).json({ error: "Vector search failed", details: rows });
+}
 
-    const ranked = rows
-      .map(r=>{
-        const emb = toVec(r.embedding);
-        if(!emb) return null;
-        const sim = cosine(qvec, emb);
-        return {...r, similarity: sim};
-      })
-      .filter(Boolean)
-      .sort((a,b)=>b.similarity-a.similarity)
-      .slice(0,8);
-
-    return res.status(200).json({
-      ok: true,
-      query: q,
-      mode: "semantic",
-      detected_document: detected ? { id: detected.id, title: detected.title, score: detected.score } : null,
-      results: ranked.map((r,i)=>({
-        id: r.id,
-        n: i+1,
-        label: r.label,
-        doc_id: r.doc_id,
-        similarity: r.similarity,
-        source_url: r.source_url,
-        excerpt: (r.text||"").slice(0,1200)
-      }))
-    });
+return res.status(200).json({
+  ok: true,
+  query: q,
+  mode: "semantic",
+  detected_document: detected ? { id: detected.id, title: detected.title, score: detected.score } : null,
+  results: (rows || []).map((r,i)=>({
+    id: r.id,
+    n: i+1,
+    label: r.label,
+    doc_id: r.doc_id,
+    similarity: r.similarity,
+    source_url: r.source_url,
+    excerpt: (r.text||"").slice(0,1200)
+  }))
+});
 
   } catch(e){
     return res.status(500).json({ error:"search crashed", details:String(e?.message||e) });
