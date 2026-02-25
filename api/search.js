@@ -216,9 +216,10 @@ const rpcResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`, {
     Authorization: `Bearer ${SERVICE_KEY}`
   },
   body: JSON.stringify({
-    query_embedding: qvec,
-    match_count: 8
-  })
+  query_embedding: qvec,
+  match_count: 8,
+  ...(detected?.id ? { doc_filter: detected.id } : {})
+})
 });
 
 const rows = await rpcResp.json();
