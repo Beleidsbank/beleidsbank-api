@@ -186,6 +186,47 @@ module.exports = async (req, res) => {
       // anders: val door naar semantisch
     }
 
+    // Definities-prioriteit (Awb art. 1:3) voor korte "wat is ..." vragen
+const qn = normalizeText(q);
+const isDefinitionQ =
+  qn.startsWith("wat is ") ||
+  qn.startsWith("wat betekent ") ||
+  qn.includes(" definitie ") ||
+  qn.startsWith("definieer ");
+
+if (isDefinitionQ && !requestedArticle) {
+  const wantsBesluit =
+    /\bbesluit\b/.test(qn) || /\bbeschikking\b/.test(qn) || /\bbeleidsregel\b/.test(qn) || /\baanvraag\b/.test(qn);
+
+  if (wantsBesluit) {
+    const candidates = await supabaseExactArticleCandidates({
+      supabaseUrl: SUPABASE_URL,
+      serviceKey: SERVICE_KEY,
+      article: "1:3",
+      docId: "BWBR0005537" // Awb
+    });
+
+    const exactHits = strictFilterExactArticle(candidates, "1:3");
+    if (exactHits.length) {
+      return res.status(200).json({
+        ok: true,
+        query: q,
+        mode: "definition-priority-awb-1:3",
+        detected_document: { id: "BWBR0005537", title: "Awb", score: 999 },
+        results: exactHits.slice(0, 8).map((r, i) => ({
+          id: r.id,
+          n: i + 1,
+          label: r.label,
+          doc_id: r.doc_id,
+          similarity: 999,
+          source_url: r.source_url,
+          excerpt: (r.text || "").slice(0, 1200)
+        }))
+      });
+    }
+  }
+}
+
     // -------------------------
 // SEMANTIC FALLBACK (VECTOR DB)
 // -------------------------
