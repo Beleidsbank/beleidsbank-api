@@ -65,6 +65,9 @@ function pickBestDocument(question, documents){
 
     // harde boost als "awb" in vraag en title bevat "algemene wet bestuursrecht"
     if (qWords.has("awb") && tn.includes("algemene wet bestuursrecht")) score += 50;
+    // harde match: korte wetnaam exact in title of id
+if (qWords.has("awb") && /bwbr0005537/i.test(d.id)) score += 100;
+if (qWords.has("omgevingswet") && /bwbr0037885/i.test(d.id)) score += 100;
 
     // algemene woord-overlap
     for (const w of tWords){
