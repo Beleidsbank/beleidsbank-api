@@ -209,16 +209,33 @@ module.exports = async (req, res) => {
       });
     }
 
-    // 3) Upsert document (FK basis) — GEEN 'type'
-    await supabaseUpsertDocument({
-      supabaseUrl: SUPABASE_URL,
-      serviceKey: SERVICE_KEY,
-      doc: {
-        id,
-        title: docShort,
-        source_url: sourceUrl
-      }
-    });
+    // 1️⃣ Embed document title
+const docEmbeddingResp = await fetch("https://api.openai.com/v1/embeddings", {
+  method: "POST",
+  headers: {
+    "Content-Type":"application/json",
+    "Authorization":`Bearer ${OPENAI_API_KEY}`
+  },
+  body: JSON.stringify({
+    model: "text-embedding-3-small",
+    input: docShort
+  })
+});
+
+const docEmbeddingJson = await docEmbeddingResp.json();
+const docEmbedding = docEmbeddingJson?.data?.[0]?.embedding;
+
+// 2️⃣ Upsert document inclusief embedding
+await supabaseUpsertDocument({
+  supabaseUrl: SUPABASE_URL,
+  serviceKey: SERVICE_KEY,
+  doc: {
+    id,
+    title: docShort,
+    source_url: sourceUrl,
+    embedding: docEmbedding
+  }
+});
 
     // 4) Embeddings
     const embeddings = await embedBatch(batch, OPENAI_API_KEY);
