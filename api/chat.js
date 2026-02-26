@@ -100,7 +100,7 @@ Regels die je moet hanteren:
 - Gebruik ALLEEN de bronpassages.
 - ELKE zin eindigt met een bronverwijzing zoals [1] of [1][2].
 - Noem geen jurisprudentie/voorbeelden tenzij dit letterlijk in de passages staat.
-- Als het niet in de passages staat: zeg "Dit staat niet in de beschikbare wetstekst." [1]
+- Als het niet in de passages staat: zeg exact: "Dit staat niet in de beschikbare wetstekst." (zonder bronverwijzing)
 - Antwoord compact.
 `.trim();
 
