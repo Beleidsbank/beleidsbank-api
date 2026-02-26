@@ -246,7 +246,14 @@ const embText = await embResp.text();
 const embJson = safeJsonParse(embText);
 
 if (!embResp.ok || !embJson?.data?.[0]?.embedding) {
-  return res.status(500).json({ error: "Embedding failed", details: embJson || embText });
+  return res.status(200).json({
+  ok: true,
+  query: q,
+  mode: "semantic-error",
+  detected_document: detected ? { id: detected.id, title: detected.title, score: detected.score } : null,
+  results: [],
+  note: "Embedding tijdelijk mislukt"
+});
 }
 
 const qvec = embJson.data[0].embedding;
@@ -269,7 +276,14 @@ const rpcResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`, {
 const rows = await rpcResp.json();
 
 if (!rpcResp.ok) {
-  return res.status(500).json({ error: "Vector search failed", details: rows });
+ return res.status(200).json({
+  ok: true,
+  query: q,
+  mode: "semantic-error",
+  detected_document: detected ? { id: detected.id, title: detected.title, score: detected.score } : null,
+  results: [],
+  note: "Vector search tijdelijk mislukt"
+});
 }
 
 return res.status(200).json({
