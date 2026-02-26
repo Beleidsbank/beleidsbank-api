@@ -102,6 +102,7 @@ Regels die je moet hanteren:
 - Noem geen jurisprudentie/voorbeelden tenzij dit letterlijk in de passages staat.
 - Als het niet in de passages staat: zeg exact: "Dit staat niet in de beschikbare wetstekst." (zonder bronverwijzing)
 - Antwoord compact.
+- Alle andere zinnen moeten wél eindigen met [1], [2], ...
 `.trim();
 
     const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
