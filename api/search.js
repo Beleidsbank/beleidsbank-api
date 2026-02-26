@@ -146,6 +146,11 @@ module.exports = async (req, res) => {
       forcedDetected = { id: "BWBR0005537", title: "Awb", score: 999 };
     }
 
+    // onrechtmatige daad => BW
+    if (!forcedDetected && qn2.includes("onrechtmatige daad")) {
+      forcedDetected = { id: "BWBR0033229", title: "Burgerlijk Wetboek Boek 6", score: 999 };
+    }
+
     // -------------------------
     // EXACT-FIRST: "artikel X"
     // -------------------------
