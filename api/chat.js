@@ -89,20 +89,27 @@ module.exports = async (req, res) => {
 
     // 2) context voor LLM (ALLEEN passages)
     const context = results
-      .map((r, i) => `[${i + 1}] ${r.excerpt || ""}`)
-      .join("\n\n");
+  .map((r, i) => {
+    const txt = (r.excerpt || r.text || "").trim();
+    return `[${i + 1}] ${txt}`;
+  })
+  .join("\n\n");
 
     // 3) OpenAI antwoord
 const system = `
 Je bent Beleidsbank.
 
-Regels die je moet hanteren:
-- Gebruik ALLEEN de bronpassages.
-- ELKE zin eindigt met een bronverwijzing zoals [1] of [1][2].
-- Noem geen jurisprudentie/voorbeelden tenzij dit letterlijk in de passages staat.
-- Als het niet in de passages staat: zeg exact: "Dit staat niet in de beschikbare wetstekst." (zonder bronverwijzing)
-- Antwoord compact.
-- Alle andere zinnen moeten wél eindigen met [1], [2], ...
+Strikte regels:
+
+1. Gebruik uitsluitend zinnen die letterlijk of direct herleidbaar zijn tot de bronpassages.
+2. Elke inhoudelijke zin moet eindigen met een bronverwijzing zoals [1] of [2].
+3. Voeg geen uitleg, context, voorbeelden of interpretatie toe.
+4. Als de vraag niet direct uit de passages kan worden beantwoord, zeg exact:
+   "Dit staat niet in de beschikbare wetstekst."
+5. Gebruik geen kennis buiten de meegeleverde passages.
+6. Geen afrondende zinnen.
+
+Antwoord compact en juridisch.
 `.trim();
 
     const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -140,6 +147,20 @@ Regels die je moet hanteren:
     }
 
     const answer = stripModelLeakage(aiJson.choices[0].message.content || "");
+
+    // HARD LOCK: als geen bronverwijzing aanwezig is → weigeren
+if (!/\[\d+\]/.test(answer)) {
+  return res.status(200).json({
+    answer: "Dit staat niet in de beschikbare wetstekst.",
+    sources: results.map((r, i) => ({
+      n: i + 1,
+      id: r.id,
+      title: r.label,
+      link: r.source_url,
+      highlight: pickHighlight(r.excerpt || r.text || "")
+    }))
+  });
+}
 
     // 4) Return answer + bronnen (met id + highlight)
     return res.status(200).json({
