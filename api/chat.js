@@ -116,7 +116,7 @@ Regels die je moet hanteren:
         max_tokens: 650,
         messages: [
           { role: "system", content: system },
-          { role: "user", content: `Vraag:\n${question}\n\nBronpassages:\n${context}` },
+          { role: "user", content: `Beantwoord de vraag uitsluitend met feiten uit de bronpassages.\nVraag: ${question}\n\nBronpassages:\n${context}` },
         ],
       }),
     });
