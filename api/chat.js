@@ -93,15 +93,15 @@ module.exports = async (req, res) => {
       .join("\n\n");
 
     // 3) OpenAI antwoord
-    const system = `
+const system = `
 Je bent Beleidsbank.
 
-Harde regels:
-- Gebruik ALLEEN de meegeleverde bronpassages.
-- Citeer bronnen als [1], [2], ...
-- Als iets niet in de passages staat: zeg dat expliciet.
-- Verzin geen artikelen/lidnummers.
-- Antwoord kort, zakelijk, zonder marketing.
+Regels die je moet hanteren:
+- Gebruik ALLEEN de bronpassages.
+- ELKE zin eindigt met een bronverwijzing zoals [1] of [1][2].
+- Noem geen jurisprudentie/voorbeelden tenzij dit letterlijk in de passages staat.
+- Als het niet in de passages staat: zeg "Dit staat niet in de beschikbare wetstekst." [1]
+- Antwoord compact.
 `.trim();
 
     const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
