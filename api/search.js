@@ -1,7 +1,7 @@
 // beleidsbank-api/api/search.js
 // Generic search (evidence-first):
 // 1) Exact-first voor "artikel X" met strikte doc-filter als wet genoemd wordt
-// 2) Fallback semantisch (MVP)
+// 2) Fallback semantisch (VECTOR DB via Supabase RPC)
 //
 // Output: { ok, query, mode, detected_document, results: [...] }
 
@@ -44,7 +44,6 @@ async function supabaseFetchDocuments({ supabaseUrl, serviceKey }){
 // - woord-overlap (middel)
 function pickBestDocument(question, documents){
   const qn = normalizeText(question);
-
   let best = null;
 
   for (const d of documents){
@@ -57,17 +56,15 @@ function pickBestDocument(question, documents){
     // 1) exacte title substring in vraag
     if (qn.includes(tn)) score += 10;
 
-    // 2) afkorting match: neem eerste "woord" van title als kandidaat, plus veelgebruikte afkortingen
-    // Specifiek: "awb" komt niet altijd als volledige title voor, maar wel als afkorting.
-    // We doen generiek: als query een los woord heeft dat ook in title voorkomt, zwaar meetellen.
     const qWords = new Set(qn.split(" "));
     const tWords = new Set(tn.split(" "));
 
     // harde boost als "awb" in vraag en title bevat "algemene wet bestuursrecht"
     if (qWords.has("awb") && tn.includes("algemene wet bestuursrecht")) score += 50;
-    // harde match: korte wetnaam exact in title of id
-if (qWords.has("awb") && /bwbr0005537/i.test(d.id)) score += 100;
-if (qWords.has("omgevingswet") && /bwbr0037885/i.test(d.id)) score += 100;
+
+    // harde match op bekende IDs (fix voor rare titles)
+    if (qWords.has("awb") && /bwbr0005537/i.test(d.id)) score += 100;
+    if (qWords.has("omgevingswet") && /bwbr0037885/i.test(d.id)) score += 100;
 
     // algemene woord-overlap
     for (const w of tWords){
@@ -79,9 +76,6 @@ if (qWords.has("omgevingswet") && /bwbr0037885/i.test(d.id)) score += 100;
     }
   }
 
-  // Drempel:
-  // - als query expliciet 'awb' bevat, verwachten we score >= 20 (door de harde boost)
-  // - anders is >= 6 meestal ok
   const qnHasAwb = normalizeText(question).split(" ").includes("awb");
   const threshold = qnHasAwb ? 20 : 6;
 
@@ -137,30 +131,44 @@ module.exports = async (req, res) => {
     const detected = pickBestDocument(q, documents);
 
     // -------------------------
+    // FORCED ROUTING (klein, direct effect)
+    // -------------------------
+    let forcedDetected = detected;
+    const qn2 = normalizeText(q);
+
+    // omgevingsplan => Omgevingswet
+    if (!forcedDetected && qn2.includes("omgevingsplan")) {
+      forcedDetected = { id: "BWBR0037885", title: "Omgevingswet", score: 999 };
+    }
+
+    // bestuursorgaan => Awb
+    if (!forcedDetected && qn2.includes("bestuursorgaan")) {
+      forcedDetected = { id: "BWBR0005537", title: "Awb", score: 999 };
+    }
+
+    // -------------------------
     // EXACT-FIRST: "artikel X"
     // -------------------------
     const requestedArticle = extractRequestedArticle(q);
     if (requestedArticle) {
-      // ✅ Als we een document detecteren: verplicht filteren op doc_id
       const candidates = await supabaseExactArticleCandidates({
         supabaseUrl: SUPABASE_URL,
         serviceKey: SERVICE_KEY,
         article: requestedArticle,
-        docId: detected?.id || null
+        docId: forcedDetected?.id || null
       });
 
       const exactHits = strictFilterExactArticle(candidates, requestedArticle);
 
-      // ✅ Als wet expliciet genoemd is (bv 'awb') en detected null -> we moeten NIET cross-wet antwoorden.
       const qWords = new Set(normalizeText(q).split(" "));
-      const explicitLawMentioned = qWords.has("awb"); // later uitbreiden, maar dit fixt jouw issue direct
+      const explicitLawMentioned = qWords.has("awb") || qWords.has("omgevingswet");
 
       if (exactHits.length) {
         return res.status(200).json({
           ok: true,
           query: q,
           mode: "exact-article",
-          detected_document: detected ? { id: detected.id, title: detected.title, score: detected.score } : null,
+          detected_document: forcedDetected ? { id: forcedDetected.id, title: forcedDetected.title, score: forcedDetected.score } : null,
           results: exactHits.slice(0, 8).map((r, i) => ({
             id: r.id,
             n: i + 1,
@@ -174,133 +182,136 @@ module.exports = async (req, res) => {
       }
 
       if (explicitLawMentioned) {
-        // Als user "Awb" zegt maar we vinden niets exact, dan geen andere wetten teruggeven.
         return res.status(200).json({
           ok: true,
           query: q,
           mode: "exact-article-not-found",
-          detected_document: detected ? { id: detected.id, title: detected.title, score: detected.score } : null,
+          detected_document: forcedDetected ? { id: forcedDetected.id, title: forcedDetected.title, score: forcedDetected.score } : null,
           results: []
         });
       }
       // anders: val door naar semantisch
     }
 
-    // Definities-prioriteit (Awb art. 1:3) voor korte "wat is ..." vragen
-const qn = normalizeText(q);
-const isDefinitionQ =
-  qn.startsWith("wat is ") ||
-  qn.startsWith("wat betekent ") ||
-  qn.includes(" definitie ") ||
-  qn.startsWith("definieer ");
+    // -------------------------
+    // DEFINITIE-PRIORITEIT (Awb art. 1:3)
+    // -------------------------
+    const qn = normalizeText(q);
+    const isDefinitionQ =
+      qn.startsWith("wat is ") ||
+      qn.startsWith("wat betekent ") ||
+      qn.includes(" definitie ") ||
+      qn.startsWith("definieer ");
 
-if (isDefinitionQ && !requestedArticle) {
-  const wantsBesluit =
-    /\bbesluit\b/.test(qn) || /\bbeschikking\b/.test(qn) || /\bbeleidsregel\b/.test(qn) || /\baanvraag\b/.test(qn);
+    if (isDefinitionQ && !requestedArticle) {
+      const wantsBesluit =
+        /\bbesluit\b/.test(qn) ||
+        /\bbeschikking\b/.test(qn) ||
+        /\bbeleidsregel\b/.test(qn) ||
+        /\baanvraag\b/.test(qn);
 
-  if (wantsBesluit) {
-    const candidates = await supabaseExactArticleCandidates({
-      supabaseUrl: SUPABASE_URL,
-      serviceKey: SERVICE_KEY,
-      article: "1:3",
-      docId: "BWBR0005537" // Awb
+      if (wantsBesluit) {
+        const candidates = await supabaseExactArticleCandidates({
+          supabaseUrl: SUPABASE_URL,
+          serviceKey: SERVICE_KEY,
+          article: "1:3",
+          docId: "BWBR0005537" // Awb
+        });
+
+        const exactHits = strictFilterExactArticle(candidates, "1:3");
+        if (exactHits.length) {
+          return res.status(200).json({
+            ok: true,
+            query: q,
+            mode: "definition-priority-awb-1:3",
+            detected_document: { id: "BWBR0005537", title: "Awb", score: 999 },
+            results: exactHits.slice(0, 8).map((r, i) => ({
+              id: r.id,
+              n: i + 1,
+              label: r.label,
+              doc_id: r.doc_id,
+              similarity: 999,
+              source_url: r.source_url,
+              excerpt: (r.text || "").slice(0, 1200)
+            }))
+          });
+        }
+      }
+    }
+
+    // -------------------------
+    // SEMANTIC FALLBACK (VECTOR DB)
+    // -------------------------
+    const embResp = await fetch("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_KEY}`
+      },
+      body: JSON.stringify({
+        model: "text-embedding-3-small",
+        input: q
+      })
     });
 
-    const exactHits = strictFilterExactArticle(candidates, "1:3");
-    if (exactHits.length) {
+    const embText = await embResp.text();
+    const embJson = safeJsonParse(embText);
+
+    if (!embResp.ok || !embJson?.data?.[0]?.embedding) {
       return res.status(200).json({
         ok: true,
         query: q,
-        mode: "definition-priority-awb-1:3",
-        detected_document: { id: "BWBR0005537", title: "Awb", score: 999 },
-        results: exactHits.slice(0, 8).map((r, i) => ({
-          id: r.id,
-          n: i + 1,
-          label: r.label,
-          doc_id: r.doc_id,
-          similarity: 999,
-          source_url: r.source_url,
-          excerpt: (r.text || "").slice(0, 1200)
-        }))
+        mode: "semantic-error",
+        detected_document: forcedDetected ? { id: forcedDetected.id, title: forcedDetected.title, score: forcedDetected.score } : null,
+        results: [],
+        note: "Embedding tijdelijk mislukt"
       });
     }
-  }
-}
 
-    // -------------------------
-// SEMANTIC FALLBACK (VECTOR DB)
-// -------------------------
-const embResp = await fetch("https://api.openai.com/v1/embeddings", {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${OPENAI_KEY}`
-  },
-  body: JSON.stringify({
-    model: "text-embedding-3-small",
-    input: q
-  })
-});
+    const qvec = embJson.data[0].embedding;
 
-const embText = await embResp.text();
-const embJson = safeJsonParse(embText);
+    const rpcResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SERVICE_KEY,
+        Authorization: `Bearer ${SERVICE_KEY}`
+      },
+      body: JSON.stringify({
+        query_embedding: qvec,
+        match_count: 12,
+        doc_filter: forcedDetected?.id || null
+      })
+    });
 
-if (!embResp.ok || !embJson?.data?.[0]?.embedding) {
-  return res.status(200).json({
-  ok: true,
-  query: q,
-  mode: "semantic-error",
-  detected_document: detected ? { id: detected.id, title: detected.title, score: detected.score } : null,
-  results: [],
-  note: "Embedding tijdelijk mislukt"
-});
-}
+    const rows = await rpcResp.json();
 
-const qvec = embJson.data[0].embedding;
+    if (!rpcResp.ok) {
+      return res.status(200).json({
+        ok: true,
+        query: q,
+        mode: "semantic-error",
+        detected_document: forcedDetected ? { id: forcedDetected.id, title: forcedDetected.title, score: forcedDetected.score } : null,
+        results: [],
+        note: "Vector search tijdelijk mislukt"
+      });
+    }
 
-// 🔥 Supabase vector RPC call
-const rpcResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`, {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    apikey: SERVICE_KEY,
-    Authorization: `Bearer ${SERVICE_KEY}`
-  },
-  body: JSON.stringify({
-  query_embedding: qvec,
-  match_count: 30,
-  doc_filter: detected?.id || null
-})
-});
-
-const rows = await rpcResp.json();
-
-if (!rpcResp.ok) {
- return res.status(200).json({
-  ok: true,
-  query: q,
-  mode: "semantic-error",
-  detected_document: detected ? { id: detected.id, title: detected.title, score: detected.score } : null,
-  results: [],
-  note: "Vector search tijdelijk mislukt"
-});
-}
-
-return res.status(200).json({
-  ok: true,
-  query: q,
-  mode: "semantic",
-  detected_document: detected ? { id: detected.id, title: detected.title, score: detected.score } : null,
-  results: (rows || []).map((r,i)=>({
-    id: r.id,
-    n: i+1,
-    label: r.label,
-    doc_id: r.doc_id,
-    similarity: r.similarity,
-    source_url: r.source_url,
-    excerpt: (r.text||"").slice(0,1200)
-  }))
-});
+    return res.status(200).json({
+      ok: true,
+      query: q,
+      mode: "semantic",
+      detected_document: forcedDetected ? { id: forcedDetected.id, title: forcedDetected.title, score: forcedDetected.score } : null,
+      results: (rows || []).map((r,i)=>({
+        id: r.id,
+        n: i+1,
+        label: r.label,
+        doc_id: r.doc_id,
+        similarity: r.similarity,
+        source_url: r.source_url,
+        excerpt: (r.text||"").slice(0,1200)
+      }))
+    });
 
   } catch(e){
     return res.status(500).json({ error:"search crashed", details:String(e?.message||e) });
