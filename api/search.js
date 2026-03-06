@@ -28,22 +28,42 @@ module.exports = async (req, res) => {
       return res.json({ ok:false, results:[] });
     }
 
-    // zoek op eerste woord (bijv "besluit")
     const keyword = words[0];
 
-    const url =
-      `${SUPABASE_URL}/rest/v1/chunks` +
-      `?select=id,label,text,source_url` +
-      `&text=ilike.*${encodeURIComponent(keyword)}*` +
-      `&limit=8`;
+// definities eerst uit Awb halen
+const awbUrl =
+  `${SUPABASE_URL}/rest/v1/chunks` +
+  `?select=id,label,text,source_url` +
+  `&doc_id=eq.BWBR0005537` +
+  `&text=ilike.*${encodeURIComponent(keyword)}*` +
+  `&limit=5`;
 
-    const resp = await fetch(url,{
-      headers:{
-        apikey:SERVICE_KEY,
-        Authorization:`Bearer ${SERVICE_KEY}`
-      }
-    });
+const respAwb = await fetch(awbUrl,{
+  headers:{
+    apikey:SERVICE_KEY,
+    Authorization:`Bearer ${SERVICE_KEY}`
+  }
+});
 
+let rows = await respAwb.json();
+
+if(!rows || rows.length === 0){
+
+  const url =
+    `${SUPABASE_URL}/rest/v1/chunks` +
+    `?select=id,label,text,source_url` +
+    `&text=ilike.*${encodeURIComponent(keyword)}*` +
+    `&limit=8`;
+
+  const resp = await fetch(url,{
+    headers:{
+      apikey:SERVICE_KEY,
+      Authorization:`Bearer ${SERVICE_KEY}`
+    }
+  });
+
+  rows = await resp.json();
+}
     const rows = await resp.json();
 
     const results = (rows || []).map(r => ({
