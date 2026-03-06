@@ -1,95 +1,37 @@
 module.exports = async (req, res) => {
-
   try {
-
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
     const q = (req.query.q || "").toString().trim();
+    if (!q) return res.json({ ok: false, error: "missing query" });
 
-    if (!q) {
-      return res.status(400).json({ ok:false, error:"missing query"});
-    }
+    // Gebruik Postgres full-text search (snel en geschikt voor wetstekst)
+    const url =
+      `${SUPABASE_URL}/rest/v1/chunks` +
+      `?select=id,label,text,source_url` +
+      `&text=fts.${encodeURIComponent(q)}` +
+      `&limit=8`;
 
-    // 1️⃣ embedding maken
-    const embResp = await fetch("https://api.openai.com/v1/embeddings",{
-      method:"POST",
-      headers:{
-        "Content-Type":"application/json",
-        Authorization:`Bearer ${OPENAI_KEY}`
+    const resp = await fetch(url, {
+      headers: {
+        apikey: SERVICE_KEY,
+        Authorization: `Bearer ${SERVICE_KEY}`,
       },
-      body:JSON.stringify({
-        model:"text-embedding-3-small",
-        input:q
-      })
     });
 
-    const embJson = await embResp.json();
-    const embedding = embJson?.data?.[0]?.embedding;
+    const rows = await resp.json();
 
-    if(!embedding){
-      return res.status(500).json({ ok:false, error:"embedding failed"});
-    }
-
-    // 2️⃣ Supabase vector search (RPC)
-    const supaResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`,{
-      method:"POST",
-      headers:{
-        "Content-Type":"application/json",
-        apikey:SERVICE_KEY,
-        Authorization:`Bearer ${SERVICE_KEY}`
-      },
-      body:JSON.stringify({
-        query_embedding: embedding,
-        match_count: 5,
-        doc_filter: null
-      })
-    });
-
-    const text = await supaResp.text();
-    let data;
-
-    try {
-      data = JSON.parse(text);
-    } catch {
-      return res.status(500).json({
-        ok:false,
-        error:"supabase response parse failed",
-        preview:text.slice(0,200)
-      });
-    }
-
-    if(!supaResp.ok){
-      return res.status(500).json({
-        ok:false,
-        error:"vector search failed",
-        details:data
-      });
-    }
-
-    const results = (data || []).map(r => ({
-      id:r.id,
-      label:r.label,
-      text:r.text,
-      excerpt:r.text,
-      source_url:r.source_url
+    const results = (Array.isArray(rows) ? rows : []).map((r) => ({
+      id: r.id,
+      label: r.label,
+      text: r.text,
+      excerpt: r.text,
+      source_url: r.source_url,
     }));
 
-    return res.json({
-      ok:true,
-      results
-    });
-
+    return res.json({ ok: true, results });
+  } catch (e) {
+    return res.json({ ok: false, error: String(e) });
   }
-
-  catch(e){
-
-    return res.status(500).json({
-      ok:false,
-      error:String(e)
-    });
-
-  }
-
 };
