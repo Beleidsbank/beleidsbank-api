@@ -89,8 +89,9 @@ module.exports = async (req, res) => {
     });
 
     const rows = await rpcResp.json();
+const results = Array.isArray(rows) ? rows : [];
 
-    const filtered = (rows || []).filter(r => r.similarity > 0.78);
+const filtered = results.filter(r => r.similarity > 0.78);
 
     if (!filtered.length) {
       return res.status(200).json({
