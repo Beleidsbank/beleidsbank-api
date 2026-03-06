@@ -58,7 +58,7 @@ module.exports = async (req, res) => {
       },
       body: JSON.stringify({
         query_embedding: qvec,
-        match_count: 1
+        match_count: 12
       })
     });
 
@@ -83,7 +83,7 @@ if (docRows?.[0]?.similarity > 0.65) {
       },
       body: JSON.stringify({
         query_embedding: qvec,
-        match_count: 8,
+        match_count: 12,
         doc_filter: routedDocId
       })
     });
@@ -91,7 +91,7 @@ if (docRows?.[0]?.similarity > 0.65) {
     const rows = await rpcResp.json();
 const results = Array.isArray(rows) ? rows : [];
 
-const filtered = results.filter(r => r.similarity > 0.55);
+const filtered = results;
 
     if (!filtered.length) {
       return res.status(200).json({
