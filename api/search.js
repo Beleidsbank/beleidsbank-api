@@ -63,7 +63,11 @@ module.exports = async (req, res) => {
 
     const docRows = await docResp.json();
 
-    const routedDocId = docRows?.[0]?.id || null;
+    let routedDocId = null;
+
+if (docRows?.[0]?.similarity > 0.55) {
+  routedDocId = docRows[0].id;
+}
 
     // -------------------------
     // CHUNK VECTOR SEARCH
@@ -78,23 +82,25 @@ module.exports = async (req, res) => {
       },
       body: JSON.stringify({
         query_embedding: qvec,
-        match_count: 12,
+        match_count: 8,
         doc_filter: routedDocId
       })
     });
 
     const rows = await rpcResp.json();
 
-    if (!rows || !rows.length) {
-      return res.status(200).json({
-        ok: true,
-        query: q,
-        results: [],
-        note: "Geen relevante wetgeving gevonden"
-      });
-    }
+    const filtered = (rows || []).filter(r => r.similarity > 0.78);
+    
+    if (!filtered.length) {
+  return res.status(200).json({
+    ok: true,
+    query: q,
+    results: [],
+    note: "Geen relevante wetgeving gevonden"
+  });
+}
 
-    return res.status(200).json({
+    results: filtered.map((r,i)=>({
       ok: true,
       query: q,
       routed_document: docRows?.[0] || null,
