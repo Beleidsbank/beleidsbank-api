@@ -82,10 +82,10 @@ if (docRows?.[0]?.similarity > 0.65) {
         Authorization: `Bearer ${SERVICE_KEY}`
       },
       body: JSON.stringify({
-        query_embedding: qvec,
-        match_count: 12,
-        doc_filter: routedDocId
-      })
+  query_embedding: qvec,
+  match_count: 8,
+  doc_filter: routedDocId ?? null
+})
     });
 
     const rows = await rpcResp.json();
