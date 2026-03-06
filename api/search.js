@@ -1,55 +1,11 @@
 module.exports = async (req, res) => {
 
-  res.setHeader("Access-Control-Allow-Origin", "https://app.beleidsbank.nl");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  if (req.method === "OPTIONS") return res.status(200).end();
-
   try {
 
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
-    const q = (req.query.q || "").toString().trim();
-
-    if (!q) {
-      return res.status(400).json({ error: "missing query" });
-    }
-
-    // -------------------------
-    // EMBEDDING
-    // -------------------------
-
-    const embResp = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_KEY}`
-      },
-      body: JSON.stringify({
-        model: "text-embedding-3-small",
-        input: q
-      })
-    });
-
-    const embJson = await embResp.json();
-
-    if (!embJson?.data?.[0]?.embedding) {
-      return res.status(500).json({
-        ok:false,
-        error:"embedding failed"
-      });
-    }
-
-    const qvec = embJson.data[0].embedding;
-
-    // -------------------------
-    // CHUNK VECTOR SEARCH
-    // -------------------------
-
-    const rpcResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`, {
+    const test = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -57,55 +13,30 @@ module.exports = async (req, res) => {
         Authorization: `Bearer ${SERVICE_KEY}`
       },
       body: JSON.stringify({
-        query_embedding: qvec,
-        match_count: 20,
+        query_embedding: (await fetch("https://api.openai.com/v1/embeddings", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+          },
+          body: JSON.stringify({
+            model: "text-embedding-3-small",
+            input: "besluit"
+          })
+        }).then(r => r.json())).data[0].embedding,
+        match_count: 5,
         doc_filter: null
       })
     });
 
-    const rpcJson = await rpcResp.json();
+    const json = await test.json();
 
-let results = [];
-
-if (Array.isArray(rpcJson)) {
-  results = rpcJson;
-} else if (rpcJson?.data && Array.isArray(rpcJson.data)) {
-  results = rpcJson.data;
-}
-
-    if (!results.length) {
-      return res.status(200).json({
-        ok:true,
-        query:q,
-        results:[],
-        note:"Geen relevante wetgeving gevonden"
-      });
-    }
-
-    return res.status(200).json({
-      ok:true,
-      query:q,
-      results: results.map((r,i)=>({
-        id:r.id,
-        n:i+1,
-        label:r.label,
-        doc_id:r.doc_id,
-        similarity:r.similarity,
-        source_url:r.source_url,
-        excerpt:(r.text||"").slice(0,1200)
-      }))
-    });
+    return res.json(json);
 
   }
 
   catch(e){
-
-    return res.status(500).json({
-      ok:false,
-      error:"search crashed",
-      details:String(e?.message || e)
-    });
-
+    return res.json({ error: String(e) });
   }
 
 };
