@@ -18,9 +18,9 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: "missing query" });
     }
 
-    // -----------------------
+    // -------------------------
     // EMBEDDING
-    // -----------------------
+    // -------------------------
 
     const embResp = await fetch("https://api.openai.com/v1/embeddings", {
       method: "POST",
@@ -45,34 +45,9 @@ module.exports = async (req, res) => {
 
     const qvec = embJson.data[0].embedding;
 
-    // -----------------------
-    // DOCUMENT ROUTING
-    // -----------------------
-
-    const docResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_documents`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SERVICE_KEY,
-        Authorization: `Bearer ${SERVICE_KEY}`
-      },
-      body: JSON.stringify({
-        query_embedding: qvec,
-        match_count: 12
-      })
-    });
-
-    const docRows = await docResp.json();
-
-    let routedDocId = null;
-
-if (docRows?.[0]?.similarity > 0.65) {
-  routedDocId = docRows[0].id;
-}
-
-    // -----------------------
-    // CHUNK SEARCH
-    // -----------------------
+    // -------------------------
+    // CHUNK VECTOR SEARCH
+    // -------------------------
 
     const rpcResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`, {
       method: "POST",
@@ -82,18 +57,17 @@ if (docRows?.[0]?.similarity > 0.65) {
         Authorization: `Bearer ${SERVICE_KEY}`
       },
       body: JSON.stringify({
-  query_embedding: qvec,
-  match_count: 8,
-  doc_filter: routedDocId ?? null
-})
+        query_embedding: qvec,
+        match_count: 20,
+        doc_filter: null
+      })
     });
 
     const rows = await rpcResp.json();
-const results = Array.isArray(rows) ? rows : [];
 
-const filtered = results;
+    const results = Array.isArray(rows) ? rows : [];
 
-    if (!filtered.length) {
+    if (!results.length) {
       return res.status(200).json({
         ok:true,
         query:q,
@@ -103,14 +77,18 @@ const filtered = results;
     }
 
     return res.status(200).json({
-  ok: true,
-  query: q,
-  routed_document: docRows?.[0] || null,
-  routedDocId,
-  raw_docRows: docRows,
-  raw_rows: rows,
-  results: results
-});
+      ok:true,
+      query:q,
+      results: results.map((r,i)=>({
+        id:r.id,
+        n:i+1,
+        label:r.label,
+        doc_id:r.doc_id,
+        similarity:r.similarity,
+        source_url:r.source_url,
+        excerpt:(r.text||"").slice(0,1200)
+      }))
+    });
 
   }
 
