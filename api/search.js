@@ -1,4 +1,5 @@
 module.exports = async (req, res) => {
+
   try {
 
     const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -6,9 +7,12 @@ module.exports = async (req, res) => {
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
     const q = (req.query.q || "").toString().trim();
-    if (!q) return res.json({ ok:false, error:"missing query" });
 
-    // embedding maken
+    if (!q) {
+      return res.status(400).json({ ok:false, error:"missing query"});
+    }
+
+    // 1️⃣ embedding maken
     const embResp = await fetch("https://api.openai.com/v1/embeddings",{
       method:"POST",
       headers:{
@@ -24,40 +28,47 @@ module.exports = async (req, res) => {
     const embJson = await embResp.json();
     const embedding = embJson?.data?.[0]?.embedding;
 
-    if(!embedding) {
-      return res.json({ ok:false, error:"embedding failed"});
+    if(!embedding){
+      return res.status(500).json({ ok:false, error:"embedding failed"});
     }
 
-    // directe vector query (GEEN RPC)
-    const query = `
-      select id,label,text,source_url,
-      1 - (embedding <=> '[${embedding.join(",")}]') as similarity
-      from chunks
-      order by embedding <=> '[${embedding.join(",")}]'
-      limit 5
-    `;
-
-    const dbResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/query`,{
+    // 2️⃣ Supabase vector search (RPC)
+    const supaResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`,{
       method:"POST",
       headers:{
         "Content-Type":"application/json",
         apikey:SERVICE_KEY,
         Authorization:`Bearer ${SERVICE_KEY}`
       },
-      body:JSON.stringify({ query })
+      body:JSON.stringify({
+        query_embedding: embedding,
+        match_count: 5,
+        doc_filter: null
+      })
     });
 
-   const data = await dbResp.json();
+    const text = await supaResp.text();
+    let data;
 
-const rows = Array.isArray(data) ? data : (data?.data || []);
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return res.status(500).json({
+        ok:false,
+        error:"supabase response parse failed",
+        preview:text.slice(0,200)
+      });
+    }
 
-const results = rows.map(r => ({
-  id: r.id,
-  label: r.label,
-  text: r.text,
-  excerpt: r.text,
-  source_url: r.source_url
-}));
+    if(!supaResp.ok){
+      return res.status(500).json({
+        ok:false,
+        error:"vector search failed",
+        details:data
+      });
+    }
+
+    const results = (data || []).map(r => ({
       id:r.id,
       label:r.label,
       text:r.text,
@@ -73,9 +84,12 @@ const results = rows.map(r => ({
   }
 
   catch(e){
-    return res.json({
+
+    return res.status(500).json({
       ok:false,
       error:String(e)
     });
+
   }
+
 };
