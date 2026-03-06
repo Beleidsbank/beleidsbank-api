@@ -3,6 +3,7 @@ module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "https://app.beleidsbank.nl");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
   if (req.method === "OPTIONS") return res.status(200).end();
 
   try {
@@ -17,9 +18,9 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: "missing query" });
     }
 
-    // -------------------------
-    // EMBEDDING MAKEN
-    // -------------------------
+    // -----------------------
+    // EMBEDDING
+    // -----------------------
 
     const embResp = await fetch("https://api.openai.com/v1/embeddings", {
       method: "POST",
@@ -37,16 +38,16 @@ module.exports = async (req, res) => {
 
     if (!embJson?.data?.[0]?.embedding) {
       return res.status(500).json({
-        ok: false,
-        error: "embedding failed"
+        ok:false,
+        error:"embedding failed"
       });
     }
 
     const qvec = embJson.data[0].embedding;
 
-    // -------------------------
+    // -----------------------
     // DOCUMENT ROUTING
-    // -------------------------
+    // -----------------------
 
     const docResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_documents`, {
       method: "POST",
@@ -65,13 +66,13 @@ module.exports = async (req, res) => {
 
     let routedDocId = null;
 
-if (docRows?.[0]?.similarity > 0.55) {
-  routedDocId = docRows[0].id;
-}
+    if (docRows?.[0]?.similarity > 0.55) {
+      routedDocId = docRows[0].id;
+    }
 
-    // -------------------------
-    // CHUNK VECTOR SEARCH
-    // -------------------------
+    // -----------------------
+    // CHUNK SEARCH
+    // -----------------------
 
     const rpcResp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_chunks`, {
       method: "POST",
@@ -90,38 +91,41 @@ if (docRows?.[0]?.similarity > 0.55) {
     const rows = await rpcResp.json();
 
     const filtered = (rows || []).filter(r => r.similarity > 0.78);
-    
-    if (!filtered.length) {
-  return res.status(200).json({
-    ok: true,
-    query: q,
-    results: [],
-    note: "Geen relevante wetgeving gevonden"
-  });
-}
 
-    results: filtered.map((r,i)=>({
-      ok: true,
-      query: q,
+    if (!filtered.length) {
+      return res.status(200).json({
+        ok:true,
+        query:q,
+        results:[],
+        note:"Geen relevante wetgeving gevonden"
+      });
+    }
+
+    return res.status(200).json({
+      ok:true,
+      query:q,
       routed_document: docRows?.[0] || null,
-      results: rows.map((r, i) => ({
-        id: r.id,
-        n: i + 1,
-        label: r.label,
-        doc_id: r.doc_id,
-        similarity: r.similarity,
-        source_url: r.source_url,
-        excerpt: (r.text || "").slice(0, 1200)
+      results: filtered.map((r,i)=>({
+        id:r.id,
+        n:i+1,
+        label:r.label,
+        doc_id:r.doc_id,
+        similarity:r.similarity,
+        source_url:r.source_url,
+        excerpt:(r.text||"").slice(0,1200)
       }))
     });
 
-  } catch (e) {
+  }
+
+  catch(e){
 
     return res.status(500).json({
-      ok: false,
-      error: "search crashed",
-      details: String(e?.message || e)
+      ok:false,
+      error:"search crashed",
+      details:String(e?.message || e)
     });
 
   }
+
 };
