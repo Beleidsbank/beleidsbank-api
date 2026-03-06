@@ -66,9 +66,9 @@ module.exports = async (req, res) => {
 
     let routedDocId = null;
 
-    if (docRows?.[0]?.similarity > 0.55) {
-      routedDocId = docRows[0].id;
-    }
+if (docRows?.[0]?.similarity > 0.65) {
+  routedDocId = docRows[0].id;
+}
 
     // -----------------------
     // CHUNK SEARCH
