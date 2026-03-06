@@ -47,9 +47,17 @@ module.exports = async (req, res) => {
       body:JSON.stringify({ query })
     });
 
-    const data = await dbResp.json();
+   const data = await dbResp.json();
 
-    const results = (data || []).map(r => ({
+const rows = Array.isArray(data) ? data : (data?.data || []);
+
+const results = rows.map(r => ({
+  id: r.id,
+  label: r.label,
+  text: r.text,
+  excerpt: r.text,
+  source_url: r.source_url
+}));
       id:r.id,
       label:r.label,
       text:r.text,
