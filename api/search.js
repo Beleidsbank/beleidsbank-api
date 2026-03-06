@@ -63,9 +63,15 @@ module.exports = async (req, res) => {
       })
     });
 
-    const rows = await rpcResp.json();
+    const rpcJson = await rpcResp.json();
 
-    const results = Array.isArray(rows) ? rows : [];
+let results = [];
+
+if (Array.isArray(rpcJson)) {
+  results = rpcJson;
+} else if (rpcJson?.data && Array.isArray(rpcJson.data)) {
+  results = rpcJson.data;
+}
 
     if (!results.length) {
       return res.status(200).json({
