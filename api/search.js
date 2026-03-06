@@ -3,7 +3,16 @@ module.exports = async (req, res) => {
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-    const q = (req.query.q || "").toString().trim();
+    let q = (req.query.q || "").toString().trim().toLowerCase();
+
+// simpele vraagwoorden verwijderen
+q = q
+  .replace("wat is", "")
+  .replace("wat betekent", "")
+  .replace("wat houdt", "")
+  .replace("wat wordt", "")
+  .replace("?", "")
+  .trim();
     if (!q) return res.json({ ok: false, error: "missing query" });
 
     // Gebruik Postgres full-text search (snel en geschikt voor wetstekst)
