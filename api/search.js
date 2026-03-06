@@ -5,31 +5,23 @@ module.exports = async (req, res) => {
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-    let q = (req.query.q || "").toString().toLowerCase().trim();
+    let q = (req.query.q || "").toString().toLowerCase();
 
     if (!q) {
       return res.json({ ok:false, results:[] });
     }
 
-    // simpele vraagwoorden verwijderen
+    // vraagwoorden verwijderen
     q = q
-      .replace("wat is", "")
-      .replace("wat betekent", "")
-      .replace("wat houdt", "")
-      .replace("leg uit", "")
-      .replace("definitie", "")
-      .replace("?", "")
+      .replace("wat is","")
+      .replace("wat betekent","")
+      .replace("wat houdt","")
+      .replace("leg uit","")
+      .replace("?","")
       .trim();
 
-    const words = q.split(" ").filter(w => w.length > 2);
+    const keyword = q.split(" ")[0];
 
-    if(words.length === 0){
-      return res.json({ ok:false, results:[] });
-    }
-
-    const keyword = words[0];
-
-    // HEADERS
     const headers = {
       apikey: SERVICE_KEY,
       Authorization:`Bearer ${SERVICE_KEY}`
@@ -37,10 +29,9 @@ module.exports = async (req, res) => {
 
     let rows = [];
 
-    // 1️⃣ Eerst zoeken in Awb (definities)
+    // eerst Awb
     const awbUrl =
-      `${SUPABASE_URL}/rest/v1/chunks` +
-      `?select=id,label,text,source_url` +
+      `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
       `&doc_id=eq.BWBR0005537` +
       `&text=ilike.*${encodeURIComponent(keyword)}*` +
       `&limit=5`;
@@ -48,27 +39,28 @@ module.exports = async (req, res) => {
     const awbResp = await fetch(awbUrl,{ headers });
 
     if(awbResp.ok){
-      rows = await awbResp.json();
+      const data = await awbResp.json();
+      if(Array.isArray(data)) rows = data;
     }
 
-    // 2️⃣ Als niets gevonden → zoek in alle wetten
-    if(!rows || rows.length === 0){
+    // fallback: alle wetten
+    if(rows.length === 0){
 
       const url =
-        `${SUPABASE_URL}/rest/v1/chunks` +
-        `?select=id,label,text,source_url` +
+        `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
         `&text=ilike.*${encodeURIComponent(keyword)}*` +
         `&limit=8`;
 
       const resp = await fetch(url,{ headers });
 
       if(resp.ok){
-        rows = await resp.json();
+        const data = await resp.json();
+        if(Array.isArray(data)) rows = data;
       }
 
     }
 
-    const results = (rows || []).map(r => ({
+    const results = rows.map(r => ({
       id:r.id,
       label:r.label,
       text:r.text,
@@ -87,7 +79,8 @@ module.exports = async (req, res) => {
 
     return res.json({
       ok:false,
-      error:String(e)
+      error:String(e),
+      results:[]
     });
 
   }
