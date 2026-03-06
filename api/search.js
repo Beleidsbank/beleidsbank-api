@@ -103,19 +103,14 @@ const filtered = results;
     }
 
     return res.status(200).json({
-      ok:true,
-      query:q,
-      routed_document: docRows?.[0] || null,
-      results: filtered.map((r,i)=>({
-        id:r.id,
-        n:i+1,
-        label:r.label,
-        doc_id:r.doc_id,
-        similarity:r.similarity,
-        source_url:r.source_url,
-        excerpt:(r.text||"").slice(0,1200)
-      }))
-    });
+  ok: true,
+  query: q,
+  routed_document: docRows?.[0] || null,
+  routedDocId,
+  raw_docRows: docRows,
+  raw_rows: rows,
+  results: results
+});
 
   }
 
