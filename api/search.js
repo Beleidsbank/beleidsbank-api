@@ -44,7 +44,7 @@ module.exports = async (req, res) => {
     const resp = await fetch(
       `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
       `&text=ilike.*${encodeURIComponent(keyword)}*` +
-      `&limit=8`,
+      `&limit=30`,
       {headers}
     );
 
