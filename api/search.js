@@ -5,80 +5,77 @@ module.exports = async (req, res) => {
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-    let q = (req.query.q || "").toString().toLowerCase().trim();
-
-    if (!q) {
-      return res.json({ ok:false, results:[] });
-    }
+    let q = (req.query.q || "").toLowerCase().trim();
 
     const headers = {
       apikey: SERVICE_KEY,
       Authorization:`Bearer ${SERVICE_KEY}`
     };
 
-    // ----------------------------
-    // EXACT ARTIKEL LOOKUP
-    // ----------------------------
+    // -----------------------------
+    // WET DETECTIE
+    // -----------------------------
 
-    const match = q.match(/artikel\s+([\d:.]+)\s*(.*)/i);
+    let law = null;
 
-    if(match){
+    if(q.includes("awb")) law = "BWBR0005537";
+    if(q.includes("omgevingswet")) law = "BWBR0037885";
 
-      const article = match[1];
-      const law = match[2] || "";
+    // -----------------------------
+    // ARTIKEL DETECTIE
+    // -----------------------------
 
-      let lawFilter = "";
+    const artMatch = q.match(/artikel\s+([\d:.]+)/);
 
-      if(law.includes("awb")) lawFilter = "BWBR0005537";
-      if(law.includes("omgevingswet")) lawFilter = "BWBR0037885";
+    if(artMatch && law){
 
-      let url =
-        `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
-        `&label=ilike.*artikel%20${encodeURIComponent(article)}*`;
+      const art = artMatch[1].replace(".",":");
 
-      if(lawFilter){
-        url += `&doc_id=eq.${lawFilter}`;
-      }
+      const url =
+        `${SUPABASE_URL}/rest/v1/chunks` +
+        `?select=id,label,text,source_url` +
+        `&doc_id=eq.${law}` +
+        `&label=ilike.*${encodeURIComponent(art)}*` +
+        `&limit=5`;
 
-      url += "&limit=5";
-
-      const resp = await fetch(url,{ headers });
+      const resp = await fetch(url,{headers});
       const rows = await resp.json();
 
       if(Array.isArray(rows) && rows.length > 0){
+
         return res.json({
           ok:true,
           results:rows
         });
+
       }
 
     }
 
-    // ----------------------------
-    // NORMALE KEYWORD SEARCH
-    // ----------------------------
+    // -----------------------------
+    // KEYWORD SEARCH
+    // -----------------------------
 
     q = q
       .replace("wat is","")
       .replace("wat betekent","")
-      .replace("wat houdt","")
-      .replace("leg uit","")
       .replace("?","")
       .trim();
 
     const keyword = q.split(" ")[0];
 
     const url =
-      `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
+      `${SUPABASE_URL}/rest/v1/chunks` +
+      `?select=id,label,text,source_url` +
       `&text=ilike.*${encodeURIComponent(keyword)}*` +
       `&limit=8`;
 
-    const resp = await fetch(url,{ headers });
+    const resp = await fetch(url,{headers});
     const rows = await resp.json();
 
     return res.json({
       ok:true,
-      results:Array.isArray(rows) ? rows : []
+      results:Array.isArray(rows)?rows:[]
     });
 
   }
