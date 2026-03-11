@@ -146,20 +146,11 @@ Antwoord compact en juridisch.
       });
     }
 
-    const answer = stripModelLeakage(aiJson.choices[0].message.content || "");
+    let answer = stripModelLeakage(aiJson.choices[0].message.content || "");
 
-    // als model geen bronverwijzing geeft maar we wel bronnen hebben
+// fallback: voeg bron toe als model die vergeet
 if (!/\[\d+\]/.test(answer) && results.length > 0) {
   answer = answer + " [1]";
-}
-    sources: results.map((r, i) => ({
-      n: i + 1,
-      id: r.id,
-      title: r.label,
-      link: r.source_url,
-      highlight: pickHighlight(r.excerpt || r.text || "")
-    }))
-  });
 }
 
     // 4) Return answer + bronnen (met id + highlight)
