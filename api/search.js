@@ -88,12 +88,24 @@ module.exports = async (req, res) => {
       map.set(r.id,r);
     });
 
-    const results = Array.from(map.values()).slice(0,8);
+   let results = Array.from(map.values());
 
-    return res.json({
-      ok:true,
-      results
-    });
+// simpele juridische ranking
+results = results.sort((a,b)=>{
+
+  const score = r=>{
+    let s = 0;
+
+    if(r.label.includes("Artikel 1:")) s += 5;
+    if(r.label.toLowerCase().includes("awb")) s += 3;
+
+    return s;
+  };
+
+  return score(b) - score(a);
+});
+
+results = results.slice(0,8);
 
   }
 
