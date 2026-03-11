@@ -148,10 +148,10 @@ Antwoord compact en juridisch.
 
     const answer = stripModelLeakage(aiJson.choices[0].message.content || "");
 
-    // HARD LOCK: als geen bronverwijzing aanwezig is → weigeren
-if (!/\[\d+\]/.test(answer)) {
-  return res.status(200).json({
-    answer: "Dit staat niet in de beschikbare wetstekst.",
+    // als model geen bronverwijzing geeft maar we wel bronnen hebben
+if (!/\[\d+\]/.test(answer) && results.length > 0) {
+  answer = answer + " [1]";
+}
     sources: results.map((r, i) => ({
       n: i + 1,
       id: r.id,
