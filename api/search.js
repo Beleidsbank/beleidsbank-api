@@ -5,13 +5,50 @@ module.exports = async (req, res) => {
     const SUPABASE_URL = process.env.SUPABASE_URL;
     const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-    let q = (req.query.q || "").toString().toLowerCase();
+    let q = (req.query.q || "").toString().toLowerCase().trim();
 
     if (!q) {
       return res.json({ ok:false, results:[] });
     }
 
-    // vraagwoorden verwijderen
+    const headers = {
+      apikey: SERVICE_KEY,
+      Authorization:`Bearer ${SERVICE_KEY}`
+    };
+
+    // -------------------------------
+    // EXACT ARTIKEL LOOKUP
+    // -------------------------------
+
+    const articleMatch = q.match(/artikel\s+([\d:.]+)/i);
+
+    if(articleMatch){
+
+      const article = articleMatch[1];
+
+      const url =
+        `${SUPABASE_URL}/rest/v1/chunks` +
+        `?select=id,label,text,source_url` +
+        `&label=ilike.*${encodeURIComponent(article)}*` +
+        `&limit=5`;
+
+      const resp = await fetch(url,{ headers });
+
+      const rows = await resp.json();
+
+      if(Array.isArray(rows) && rows.length > 0){
+        return res.json({
+          ok:true,
+          results:rows
+        });
+      }
+
+    }
+
+    // -------------------------------
+    // NORMALE KEYWORD SEARCH
+    // -------------------------------
+
     q = q
       .replace("wat is","")
       .replace("wat betekent","")
@@ -22,55 +59,19 @@ module.exports = async (req, res) => {
 
     const keyword = q.split(" ")[0];
 
-    const headers = {
-      apikey: SERVICE_KEY,
-      Authorization:`Bearer ${SERVICE_KEY}`
-    };
-
-    let rows = [];
-
-    // eerst Awb
-    const awbUrl =
-      `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
-      `&doc_id=eq.BWBR0005537` +
+    const url =
+      `${SUPABASE_URL}/rest/v1/chunks` +
+      `?select=id,label,text,source_url` +
       `&text=ilike.*${encodeURIComponent(keyword)}*` +
-      `&limit=5`;
+      `&limit=8`;
 
-    const awbResp = await fetch(awbUrl,{ headers });
+    const resp = await fetch(url,{ headers });
 
-    if(awbResp.ok){
-      const data = await awbResp.json();
-      if(Array.isArray(data)) rows = data;
-    }
-
-    // fallback: alle wetten
-    if(rows.length === 0){
-
-      const url =
-        `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
-        `&text=ilike.*${encodeURIComponent(keyword)}*` +
-        `&limit=8`;
-
-      const resp = await fetch(url,{ headers });
-
-      if(resp.ok){
-        const data = await resp.json();
-        if(Array.isArray(data)) rows = data;
-      }
-
-    }
-
-    const results = rows.map(r => ({
-      id:r.id,
-      label:r.label,
-      text:r.text,
-      excerpt:r.text,
-      source_url:r.source_url
-    }));
+    const rows = await resp.json();
 
     return res.json({
       ok:true,
-      results
+      results:Array.isArray(rows) ? rows : []
     });
 
   }
