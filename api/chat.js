@@ -1,58 +1,64 @@
 // beleidsbank-api/api/chat.js
-// Beleidsbank PRO chat — gebruikt eigen /api/search + OpenAI antwoord
-// Response: { answer: string, sources: [{n,id,title,link,highlight}] }
 
 const ALLOW_ORIGIN = "https://app.beleidsbank.nl";
 
-function safeJsonParse(s) {
-  try { return JSON.parse(s); } catch { return null; }
+function safeJsonParse(s){
+  try { return JSON.parse(s); }
+  catch { return null; }
 }
 
-function stripModelLeakage(text) {
+function stripModelLeakage(text){
   return (text || "")
-    .replace(/you are trained on data up to.*$/gmi, "")
-    .replace(/as an ai language model.*$/gmi, "")
-    .replace(/als (een )?ai(-| )?taalmodel.*$/gmi, "")
+    .replace(/you are trained on data up to.*$/gmi,"")
+    .replace(/as an ai language model.*$/gmi,"")
+    .replace(/als (een )?ai(-| )?taalmodel.*$/gmi,"")
     .trim();
 }
 
-function pickHighlight(excerptOrText) {
-  const raw = (excerptOrText || "").toString();
-  if (!raw.trim()) return "";
+function pickHighlight(text){
+  if(!text) return "";
 
-  const lines = raw
+  const lines = text
     .split("\n")
-    .map(s => s.replace(/\s+/g, " ").trim())
+    .map(l => l.replace(/\s+/g," ").trim())
     .filter(Boolean);
 
-  // voorkeur: definities / kernzinnen
   const preferred = lines.find(l =>
     l.toLowerCase().includes("wordt verstaan") ||
-    l.toLowerCase().includes("een schriftelijke beslissing")
+    l.toLowerCase().includes("schriftelijke beslissing")
   );
 
-  const best =
-    preferred ||
-    lines.find(l => l.length >= 25 && l.length <= 220) ||
-    (lines.join(" ").slice(0, 220));
-
-  return (best || "").slice(0, 220);
+  return (preferred || lines[0] || "").slice(0,220);
 }
 
-module.exports = async (req, res) => {
-  // CORS
+module.exports = async (req,res)=>{
+
   const origin = (req.headers.origin || "").toString();
-  res.setHeader("Access-Control-Allow-Origin", origin === ALLOW_ORIGIN ? origin : ALLOW_ORIGIN);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(200).end();
 
-  if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    origin === ALLOW_ORIGIN ? origin : ALLOW_ORIGIN
+  );
 
-  try {
+  res.setHeader("Vary","Origin");
+  res.setHeader("Access-Control-Allow-Methods","POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers","Content-Type");
+
+  if(req.method === "OPTIONS"){
+    return res.status(200).end();
+  }
+
+  if(req.method !== "POST"){
+    return res.status(405).json({error:"Only POST allowed"});
+  }
+
+  try{
+
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
-    if (!OPENAI_KEY) return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
+
+    if(!OPENAI_KEY){
+      return res.status(500).json({error:"Missing OPENAI_API_KEY"});
+    }
 
     const body =
       typeof req.body === "string"
@@ -60,116 +66,200 @@ module.exports = async (req, res) => {
         : (req.body || {});
 
     const question = (body.message || "").toString().trim();
-    if (!question) return res.status(400).json({ error: "Missing message" });
 
-    // 1) Search in eigen DB
+    if(!question){
+      return res.status(400).json({error:"Missing message"});
+    }
+
+    // -----------------------------------
+    // 1 QUERY UNDERSTANDING (AI)
+    // -----------------------------------
+
+    const rewriteResp = await fetch(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        method:"POST",
+        headers:{
+          "Content-Type":"application/json",
+          Authorization:`Bearer ${OPENAI_KEY}`
+        },
+        body: JSON.stringify({
+          model:"gpt-4o-mini",
+          temperature:0,
+          max_tokens:40,
+          messages:[
+            {
+              role:"system",
+              content:
+              "Herschrijf de vraag naar een korte juridische zoekquery van maximaal 6 woorden."
+            },
+            {
+              role:"user",
+              content:question
+            }
+          ]
+        })
+      }
+    );
+
+    const rewriteText = await rewriteResp.text();
+    const rewriteJson = safeJsonParse(rewriteText);
+
+    const searchQuery =
+      rewriteJson?.choices?.[0]?.message?.content?.trim()
+      || question;
+
+    // -----------------------------------
+    // 2 SEARCH IN DATABASE
+    // -----------------------------------
+
     const searchResp = await fetch(
-      `https://beleidsbank-api.vercel.app/api/search?q=` + encodeURIComponent(question),
-      { method: "GET" }
+      `https://beleidsbank-api.vercel.app/api/search?q=` +
+      encodeURIComponent(searchQuery)
     );
 
     const searchText = await searchResp.text();
     const searchJson = safeJsonParse(searchText);
 
-    if (!searchResp.ok || !searchJson?.ok) {
+    if(!searchResp.ok || !searchJson?.ok){
+
       return res.status(200).json({
-        answer: "Zoeken naar bronnen is mislukt.",
-        sources: [],
-        debug: { status: searchResp.status, preview: searchText.slice(0, 200) }
+        answer:"Zoeken naar bronnen is mislukt.",
+        sources:[]
       });
+
     }
 
-    const results = (searchJson.results || []).slice(0, 8);
-    if (!results.length) {
+    const results = (searchJson.results || []).slice(0,8);
+
+    if(!results.length){
+
       return res.status(200).json({
-        answer: "Ik heb nog geen relevante wetgeving in de database gevonden.",
-        sources: []
+        answer:"Ik heb nog geen relevante wetgeving in de database gevonden.",
+        sources:[]
       });
+
     }
 
-    // 2) context voor LLM (ALLEEN passages)
+    // -----------------------------------
+    // 3 CONTEXT OPBOUWEN
+    // -----------------------------------
+
     const context = results
-  .map((r, i) => {
-    const txt = (r.excerpt || r.text || "").trim();
-    return `[${i + 1}] ${txt}`;
-  })
-  .join("\n\n");
+      .map((r,i)=>{
 
-    // 3) OpenAI antwoord
-const system = `
+        const txt = (r.text || "").trim();
+
+        return `[${i+1}] ${txt}`;
+
+      })
+      .join("\n\n");
+
+    // -----------------------------------
+    // 4 AI ANTWOORD
+    // -----------------------------------
+
+    const systemPrompt = `
 Je bent Beleidsbank.
 
-Strikte regels:
+Regels:
 
-1. Gebruik uitsluitend zinnen die letterlijk of direct herleidbaar zijn tot de bronpassages.
-2. Elke inhoudelijke zin moet eindigen met een bronverwijzing zoals [1] of [2].
-3. Voeg geen uitleg, context, voorbeelden of interpretatie toe.
-4. Als de vraag niet direct uit de passages kan worden beantwoord, zeg exact:
-   "Dit staat niet in de beschikbare wetstekst."
-5. Gebruik geen kennis buiten de meegeleverde passages.
-6. Geen afrondende zinnen.
+1 Gebruik alleen informatie uit de bronpassages
+2 Elke zin eindigt met bronverwijzing zoals [1]
+3 Geen interpretatie of uitleg buiten de tekst
+4 Als het antwoord niet in de passages staat zeg exact:
 
-Antwoord compact en juridisch.
+"Dit staat niet in de beschikbare wetstekst."
 `.trim();
 
-    const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        temperature: 0.1,
-        max_tokens: 650,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: `Beantwoord de vraag uitsluitend met feiten uit de bronpassages.\nVraag: ${question}\n\nBronpassages:\n${context}` },
-        ],
-      }),
-    });
+    const aiResp = await fetch(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        method:"POST",
+        headers:{
+          "Content-Type":"application/json",
+          Authorization:`Bearer ${OPENAI_KEY}`
+        },
+        body: JSON.stringify({
+          model:"gpt-4o-mini",
+          temperature:0.1,
+          max_tokens:500,
+          messages:[
+            {role:"system",content:systemPrompt},
+            {
+              role:"user",
+              content:
+`Vraag: ${question}
+
+Bronpassages:
+${context}`
+            }
+          ]
+        })
+      }
+    );
 
     const aiText = await aiResp.text();
     const aiJson = safeJsonParse(aiText);
 
-    if (!aiResp.ok || !aiJson?.choices?.[0]?.message?.content) {
+    if(!aiResp.ok || !aiJson?.choices?.[0]?.message?.content){
+
       return res.status(200).json({
-        answer: "Antwoord genereren is mislukt.",
-        sources: results.map((r, i) => ({
-          n: i + 1,
-          id: r.id,
-          title: r.label,
-          link: r.source_url,
-          highlight: pickHighlight(r.excerpt || r.text || "")
-        })),
-        debug: { openai_status: aiResp.status, openai_preview: aiText.slice(0, 250) }
+        answer:"Antwoord genereren is mislukt.",
+        sources: results.map((r,i)=>({
+          n:i+1,
+          id:r.id,
+          title:r.label,
+          link:r.source_url,
+          highlight:pickHighlight(r.text)
+        }))
       });
+
     }
 
-    let answer = stripModelLeakage(aiJson.choices[0].message.content || "");
+    let answer =
+      stripModelLeakage(
+        aiJson.choices[0].message.content
+      );
 
-// fallback: voeg bron toe als model die vergeet
-if (!/\[\d+\]/.test(answer) && results.length > 0) {
-  answer = answer + " [1]";
-}
+    if(!/\[\d+\]/.test(answer)){
+      answer = answer + " [1]";
+    }
 
-   // gebruikte bronverwijzingen detecteren
-const used = [...answer.matchAll(/\[(\d+)\]/g)].map(m => parseInt(m[1],10));
+    // -----------------------------------
+    // 5 BRONNEN FILTEREN
+    // -----------------------------------
 
-const filtered = results.filter((r,i)=> used.includes(i+1));
+    const used = [...answer.matchAll(/\[(\d+)\]/g)]
+      .map(m => parseInt(m[1],10));
 
-return res.status(200).json({
-  answer,
-  sources: (filtered.length ? filtered : results).map((r,i)=>({
-    n: i+1,
-    id: r.id,
-    title: r.label,
-    link: r.source_url,
-    highlight: pickHighlight(r.excerpt || r.text || "")
-  }))
-});
+    const filtered =
+      results.filter((r,i)=> used.includes(i+1));
 
-  } catch (e) {
-    return res.status(500).json({ error: "chat crashed", details: String(e?.message || e) });
+    const sources =
+      (filtered.length ? filtered : results)
+      .map((r,i)=>({
+        n:i+1,
+        id:r.id,
+        title:r.label,
+        link:r.source_url,
+        highlight:pickHighlight(r.text)
+      }));
+
+    return res.status(200).json({
+      answer,
+      sources
+    });
+
   }
+
+  catch(e){
+
+    return res.status(500).json({
+      error:"chat crashed",
+      details:String(e?.message || e)
+    });
+
+  }
+
 };
