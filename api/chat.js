@@ -153,17 +153,21 @@ if (!/\[\d+\]/.test(answer) && results.length > 0) {
   answer = answer + " [1]";
 }
 
-    // 4) Return answer + bronnen (met id + highlight)
-    return res.status(200).json({
-      answer,
-      sources: results.map((r, i) => ({
-        n: i + 1,
-        id: r.id,
-        title: r.label,
-        link: r.source_url,
-        highlight: pickHighlight(r.excerpt || r.text || "")
-      })),
-    });
+   // gebruikte bronverwijzingen detecteren
+const used = [...answer.matchAll(/\[(\d+)\]/g)].map(m => parseInt(m[1],10));
+
+const filtered = results.filter((r,i)=> used.includes(i+1));
+
+return res.status(200).json({
+  answer,
+  sources: (filtered.length ? filtered : results).map((r,i)=>({
+    n: i+1,
+    id: r.id,
+    title: r.label,
+    link: r.source_url,
+    highlight: pickHighlight(r.excerpt || r.text || "")
+  }))
+});
 
   } catch (e) {
     return res.status(500).json({ error: "chat crashed", details: String(e?.message || e) });
