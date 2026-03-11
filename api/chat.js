@@ -167,7 +167,7 @@ Regels:
 1 Gebruik alleen informatie uit de bronpassages.
 2 Kies zelf de meest relevante passages.
 3 Gebruik alleen passages die direct antwoord geven.
-4 Elke zin eindigt met een bronverwijzing.
+4 Elke zin eindigt met een bronverwijzing zoals [1].
 5 Als geen passage het antwoord bevat zeg exact:
 
 "Dit staat niet in de beschikbare wetstekst."
