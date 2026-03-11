@@ -130,7 +130,7 @@ module.exports = async (req,res)=>{
 
     }
 
-    const results = (searchJson.results || []).slice(0,8);
+    const results = (searchJson.results || []).slice(0,30);
 
     if(!results.length){
 
@@ -150,7 +150,7 @@ module.exports = async (req,res)=>{
 
         const txt = (r.text || "").trim();
 
-        return `[${i+1}] ${txt}`;
+        return `Passage ${i + 1}:\n${txt}`;
 
       })
       .join("\n\n");
@@ -159,18 +159,19 @@ module.exports = async (req,res)=>{
     // 4 AI ANTWOORD
     // -----------------------------------
 
-    const systemPrompt = `
+    const system = `
 Je bent Beleidsbank.
 
 Regels:
 
-1 Gebruik alleen informatie uit de bronpassages
-2 Elke zin eindigt met bronverwijzing zoals [1]
-3 Geen interpretatie of uitleg buiten de tekst
-4 Als het antwoord niet in de passages staat zeg exact:
+1 Gebruik alleen informatie uit de bronpassages.
+2 Kies zelf de meest relevante passages.
+3 Gebruik alleen passages die direct antwoord geven.
+4 Elke zin eindigt met een bronverwijzing.
+5 Als geen passage het antwoord bevat zeg exact:
 
 "Dit staat niet in de beschikbare wetstekst."
-`.trim();
+`;
 
     const aiResp = await fetch(
       "https://api.openai.com/v1/chat/completions",
@@ -222,7 +223,7 @@ ${context}`
         aiJson.choices[0].message.content
       );
 
-    if(!/\[\d+\]/.test(answer)){
+    if (!/\d+/.test(answer)) {
       answer = answer + " [1]";
     }
 
