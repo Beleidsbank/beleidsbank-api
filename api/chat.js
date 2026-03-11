@@ -89,7 +89,7 @@ module.exports = async (req,res)=>{
           max_tokens:40,
           messages:[
             {
-              role:"system",
+              role:"systemPrompt",
               content:
               "Herschrijf de vraag naar een korte juridische zoekquery van maximaal 6 woorden."
             },
