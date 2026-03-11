@@ -16,23 +16,20 @@ module.exports = async (req, res) => {
       Authorization:`Bearer ${SERVICE_KEY}`
     };
 
-    // -------------------------
-    // EXACT ARTIKEL LOOKUP
-    // -------------------------
-
+    // exact artikel lookup
     const articleMatch = q.match(/artikel\s+([\d:.]+)/);
 
     if(articleMatch){
 
       const article = articleMatch[1].replace(".",":");
 
-      const url =
-        `${SUPABASE_URL}/rest/v1/chunks` +
-        `?select=id,label,text,source_url` +
+      const resp = await fetch(
+        `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
         `&label=ilike.*${encodeURIComponent(article)}*` +
-        `&limit=5`;
+        `&limit=5`,
+        {headers}
+      );
 
-      const resp = await fetch(url,{headers});
       const rows = await resp.json();
 
       if(Array.isArray(rows) && rows.length){
@@ -41,19 +38,16 @@ module.exports = async (req, res) => {
 
     }
 
-    // -------------------------
-    // KEYWORD SEARCH
-    // -------------------------
-
+    // keyword search
     const keyword = q.split(" ")[0];
 
-    const url =
-      `${SUPABASE_URL}/rest/v1/chunks` +
-      `?select=id,label,text,source_url` +
+    const resp = await fetch(
+      `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
       `&text=ilike.*${encodeURIComponent(keyword)}*` +
-      `&limit=8`;
+      `&limit=8`,
+      {headers}
+    );
 
-    const resp = await fetch(url,{headers});
     const rows = await resp.json();
 
     return res.json({
