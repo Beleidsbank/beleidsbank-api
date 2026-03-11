@@ -16,24 +16,33 @@ module.exports = async (req, res) => {
       Authorization:`Bearer ${SERVICE_KEY}`
     };
 
-    // -------------------------------
+    // ----------------------------
     // EXACT ARTIKEL LOOKUP
-    // -------------------------------
+    // ----------------------------
 
-    const articleMatch = q.match(/artikel\s+([\d:.]+)/i);
+    const match = q.match(/artikel\s+([\d:.]+)\s*(.*)/i);
 
-    if(articleMatch){
+    if(match){
 
-      const article = articleMatch[1];
+      const article = match[1];
+      const law = match[2] || "";
 
-      const url =
-        `${SUPABASE_URL}/rest/v1/chunks` +
-        `?select=id,label,text,source_url` +
-        `&label=ilike.*${encodeURIComponent(article)}*` +
-        `&limit=5`;
+      let lawFilter = "";
+
+      if(law.includes("awb")) lawFilter = "BWBR0005537";
+      if(law.includes("omgevingswet")) lawFilter = "BWBR0037885";
+
+      let url =
+        `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
+        `&label=ilike.*artikel%20${encodeURIComponent(article)}*`;
+
+      if(lawFilter){
+        url += `&doc_id=eq.${lawFilter}`;
+      }
+
+      url += "&limit=5";
 
       const resp = await fetch(url,{ headers });
-
       const rows = await resp.json();
 
       if(Array.isArray(rows) && rows.length > 0){
@@ -45,9 +54,9 @@ module.exports = async (req, res) => {
 
     }
 
-    // -------------------------------
+    // ----------------------------
     // NORMALE KEYWORD SEARCH
-    // -------------------------------
+    // ----------------------------
 
     q = q
       .replace("wat is","")
@@ -60,13 +69,11 @@ module.exports = async (req, res) => {
     const keyword = q.split(" ")[0];
 
     const url =
-      `${SUPABASE_URL}/rest/v1/chunks` +
-      `?select=id,label,text,source_url` +
+      `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
       `&text=ilike.*${encodeURIComponent(keyword)}*` +
       `&limit=8`;
 
     const resp = await fetch(url,{ headers });
-
     const rows = await resp.json();
 
     return res.json({
