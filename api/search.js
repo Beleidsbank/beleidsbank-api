@@ -38,24 +38,34 @@ module.exports = async (req, res) => {
 
     }
 
-    // keyword search
     const keyword = q.split(" ")[0];
 
-    const resp = await fetch(
-      `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
-      `&text=ilike.*${encodeURIComponent(keyword)}*` +
-      `&limit=30`,
-      {headers}
-    );
+// eerst belangrijkste wetten zoeken
+const priorityDocs = [
+  "BWBR0005537", // Awb
+  "BWBR0037885"  // Omgevingswet
+];
 
-    const rows = await resp.json();
+for (const doc of priorityDocs) {
 
+  const resp = await fetch(
+    `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url` +
+    `&doc_id=eq.${doc}` +
+    `&text=ilike.*${encodeURIComponent(keyword)}*` +
+    `&limit=10`,
+    { headers }
+  );
+
+  const rows = await resp.json();
+
+  if (Array.isArray(rows) && rows.length) {
     return res.json({
-      ok:true,
-      results:Array.isArray(rows)?rows:[]
+      ok: true,
+      results: rows
     });
-
   }
+
+}
 
   catch(e){
 
