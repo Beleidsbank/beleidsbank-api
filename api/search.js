@@ -155,7 +155,9 @@ module.exports = async (req, res) => {
 
     if (articleMatch) {
 
-      const article = articleMatch[1];
+      const article = articleMatch[1]
+  .replace(/\./g,":")
+  .trim();
       const variants = normalizeArticleVariants(article);
 
       let rows = [];
