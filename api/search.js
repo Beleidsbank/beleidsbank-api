@@ -5,36 +5,47 @@ module.exports = async (req, res) => {
     const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
+    if (!SUPABASE_URL || !SERVICE_KEY || !OPENAI_KEY) {
+      return res.status(500).json({
+        ok:false,
+        error:"Missing env variables",
+        results:[]
+      });
+    }
+
     const headers = {
       apikey: SERVICE_KEY,
       Authorization: `Bearer ${SERVICE_KEY}`,
-      "Content-Type": "application/json"
+      "Content-Type":"application/json"
     };
 
     const q = (req.query.q || "").toString().trim();
 
-    if (!q) {
-      return res.status(200).json({ ok:true, results:[] });
+    if(!q){
+      return res.status(200).json({
+        ok:true,
+        results:[]
+      });
     }
 
-    function cleanText(text){
-      return (text || "")
-      .replace(/\s+/g," ")
-      .replace(/Toon relaties in LiDO/gi,"")
-      .replace(/Maak een permanente link/gi,"")
-      .replace(/Toon wetstechnische informatie/gi,"")
-      .replace(/Druk het regelingonderdeel af/gi,"")
-      .replace(/Sla het regelingonderdeel op/gi,"")
-      .trim();
+    function clean(text){
+      return (text||"")
+        .replace(/\s+/g," ")
+        .replace(/Toon relaties in LiDO/gi,"")
+        .replace(/Maak een permanente link/gi,"")
+        .replace(/Toon wetstechnische informatie/gi,"")
+        .replace(/Druk het regelingonderdeel af/gi,"")
+        .replace(/Sla het regelingonderdeel op/gi,"")
+        .trim();
     }
 
     function dedupe(rows){
-      const map = new Map();
+      const map=new Map();
 
-      for(const r of rows || []){
+      for(const r of rows||[]){
         if(!r) continue;
 
-        const key = `${r.doc_id}|${(r.label || "").toLowerCase()}`;
+        const key=`${r.doc_id}|${(r.label||"").toLowerCase()}`;
 
         if(!map.has(key)){
           map.set(key,r);
@@ -44,9 +55,9 @@ module.exports = async (req, res) => {
       return Array.from(map.values());
     }
 
-    // -------------------------
-    // 1 embedding
-    // -------------------------
+    // -----------------------------
+    // 1 EMBEDDING
+    // -----------------------------
 
     const embedResp = await fetch(
       "https://api.openai.com/v1/embeddings",
@@ -65,112 +76,79 @@ module.exports = async (req, res) => {
 
     const embedJson = await embedResp.json();
 
-    const embedding = embedJson.data[0].embedding;
+    const embedding = embedJson?.data?.[0]?.embedding;
 
-    // -------------------------
-    // 2 vector search
-    // -------------------------
-
-    const vectorResp = await fetch(
-      `${SUPABASE_URL}/rest/v1/rpc/match_chunks`,
-      {
-        method:"POST",
-        headers,
-        body: JSON.stringify({
-          query_embedding: embedding,
-          match_count: 20
-        })
-      }
-    );
-
-    const vectorResults = await vectorResp.json();
-
-    // -------------------------
-    // 3 keyword search
-    // -------------------------
-
-    const keywordResp = await fetch(
-      `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id&text=ilike.*${encodeURIComponent(q)}*&limit=20`,
-      { headers }
-    );
-
-    const keywordResults = await keywordResp.json();
-
-    // -------------------------
-    // 4 combine
-    // -------------------------
-
-    const combined = dedupe([
-      ...(vectorResults || []),
-      ...(keywordResults || [])
-    ]);
-
-    if (!combined.length) {
-      return res.status(200).json({ ok:true, results:[] });
+    if(!embedding){
+      throw new Error("Embedding failed");
     }
 
-    // -------------------------
-    // 5 AI rerank
-    // -------------------------
+    // -----------------------------
+    // 2 VECTOR SEARCH
+    // -----------------------------
 
-    const passages = combined.slice(0,20).map((r,i)=>{
+    let vectorResults=[];
 
-      const txt = cleanText(r.text).slice(0,400);
+    try{
 
-      return `[${i+1}] ${txt}`;
+      const vectorResp = await fetch(
+        `${SUPABASE_URL}/rest/v1/rpc/match_chunks`,
+        {
+          method:"POST",
+          headers,
+          body: JSON.stringify({
+            query_embedding: embedding,
+            match_count:15
+          })
+        }
+      );
 
-    }).join("\n\n");
+      const json = await vectorResp.json();
 
-    const rerankResp = await fetch(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        method:"POST",
-        headers:{
-          "Content-Type":"application/json",
-          Authorization:`Bearer ${OPENAI_KEY}`
-        },
-        body: JSON.stringify({
-          model:"gpt-4o-mini",
-          temperature:0,
-          max_tokens:200,
-          messages:[
-            {
-              role:"system",
-              content:
-`Selecteer de 8 passages die het meest relevant zijn voor de vraag.
-Geef alleen de nummers terug als lijst.
-Voorbeeld: 1,4,7`
-            },
-            {
-              role:"user",
-              content:
-`Vraag: ${q}
-
-Passages:
-${passages}`
-            }
-          ]
-        })
+      if(Array.isArray(json)){
+        vectorResults=json;
       }
-    );
 
-    const rerankJson = await rerankResp.json();
+    }catch(e){
+      console.log("vector search failed",e);
+    }
 
-    const order =
-      rerankJson?.choices?.[0]?.message?.content
-      ?.match(/\d+/g)
-      ?.map(n=>parseInt(n)-1)
-      || [];
+    // -----------------------------
+    // 3 KEYWORD SEARCH (fallback)
+    // -----------------------------
 
-    const ranked = order
-      .map(i=>combined[i])
-      .filter(Boolean);
+    let keywordResults=[];
 
-    const results = ranked.map(r=>({
+    try{
+
+      const keywordResp = await fetch(
+        `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id&text=ilike.*${encodeURIComponent(q)}*&limit=15`,
+        { headers }
+      );
+
+      const json = await keywordResp.json();
+
+      if(Array.isArray(json)){
+        keywordResults=json;
+      }
+
+    }catch(e){
+      console.log("keyword search failed",e);
+    }
+
+    // -----------------------------
+    // 4 COMBINE
+    // -----------------------------
+
+    const combined = dedupe([
+      ...vectorResults,
+      ...keywordResults
+    ]);
+
+    const results = combined.slice(0,15).map(r=>({
       id:r.id,
       label:r.label,
-      text:cleanText(r.text),
-      excerpt:cleanText(r.text),
+      text:clean(r.text),
+      excerpt:clean(r.text),
       source_url:r.source_url,
       doc_id:r.doc_id
     }));
@@ -186,7 +164,7 @@ ${passages}`
 
     return res.status(500).json({
       ok:false,
-      error:String(e?.message || e),
+      error:String(e?.message||e),
       results:[]
     });
 
