@@ -25,8 +25,8 @@ function cleanLegalText(text) {
     .replace(/\n[ \t]+/g, "\n")
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
-.replace(/\n([a-z])\.\n/g, "\n$1. ")
-.replace(/\n([0-9]+°?)\.\n/g, "\n$1. ")
+    .replace(/\n([a-z])\.\n/g, "\n$1. ")
+    .replace(/\n([0-9]+°?)\.\n/g, "\n$1. ")
     .trim();
 }
 
@@ -75,6 +75,7 @@ module.exports = async (req, res) => {
         : (req.body || {});
 
     const question = (body.message || "").toString().trim();
+
     if (!question) {
       return res.status(400).json({ error: "Missing message" });
     }
@@ -96,6 +97,14 @@ module.exports = async (req, res) => {
       });
     }
 
+    // 1b) Doorvraag bij dubbelzinnige artikelvraag
+    if (searchJson?.ambiguous && searchJson?.question) {
+      return res.status(200).json({
+        answer: searchJson.question,
+        sources: []
+      });
+    }
+
     const results = (searchJson.results || []).slice(0, 12);
 
     if (!results.length) {
@@ -105,7 +114,7 @@ module.exports = async (req, res) => {
       });
     }
 
-    // 2) Artikel lookup direct teruggeven (zonder AI)
+    // 2) Artikelvraag: direct artikel teruggeven, geen AI
     if (/artikel\s+[0-9]/i.test(question)) {
       const r = results[0];
       const cleaned = cleanLegalText(r.text || "");
@@ -122,7 +131,7 @@ module.exports = async (req, res) => {
       });
     }
 
-    // 3) Context for AI
+    // 3) Context voor AI
     const context = results.map((r, i) => {
       const txt = cleanLegalText((r.excerpt || r.text || "").slice(0, 700));
       return `[${i + 1}] ${txt}`;
@@ -141,7 +150,7 @@ Regels:
 6. Antwoord compact en juridisch.
 `.trim();
 
-    // 4) OpenAI answer
+    // 4) OpenAI antwoord
     const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -168,6 +177,7 @@ Regels:
     // 5) Fallback als OpenAI faalt
     if (!aiResp.ok || !aiJson?.choices?.[0]?.message?.content) {
       const fallback = pickHighlight(results[0].excerpt || results[0].text || "");
+
       return res.status(200).json({
         answer: fallback ? `${fallback} [1]` : "Dit staat niet in de beschikbare wetstekst.",
         sources: [{
