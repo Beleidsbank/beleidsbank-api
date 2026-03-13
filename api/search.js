@@ -35,7 +35,7 @@ module.exports = async (req, res) => {
         .trim();
     }
 
-    function extractTokens(input) {
+    function extractTokens(input){
 
       const stop = new Set([
         "wat","is","een","de","het","van","in","op","om","te","met",
@@ -53,21 +53,22 @@ module.exports = async (req, res) => {
         .filter(x=>!stop.has(x));
     }
 
-    async function fetchJson(url) {
+    async function fetchJson(url){
 
       const r = await fetch(url,{ headers });
       const text = await r.text();
 
-      let json = null;
+      let json=null;
 
       try { json = JSON.parse(text); } catch {}
 
       if (!Array.isArray(json)) return [];
 
       return json;
+
     }
 
-    async function queryChunks({docId=null,textLike=null,labelLike=null,limit=10}) {
+    async function queryChunks({docId=null,textLike=null,labelLike=null,limit=10}){
 
       let url =
         `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id&limit=${limit}`;
@@ -88,7 +89,7 @@ module.exports = async (req, res) => {
 
     }
 
-    function detectLaw(input) {
+    function detectLaw(input){
 
       if (input.includes("awb") || input.includes("algemene wet bestuursrecht"))
         return DOCS.awb;
@@ -100,7 +101,7 @@ module.exports = async (req, res) => {
 
     }
 
-    function normalizeArticleVariants(a) {
+    function normalizeArticleVariants(a){
 
       const v = new Set([a]);
 
@@ -114,10 +115,10 @@ module.exports = async (req, res) => {
 
     }
 
-    function rank(rows, keyword, preferredDoc) {
+    function rank(rows, keyword, preferredDoc){
 
       return rows
-        .map(r => {
+        .map(r=>{
 
           let score = 0;
 
@@ -139,6 +140,9 @@ module.exports = async (req, res) => {
           if (text.includes("schriftelijke beslissing"))
             score += 20;
 
+          if (text.includes("omgevingsvergunning"))
+            score += 30;
+
           return { ...r, score };
 
         })
@@ -147,22 +151,20 @@ module.exports = async (req, res) => {
     }
 
     // -------------------------
-    // Exact artikel lookup
+    // ARTIKEL LOOKUP
     // -------------------------
 
     const articleMatch = q.match(/artikel\s+([0-9a-z:.]+)/i);
     const lawId = detectLaw(q);
 
-    if (articleMatch) {
+    if (articleMatch){
 
-      const article = articleMatch[1]
-  .replace(/\./g,":")
-  .trim();
+      const article = articleMatch[1];
       const variants = normalizeArticleVariants(article);
 
-      let rows = [];
+      let rows=[];
 
-      for (const v of variants) {
+      for (const v of variants){
 
         rows.push(...await queryChunks({
           docId: lawId,
@@ -172,7 +174,7 @@ module.exports = async (req, res) => {
 
       }
 
-      if (rows.length) {
+      if (rows.length){
 
         return res.json({
           ok:true,
@@ -181,10 +183,21 @@ module.exports = async (req, res) => {
 
       }
 
+      // artikel zonder wet → AI moet doorvragen
+      if (!lawId){
+
+        return res.json({
+          ok:true,
+          ambiguous:true,
+          question:"Over welke wet gaat het? (bijvoorbeeld Awb of Omgevingswet)"
+        });
+
+      }
+
     }
 
     // -------------------------
-    // Keyword search
+    // KEYWORD SEARCH
     // -------------------------
 
     const tokens = extractTokens(q);
@@ -192,34 +205,34 @@ module.exports = async (req, res) => {
     const primaryToken = tokens[0] || "";
     const secondaryToken = tokens[1] || "";
 
-    let rows = [];
+    let rows=[];
 
     rows.push(...await queryChunks({
-      docId: DOCS.awb,
-      textLike: primaryToken,
+      docId:DOCS.awb,
+      textLike:primaryToken,
       limit:10
     }));
 
-    if (secondaryToken) {
+    if (secondaryToken){
 
       rows.push(...await queryChunks({
-        docId: DOCS.awb,
-        textLike: secondaryToken,
+        docId:DOCS.awb,
+        textLike:secondaryToken,
         limit:10
       }));
 
     }
 
     rows.push(...await queryChunks({
-      docId: DOCS.omgevingswet,
-      textLike: primaryToken,
+      docId:DOCS.omgevingswet,
+      textLike:primaryToken,
       limit:10
     }));
 
-    if (rows.length < 10) {
+    if (rows.length < 10){
 
       rows.push(...await queryChunks({
-        textLike: primaryToken,
+        textLike:primaryToken,
         limit:20
       }));
 
@@ -241,7 +254,7 @@ module.exports = async (req, res) => {
 
   }
 
-  catch(e) {
+  catch(e){
 
     return res.status(500).json({
       ok:false,
