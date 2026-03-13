@@ -148,7 +148,17 @@ module.exports = async (req, res) => {
           if (r.doc_id === DOCS.awb.id && /artikel 1[:.]/.test(label)) score += 10;
 
           // sterke boost voor omgevingsvergunning → Omgevingswet 5:1
-          if (qLower.includes("omgevingsvergunning") && r.doc_id === DOCS.omgevingswet.id) score += 40;
+          if (qLower.includes("omgevingsvergunning")) {
+
+  if (r.doc_id === DOCS.omgevingswet.id) score += 80;
+
+  if (label.includes("5:1") || label.includes("5.1"))
+    score += 200;
+
+  if (text.includes("zonder omgevingsvergunning"))
+    score += 150;
+
+}
           if (qLower.includes("omgevingsvergunning") && label.includes("5:1")) score += 120;
           if (qLower.includes("omgevingsvergunning") && text.includes("zonder omgevingsvergunning")) score += 80;
 
