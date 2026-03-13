@@ -85,6 +85,25 @@ module.exports = async (req, res) => {
       });
     }
 
+// Detect artikel lookup
+if (/artikel\s+[0-9]/i.test(question)) {
+
+  const r = results[0];
+
+  return res.status(200).json({
+    answer: (r.text || "").slice(0,900),
+    sources: [{
+      n:1,
+      id:r.id,
+      title:r.label,
+      link:r.source_url,
+      highlight:(r.text || "").slice(0,220)
+    }]
+  });
+
+}
+
+    
     // 2) Context
     const context = results.map((r, i) => {
       const txt = (r.excerpt || r.text || "").slice(0, 700).trim();
