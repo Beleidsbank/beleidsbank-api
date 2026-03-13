@@ -130,7 +130,7 @@ module.exports = async (req,res)=>{
 
     }
 
-    const results = (searchJson.results || []).slice(0,30);
+    const results = (searchJson.results || []).slice(0,15);
 
     if(!results.length){
 
@@ -148,7 +148,7 @@ module.exports = async (req,res)=>{
     const context = results
       .map((r,i)=>{
 
-        const txt = (r.text || "").trim();
+        const txt = (r.text || "").slice(0,600).trim();
 
         return `Passage ${i + 1}:\n${txt}`;
 
