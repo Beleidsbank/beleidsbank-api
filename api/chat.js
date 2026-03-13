@@ -12,35 +12,29 @@ function stripModelLeakage(text) {
     .trim();
 }
 
-function cleanLegalText(text){
-
+function cleanLegalText(text) {
   return (text || "")
-
-    // LiDO rommel verwijderen
-    .replace(/Toon relaties in LiDO/gi,"")
-    .replace(/Maak een permanente link/gi,"")
-    .replace(/Toon wetstechnische informatie/gi,"")
-    .replace(/Druk het regelingonderdeel af/gi,"")
-    .replace(/Sla het regelingonderdeel op/gi,"")
-
-    // meerdere spaties
-    .replace(/[ \t]+/g," ")
-
-    // lege regels opschonen
-    .replace(/\n\s*\n\s*\n/g,"\n\n")
-
+    .replace(/Toon relaties in LiDO/gi, "")
+    .replace(/Maak een permanente link/gi, "")
+    .replace(/Toon wetstechnische informatie/gi, "")
+    .replace(/Druk het regelingonderdeel af/gi, "")
+    .replace(/Sla het regelingonderdeel op/gi, "")
+    .replace(/Geen andere versie om mee te vergelijken/gi, "")
+    .replace(/^\s*\.\.\.\s*$/gmi, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
 function pickHighlight(text) {
-
   const raw = cleanLegalText(text || "");
-
   if (!raw.trim()) return "";
 
   const lines = raw
     .split("\n")
-    .map(s => s.replace(/\s+/g," ").trim())
+    .map(s => s.replace(/\s+/g, " ").trim())
     .filter(Boolean);
 
   const preferred = lines.find(l =>
@@ -48,29 +42,27 @@ function pickHighlight(text) {
     l.toLowerCase().includes("schriftelijke beslissing")
   );
 
-  return (preferred || lines[0] || raw).slice(0,220);
+  return (preferred || lines[0] || raw).slice(0, 220);
 }
 
 module.exports = async (req, res) => {
-
   const origin = (req.headers.origin || "").toString();
 
   res.setHeader(
     "Access-Control-Allow-Origin",
     origin === ALLOW_ORIGIN ? origin : ALLOW_ORIGIN
   );
-
-  res.setHeader("Vary","Origin");
-  res.setHeader("Access-Control-Allow-Methods","POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers","Content-Type");
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Only POST allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Only POST allowed" });
+  }
 
   try {
-
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
-
     if (!OPENAI_KEY) {
       return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
     }
@@ -81,15 +73,11 @@ module.exports = async (req, res) => {
         : (req.body || {});
 
     const question = (body.message || "").toString().trim();
-
     if (!question) {
       return res.status(400).json({ error: "Missing message" });
     }
 
-    // -------------------------
-    // 1 SEARCH
-    // -------------------------
-
+    // 1) Search
     const searchResp = await fetch(
       `https://beleidsbank-api.vercel.app/api/search?q=` + encodeURIComponent(question),
       { method: "GET" }
@@ -99,184 +87,123 @@ module.exports = async (req, res) => {
     const searchJson = safeJsonParse(searchText);
 
     if (!searchResp.ok || !searchJson?.ok) {
-
       return res.status(200).json({
-        answer:"Zoeken naar bronnen is mislukt.",
-        sources:[]
+        answer: "Zoeken naar bronnen is mislukt.",
+        sources: [],
+        debug: { status: searchResp.status, preview: searchText.slice(0, 200) }
       });
-
     }
 
-    const results = (searchJson.results || []).slice(0,12);
+    const results = (searchJson.results || []).slice(0, 12);
 
     if (!results.length) {
-
       return res.status(200).json({
-        answer:"Ik heb nog geen relevante wetgeving in de database gevonden.",
-        sources:[]
+        answer: "Ik heb nog geen relevante wetgeving in de database gevonden.",
+        sources: []
       });
-
     }
 
-    // -------------------------
-    // 2 ARTIKEL LOOKUP (DIRECT)
-    // -------------------------
-
+    // 2) Artikel lookup direct teruggeven (zonder AI)
     if (/artikel\s+[0-9]/i.test(question)) {
-
       const r = results[0];
-
       const cleaned = cleanLegalText(r.text || "");
 
       return res.status(200).json({
-
-        answer: cleaned.slice(0,900),
-
-        sources:[{
-          n:1,
-          id:r.id,
-          title:r.label,
-          link:r.source_url,
+        answer: cleaned,
+        sources: [{
+          n: 1,
+          id: r.id,
+          title: r.label,
+          link: r.source_url,
           highlight: pickHighlight(cleaned)
         }]
-
       });
-
     }
 
-    // -------------------------
-    // 3 CONTEXT
-    // -------------------------
-
-    const context = results.map((r,i)=>{
-
-      const txt = cleanLegalText(
-        (r.excerpt || r.text || "").slice(0,700)
-      );
-
-      return `[${i+1}] ${txt}`;
-
+    // 3) Context for AI
+    const context = results.map((r, i) => {
+      const txt = cleanLegalText((r.excerpt || r.text || "").slice(0, 700));
+      return `[${i + 1}] ${txt}`;
     }).join("\n\n");
-
-    // -------------------------
-    // 4 AI PROMPT
-    // -------------------------
 
     const system = `
 Je bent Beleidsbank.
 
 Regels:
-
-1 Gebruik alleen informatie uit de bronpassages
-2 Gebruik alleen passages die direct relevant zijn
-3 Elke zin eindigt met een bronverwijzing zoals [1]
-4 Als het antwoord niet in de passages staat zeg exact:
-
+1. Gebruik alleen informatie uit de bronpassages.
+2. Gebruik alleen passages die direct relevant zijn voor de vraag.
+3. Elke inhoudelijke zin eindigt met een bronverwijzing zoals [1].
+4. Als het antwoord niet direct uit de passages volgt, zeg exact:
 "Dit staat niet in de beschikbare wetstekst."
-
-Antwoord compact en juridisch.
+5. Voeg geen eigen interpretatie toe.
+6. Antwoord compact en juridisch.
 `.trim();
 
-    const aiResp = await fetch(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        method:"POST",
-        headers:{
-          "Content-Type":"application/json",
-          Authorization:`Bearer ${OPENAI_KEY}`
-        },
-        body: JSON.stringify({
-
-          model:"gpt-4o-mini",
-          temperature:0.1,
-          max_tokens:450,
-
-          messages:[
-            { role:"system", content:system },
-            {
-              role:"user",
-              content:
-`Vraag: ${question}
-
-Bronpassages:
-${context}`
-            }
-          ]
-
-        })
-      }
-    );
+    // 4) OpenAI answer
+    const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_KEY}`
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0.1,
+        max_tokens: 450,
+        messages: [
+          { role: "system", content: system },
+          {
+            role: "user",
+            content: `Vraag: ${question}\n\nBronpassages:\n${context}`
+          }
+        ]
+      })
+    });
 
     const aiText = await aiResp.text();
     const aiJson = safeJsonParse(aiText);
 
-    // -------------------------
-    // 5 FALLBACK
-    // -------------------------
-
+    // 5) Fallback als OpenAI faalt
     if (!aiResp.ok || !aiJson?.choices?.[0]?.message?.content) {
-
-      const fallback = pickHighlight(results[0].text);
-
+      const fallback = pickHighlight(results[0].excerpt || results[0].text || "");
       return res.status(200).json({
-
         answer: fallback ? `${fallback} [1]` : "Dit staat niet in de beschikbare wetstekst.",
-
-        sources:[{
-          n:1,
-          id:results[0].id,
-          title:results[0].label,
-          link:results[0].source_url,
-          highlight:pickHighlight(results[0].text)
-        }]
-
+        sources: [{
+          n: 1,
+          id: results[0].id,
+          title: results[0].label,
+          link: results[0].source_url,
+          highlight: pickHighlight(results[0].excerpt || results[0].text || "")
+        }],
+        debug: { openai_status: aiResp.status, openai_preview: aiText.slice(0, 200) }
       });
-
     }
 
-    let answer = stripModelLeakage(
-      aiJson.choices[0].message.content || ""
-    );
+    let answer = stripModelLeakage(aiJson.choices[0].message.content || "");
 
     if (!/\[\d+\]/.test(answer)) {
       answer = answer + " [1]";
     }
 
-    // -------------------------
-    // 6 BRONNEN FILTEREN
-    // -------------------------
-
-    const used = [...answer.matchAll(/\[(\d+)\]/g)]
-      .map(m => parseInt(m[1],10));
-
-    const filtered = results.filter((r,i)=> used.includes(i+1));
+    // 6) Alleen gebruikte bronnen tonen
+    const used = [...answer.matchAll(/\[(\d+)\]/g)].map(m => parseInt(m[1], 10));
+    const filtered = results.filter((r, i) => used.includes(i + 1));
 
     return res.status(200).json({
-
       answer,
-
-      sources:(filtered.length ? filtered : results.slice(0,3))
-        .map((r,i)=>({
-
-          n:i+1,
-          id:r.id,
-          title:r.label,
-          link:r.source_url,
-          highlight:pickHighlight(r.text)
-
-        }))
-
+      sources: (filtered.length ? filtered : results.slice(0, 3)).map((r, i) => ({
+        n: i + 1,
+        id: r.id,
+        title: r.label,
+        link: r.source_url,
+        highlight: pickHighlight(r.excerpt || r.text || "")
+      }))
     });
 
-  }
-
-  catch(e){
-
+  } catch (e) {
     return res.status(500).json({
-      error:"chat crashed",
-      details:String(e?.message || e)
+      error: "chat crashed",
+      details: String(e?.message || e)
     });
-
   }
-
 };
