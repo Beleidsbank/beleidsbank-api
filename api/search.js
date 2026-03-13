@@ -184,21 +184,37 @@ module.exports = async (req, res) => {
     // 2. PRIORITEITSWETTEN EERST
     // -------------------------
     const tokens = extractTokens(q);
-    const primaryToken = tokens[0] || q.split(/\s+/)[0] || q;
+    const primaryToken = tokens[0] || "";
+const secondaryToken = tokens[1] || "";
 
     let rows = [];
 
     rows.push(...await queryChunks({
-      docId: DOCS.awb,
-      textLike: primaryToken,
-      limit: 15
-    }));
+  docId: DOCS.awb,
+  textLike: primaryToken,
+  limit: 10
+}));
 
-    rows.push(...await queryChunks({
-      docId: DOCS.omgevingswet,
-      textLike: primaryToken,
-      limit: 15
-    }));
+if (secondaryToken) {
+  rows.push(...await queryChunks({
+    docId: DOCS.awb,
+    textLike: secondaryToken,
+    limit: 10
+  }));
+}
+rows.push(...await queryChunks({
+  docId: DOCS.omgevingswet,
+  textLike: primaryToken,
+  limit: 10
+}));
+
+if (secondaryToken) {
+  rows.push(...await queryChunks({
+    docId: DOCS.omgevingswet,
+    textLike: secondaryToken,
+    limit: 10
+  }));
+
 
     // -------------------------
     // 3. ALGEMENE FALLBACK
