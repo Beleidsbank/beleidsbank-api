@@ -74,7 +74,16 @@ module.exports = async (req, res) => {
         ? safeJsonParse(req.body) || {}
         : (req.body || {});
 
-    const question = (body.message || "").toString().trim();
+    let question = (body.message || "").toString().trim();
+let previous = (body.previous || "").toString().trim();
+
+if (
+  previous &&
+  /artikel\s+[0-9]/i.test(previous) &&
+  /^(awb|omgevingswet|bal)$/i.test(question)
+) {
+  question = previous + " " + question;
+}
 
     if (!question) {
       return res.status(400).json({ error: "Missing message" });
