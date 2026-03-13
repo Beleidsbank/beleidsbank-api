@@ -25,6 +25,8 @@ function cleanLegalText(text) {
     .replace(/\n[ \t]+/g, "\n")
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
+.replace(/\n([a-z])\.\n/g, "\n$1. ")
+.replace(/\n([0-9]+°?)\.\n/g, "\n$1. ")
     .trim();
 }
 
