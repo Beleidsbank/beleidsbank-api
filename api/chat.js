@@ -89,10 +89,10 @@ module.exports = async (req,res)=>{
           max_tokens:40,
           messages:[
             {
-              role:"systemPrompt",
-              content:
-              "Herschrijf de vraag naar een korte juridische zoekquery van maximaal 6 woorden."
-            },
+  role:"system",
+  content:
+  "Herschrijf de vraag naar een korte juridische zoekquery van maximaal 6 woorden."
+},
             {
               role:"user",
               content:question
@@ -186,16 +186,16 @@ Regels:
           temperature:0.1,
           max_tokens:500,
           messages: [
-  { role: "system", content: systemPrompt },
-            {
-              role:"user",
-              content:
+  { role: "system", content: system },
+  {
+    role:"user",
+    content:
 `Vraag: ${question}
 
 Bronpassages:
 ${context}`
-            }
-          ]
+  }
+]
         })
       }
     );
