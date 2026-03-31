@@ -4,7 +4,6 @@ module.exports = async (req, res) => {
     const SERVICE_KEY =
       process.env.SUPABASE_SERVICE_KEY ||
       process.env.SUPABASE_SERVICE_ROLE_KEY;
-
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
     if (!SUPABASE_URL) return res.status(500).json({ error: "SUPABASE_URL missing" });
@@ -18,10 +17,8 @@ module.exports = async (req, res) => {
 
     const limit = 40;
     const offset = parseInt(req.query.offset || "0", 10);
-
     const sourceUrl = `https://wetten.overheid.nl/${id}`;
 
-    // -------- CLEAN --------
     function cleanText(t) {
       return (t || "")
         .replace(/Toon relaties in LiDO/gi, "")
@@ -45,13 +42,11 @@ module.exports = async (req, res) => {
     function splitArticles(text) {
       const re = /Artikel\s+\d+[a-zA-Z]?(?::\d+[a-zA-Z]?)?/g;
       const matches = [...text.matchAll(re)];
-
       const blocks = [];
 
       for (let i = 0; i < matches.length; i++) {
         const start = matches[i].index;
         const end = i + 1 < matches.length ? matches[i + 1].index : text.length;
-
         const block = text.slice(start, end).trim();
         if (block.length > 100) blocks.push(block);
       }
@@ -65,7 +60,8 @@ module.exports = async (req, res) => {
         "BWBR0037885": "Omgevingswet",
         "BWBR0041330": "Bal",
         "BWBR0041297": "Bbl",
-        "BWBR0041313": "Bkl"
+        "BWBR0041313": "Bkl",
+        "BWBR0041298": "Wkb"
       };
       return map[id] || id;
     }
@@ -75,21 +71,23 @@ module.exports = async (req, res) => {
       return m?.[1] || "";
     }
 
-    // -------- FETCH --------
-    const html = await fetch(sourceUrl).then(r => r.text());
+    const htmlResp = await fetch(sourceUrl);
+    const html = await htmlResp.text();
+
+    if (!htmlResp.ok) {
+      return res.status(500).json({ error: "wetten.overheid fetch failed", details: html.slice(0, 300) });
+    }
 
     const plain = htmlToText(html);
     const articles = splitArticles(plain);
 
     if (!articles.length) {
-      return res.json({ error: "geen artikelen gevonden" });
+      return res.status(500).json({ error: "geen artikelen gevonden" });
     }
 
     const batch = articles.slice(offset, offset + limit);
-
     const lawName = getLawName(id);
 
-    // -------- EMBEDDINGS --------
     const embResp = await fetch("https://api.openai.com/v1/embeddings", {
       method: "POST",
       headers: {
@@ -102,21 +100,46 @@ module.exports = async (req, res) => {
       })
     });
 
-    const embJson = await embResp.json();
+    const embText = await embResp.text();
+    if (!embResp.ok) {
+      return res.status(500).json({ error: "embedding failed", details: embText.slice(0, 500) });
+    }
+
+    const embJson = JSON.parse(embText);
     const embeddings = embJson.data.map(d => d.embedding);
 
-    // -------- INSERT --------
+    const docResp = await fetch(`${SUPABASE_URL}/rest/v1/documents?on_conflict=id`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SERVICE_KEY,
+        Authorization: `Bearer ${SERVICE_KEY}`,
+        Prefer: "resolution=merge-duplicates"
+      },
+      body: JSON.stringify([{
+        id,
+        title: lawName,
+        source_url: sourceUrl
+      }])
+    });
+
+    const docText = await docResp.text();
+    if (!docResp.ok) {
+      return res.status(500).json({ error: "documents insert failed", details: docText.slice(0, 500) });
+    }
+
     for (let i = 0; i < batch.length; i++) {
       const raw = batch[i];
       const text = cleanText(raw);
       const article = getArticle(text);
 
-      await fetch(`${SUPABASE_URL}/rest/v1/chunks`, {
+      const chunkResp = await fetch(`${SUPABASE_URL}/rest/v1/chunks`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           apikey: SERVICE_KEY,
-          Authorization: `Bearer ${SERVICE_KEY}`
+          Authorization: `Bearer ${SERVICE_KEY}`,
+          Prefer: "return=representation"
         },
         body: JSON.stringify({
           doc_id: id,
@@ -128,6 +151,15 @@ module.exports = async (req, res) => {
           embedding: embeddings[i]
         })
       });
+
+      const chunkText = await chunkResp.text();
+      if (!chunkResp.ok) {
+        return res.status(500).json({
+          error: "chunk insert failed",
+          article,
+          details: chunkText.slice(0, 500)
+        });
+      }
     }
 
     return res.json({
@@ -138,6 +170,6 @@ module.exports = async (req, res) => {
     });
 
   } catch (e) {
-    return res.status(500).json({ error: String(e) });
+    return res.status(500).json({ error: String(e?.message || e) });
   }
 };
