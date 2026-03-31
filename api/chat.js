@@ -126,6 +126,77 @@ Regels:
     const searchQuery =
       rewriteJson?.choices?.[0]?.message?.content?.trim() || rawQuestion;
 
+
+    // --------------------------------
+// EXTRA: slimme intent detectie
+// --------------------------------
+
+const lowerQ = rawQuestion.toLowerCase();
+
+// 1. Als vraag onduidelijk is (artikel zonder wet)
+if (
+  lowerQ.includes("artikel") &&
+  !lowerQ.includes("awb") &&
+  !lowerQ.includes("omgevingswet") &&
+  !lowerQ.includes("bal") &&
+  !lowerQ.includes("bbl") &&
+  !lowerQ.includes("bkl") &&
+  !lowerQ.includes("wkb")
+) {
+  return res.status(200).json({
+    answer: "Over welke wet gaat het? Bijvoorbeeld Awb, Omgevingswet of Bal.",
+    sources: []
+  });
+}
+
+// 2. Follow-up detectie (samenvatten / uitleggen)
+const isFollowUp =
+  lowerQ.includes("samenvat") ||
+  lowerQ.includes("kort") ||
+  lowerQ.includes("leg uit") ||
+  lowerQ.includes("in simpele taal") ||
+  lowerQ.includes("in 2 regels");
+
+// als follow-up → GEEN nieuwe search doen
+if (isFollowUp && safeHistory.length > 0) {
+  const lastAnswer = safeHistory
+    .filter(m => m.role === "assistant")
+    .slice(-1)[0]?.content;
+
+  if (lastAnswer) {
+    const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_KEY}`
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0.3,
+        max_tokens: 200,
+        messages: [
+          {
+            role: "system",
+            content: "Herschrijf of vat de tekst samen volgens de vraag van de gebruiker. Voeg geen nieuwe informatie toe."
+          },
+          {
+            role: "user",
+            content: `Vraag: ${rawQuestion}\n\nTekst:\n${lastAnswer}`
+          }
+        ]
+      })
+    });
+
+    const aiJson = await aiResp.json();
+
+    return res.status(200).json({
+      answer: aiJson?.choices?.[0]?.message?.content || "",
+      sources: []
+    });
+  }
+}
+
+    
     const searchResp = await fetch(
       `https://beleidsbank-api.vercel.app/api/search?q=` + encodeURIComponent(searchQuery),
       { method: "GET" }
