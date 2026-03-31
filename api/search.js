@@ -58,7 +58,6 @@ module.exports = async (req, res) => {
       if (!article) return null;
       let a = article.trim();
 
-      // Awb gebruikt meestal dubbele punten, zoals 1:3 en 2:1
       if (lawName === "Awb" && /^\d+\.\d+[a-zA-Z]?$/.test(a)) {
         a = a.replace(".", ":");
       }
@@ -93,45 +92,29 @@ module.exports = async (req, res) => {
     let keywordResults = [];
     let vectorResults = [];
 
-    // 1. DIRECTE ARTIKELZOEKING
+    // 1. Directe artikelzoeking
     if (article) {
       try {
         let url =
           `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id,law_name,article_number` +
-          `&article_number=eq.${encodeURIComponent(article)}` +
-          `&limit=5`;
+          `&limit=10`;
 
         if (lawName) {
           url += `&law_name=eq.${encodeURIComponent(lawName)}`;
         }
 
+        url += `&or=(article_number.eq.${encodeURIComponent(article)},label.ilike.*${encodeURIComponent(article)}*)`;
+
         const resp = await fetch(url, { headers });
         const rows = await resp.json();
 
-        if (Array.isArray(rows) && rows.length) {
+        if (Array.isArray(rows)) {
           articleResults = rows;
-        } else {
-          // fallback: label exact-ish match
-          let fallbackUrl =
-            `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id,law_name,article_number` +
-            `&label=ilike.*${encodeURIComponent(article)}*` +
-            `&limit=5`;
-
-          if (lawName) {
-            fallbackUrl += `&law_name=eq.${encodeURIComponent(lawName)}`;
-          }
-
-          const fallbackResp = await fetch(fallbackUrl, { headers });
-          const fallbackRows = await fallbackResp.json();
-
-          if (Array.isArray(fallbackRows)) {
-            articleResults = fallbackRows;
-          }
         }
       } catch {}
     }
 
-    // 2. KEYWORD SEARCH
+    // 2. Keyword search
     try {
       for (const word of keywords.slice(0, 5)) {
         let url =
@@ -152,7 +135,7 @@ module.exports = async (req, res) => {
       }
     } catch {}
 
-    // 3. VECTOR SEARCH
+    // 3. Vector search
     try {
       if (OPENAI_KEY) {
         const embedResp = await fetch("https://api.openai.com/v1/embeddings", {
@@ -193,7 +176,7 @@ module.exports = async (req, res) => {
       }
     } catch {}
 
-    // 4. COMBINEREN + DEDUPEN
+    // 4. Combineren + dedupen
     const seen = new Set();
     const combined = [...articleResults, ...keywordResults, ...vectorResults].filter(r => {
       const key = `${r.doc_id || ""}-${r.label || ""}`;
@@ -210,27 +193,27 @@ module.exports = async (req, res) => {
       const rowLaw = (r.law_name || "").toLowerCase();
       const rowArticle = (r.article_number || "").toLowerCase();
 
-      if (lawName && rowLaw === lawName.toLowerCase()) score += 10;
-      if (lawName && label.includes(lawName.toLowerCase())) score += 4;
-
+      // Exact artikel altijd hoogste prioriteit
       if (article) {
-        if (rowArticle === article.toLowerCase()) score += 30;
-        else if (rowArticle.includes(article.toLowerCase())) score += 10;
-
-        if (label.includes(article.toLowerCase())) score += 8;
+        if (rowArticle === article.toLowerCase()) score += 1000;
+        if (label.includes(`artikel ${article.toLowerCase()}`)) score += 500;
       }
 
+      // Wetmatch
+      if (lawName && rowLaw === lawName.toLowerCase()) score += 50;
+      if (lawName && label.includes(lawName.toLowerCase())) score += 20;
+
+      // Keywords
       for (const word of keywords) {
-        if (txt.includes(word)) score += 4;
-        if (label.includes(word)) score += 2;
+        if (txt.includes(word)) score += 5;
+        if (label.includes(word)) score += 3;
       }
 
-      // generieke definitie-signalen
+      // Algemene definitie-signalen
       if (txt.includes("wordt verstaan")) score += 5;
-      if (txt.includes("onder ") && txt.includes("wordt verstaan")) score += 3;
       if (txt.includes("schriftelijke beslissing")) score += 4;
 
-      // generieke themasignalen
+      // Thema-signalen
       if (q.includes("bezwaar")) {
         if (txt.includes("bezwaar")) score += 8;
         if (txt.includes("besluit")) score += 3;
