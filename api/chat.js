@@ -45,6 +45,79 @@ function pickHighlight(text) {
   return (preferred || lines[0] || raw).slice(0, 240);
 }
 
+function detectLaw(text) {
+  const q = (text || "").toLowerCase();
+  if (q.includes("awb")) return "Awb";
+  if (q.includes("omgevingswet")) return "Omgevingswet";
+  if (q.includes("bal")) return "Bal";
+  if (q.includes("bbl")) return "Bbl";
+  if (q.includes("bkl")) return "Bkl";
+  if (q.includes("wkb")) return "Wkb";
+  return null;
+}
+
+function hasArticleReference(text) {
+  const q = (text || "").toLowerCase();
+  return (
+    /artikel\s+[0-9a-z.:-]+/i.test(q) ||
+    /\bart\.?\s*[0-9a-z.:-]+/i.test(q) ||
+    /\b[0-9]+(?::|\.)[0-9a-z.-]+\b/i.test(q)
+  );
+}
+
+function isFollowUpQuestion(text) {
+  const q = (text || "").toLowerCase();
+  return [
+    "kan je dit samenvatten",
+    "kun je dit samenvatten",
+    "vat dit samen",
+    "samenvat",
+    "samenvatten",
+    "leg dit uit",
+    "leg uit",
+    "in simpele taal",
+    "korter",
+    "in 2 regels",
+    "in twee regels",
+    "wat betekent dit",
+    "in de praktijk",
+    "wanneer geldt dit niet",
+    "herschrijf",
+    "voor een rapport",
+    "maak hier",
+    "kort samen"
+  ].some(p => q.includes(p));
+}
+
+function extractLastSourceContext(history) {
+  const msgs = [...history].reverse();
+
+  let lastAssistantWithSources = null;
+  for (const msg of msgs) {
+    if (msg.role === "assistant" && typeof msg.content === "string" && msg.content.includes("Bronnen:")) {
+      lastAssistantWithSources = msg.content;
+      break;
+    }
+  }
+
+  if (!lastAssistantWithSources) return null;
+
+  const parts = lastAssistantWithSources.split("Bronnen:");
+  const answerText = (parts[0] || "").trim();
+  const sourcesText = (parts[1] || "").trim();
+
+  const sourceLines = sourcesText
+    .split("\n")
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  return {
+    answerText,
+    sourcesText,
+    sourceLines
+  };
+}
+
 module.exports = async (req, res) => {
   const origin = (req.headers.origin || "").toString();
 
@@ -81,31 +154,103 @@ module.exports = async (req, res) => {
 
     const safeHistory = history
       .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-      .slice(-12)
+      .slice(-16)
       .map(m => ({
         role: m.role,
-        content: String(m.content).slice(0, 1200)
+        content: String(m.content).slice(0, 3000)
       }));
 
+    const lowerQ = rawQuestion.toLowerCase();
+    const followUp = isFollowUpQuestion(rawQuestion);
+    const lawInQuestion = detectLaw(rawQuestion);
+    const lastContext = extractLastSourceContext(safeHistory);
+
+    // 1. Onduidelijke artikelvraag -> eerst doorvragen
+    if (hasArticleReference(rawQuestion) && !lawInQuestion) {
+      return res.status(200).json({
+        answer: "Over welke wet gaat het? Bijvoorbeeld Awb, Omgevingswet of Bal.",
+        sources: []
+      });
+    }
+
+    // 2. Follow-up op bestaand artikel/antwoord -> GEEN nieuwe search
+    if (followUp && lastContext?.answerText) {
+      const followUpSystem = `
+Je bent Beleidsbank.
+
+Je bewerkt of legt alleen de aangeleverde tekst uit.
+Gebruik uitsluitend de aangeleverde tekst en voeg geen nieuwe juridische informatie of nieuwe artikelen toe.
+
+Regels:
+1. Blijf volledig binnen de aangeleverde tekst.
+2. Voeg geen nieuwe bronnen of wetsartikelen toe.
+3. Als de gebruiker vraagt om een samenvatting: vat samen.
+4. Als de gebruiker vraagt om uitleg in simpele taal: leg simpel uit.
+5. Als de gebruiker vraagt "wat betekent dit in de praktijk": leg praktisch uit, maar alleen op basis van de tekst.
+6. Als de gebruiker vraagt "wanneer geldt dit niet" en dat staat niet in de tekst, zeg exact:
+"Dat volgt niet direct uit de eerder gevonden artikeltekst."
+7. Houd het antwoord kort en helder.
+8. Noem niet dat je een AI bent.
+
+Schrijf in het Nederlands.
+`.trim();
+
+      const followUpResp = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${OPENAI_KEY}`
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          temperature: 0.2,
+          max_tokens: 220,
+          messages: [
+            { role: "system", content: followUpSystem },
+            {
+              role: "user",
+              content:
+`Gebruikersvraag:
+${rawQuestion}
+
+Eerder gevonden tekst:
+${lastContext.answerText}`
+            }
+          ]
+        })
+      });
+
+      const followUpText = await followUpResp.text();
+      const followUpJson = safeJsonParse(followUpText);
+      const answer = stripModelLeakage(followUpJson?.choices?.[0]?.message?.content || "").trim();
+
+      return res.status(200).json({
+        answer: answer || "Dat volgt niet direct uit de eerder gevonden artikeltekst.",
+        sources: []
+      });
+    }
+
+    // 3. Zoekquery maken met context
     const rewriteSystem = `
 Je zet een gebruikersvraag plus chatgeschiedenis om naar één korte juridische zoekquery.
 
 BELANGRIJK:
 1. Combineer context uit eerdere berichten.
-2. Als gebruiker eerst een artikel noemt en daarna een wet → combineer die.
-3. Als gebruiker alleen een wet noemt → combineer met laatste artikel.
-4. Als gebruiker zegt "deze" of "dit" → gebruik vorige context.
+2. Als gebruiker eerst een artikel noemt en daarna een wet noemt, combineer die context.
+3. Als gebruiker alleen een wet noemt als antwoord op een eerdere artikelvraag, combineer die met het laatst genoemde artikel.
+4. Als gebruiker een nieuwe zelfstandige vraag stelt, gebruik alleen die vraag.
+5. Bij follow-up zoals "dit", "deze", "samenvatten" of "leg uit" mag je alleen context meenemen als het duidelijk over hetzelfde artikel gaat.
 
 Voorbeelden:
 - "artikel 1:3" + "Awb" -> "artikel 1:3 awb"
-- "artikel 1:3" + "Omgevingswet" -> "artikel 1:3 omgevingswet"
-- "wat is een besluit?" + "Awb" -> "besluit awb"
-- "deze samenvatten" -> gebruik vorige tekst
+- "artikel 1.3" + "Omgevingswet" -> "artikel 1.3 omgevingswet"
+- "wat is belanghebbende" + "Awb" -> "belanghebbende awb"
+- "Geef nu die van AWB" na "artikel 1.3" -> "artikel 1.3 awb"
 
 Regels:
-- Geef alleen de zoekquery
+- Geef alleen de zoekquery terug
 - Geen uitleg
-`;
+`.trim();
 
     const rewriteMessages = [
       { role: "system", content: rewriteSystem },
@@ -122,7 +267,7 @@ Regels:
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0,
-        max_tokens: 40,
+        max_tokens: 50,
         messages: rewriteMessages
       })
     });
@@ -132,77 +277,7 @@ Regels:
     const searchQuery =
       rewriteJson?.choices?.[0]?.message?.content?.trim() || rawQuestion;
 
-
-    // --------------------------------
-// EXTRA: slimme intent detectie
-// --------------------------------
-
-const lowerQ = rawQuestion.toLowerCase();
-
-// 1. Als vraag onduidelijk is (artikel zonder wet)
-if (
-  lowerQ.includes("artikel") &&
-  !lowerQ.includes("awb") &&
-  !lowerQ.includes("omgevingswet") &&
-  !lowerQ.includes("bal") &&
-  !lowerQ.includes("bbl") &&
-  !lowerQ.includes("bkl") &&
-  !lowerQ.includes("wkb")
-) {
-  return res.status(200).json({
-    answer: "Over welke wet gaat het? Bijvoorbeeld Awb, Omgevingswet of Bal.",
-    sources: []
-  });
-}
-
-// 2. Follow-up detectie (samenvatten / uitleggen)
-const isFollowUp =
-  lowerQ.includes("samenvat") ||
-  lowerQ.includes("kort") ||
-  lowerQ.includes("leg uit") ||
-  lowerQ.includes("in simpele taal") ||
-  lowerQ.includes("in 2 regels");
-
-// als follow-up → GEEN nieuwe search doen
-if (isFollowUp && safeHistory.length > 0) {
-  const lastAnswer = safeHistory
-    .filter(m => m.role === "assistant")
-    .slice(-1)[0]?.content;
-
-  if (lastAnswer) {
-    const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_KEY}`
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        temperature: 0.3,
-        max_tokens: 200,
-        messages: [
-          {
-            role: "system",
-            content: "Herschrijf of vat de tekst samen volgens de vraag van de gebruiker. Voeg geen nieuwe informatie toe."
-          },
-          {
-            role: "user",
-            content: `Vraag: ${rawQuestion}\n\nTekst:\n${lastAnswer}`
-          }
-        ]
-      })
-    });
-
-    const aiJson = await aiResp.json();
-
-    return res.status(200).json({
-      answer: aiJson?.choices?.[0]?.message?.content || "",
-      sources: []
-    });
-  }
-}
-
-    
+    // 4. Search
     const searchResp = await fetch(
       `https://beleidsbank-api.vercel.app/api/search?q=` + encodeURIComponent(searchQuery),
       { method: "GET" }
@@ -227,7 +302,8 @@ if (isFollowUp && safeHistory.length > 0) {
       });
     }
 
-    if (/artikel\s+[0-9]/i.test(searchQuery)) {
+    // 5. Directe artikelvraag -> artikel tonen
+    if (hasArticleReference(searchQuery)) {
       const r = results[0];
       const cleaned = cleanLegalText(r.text || "");
 
@@ -243,6 +319,7 @@ if (isFollowUp && safeHistory.length > 0) {
       });
     }
 
+    // 6. Normale inhoudelijke vraag
     const context = results
       .map((r, i) => {
         const txt = cleanLegalText((r.excerpt || r.text || "").slice(0, 900));
@@ -258,12 +335,11 @@ Geef een correct en betrouwbaar antwoord op basis van de bronpassages.
 
 BELANGRIJK:
 1. Gebruik alleen informatie die letterlijk of direct logisch uit de bronpassages volgt.
-2. Gebruik MAXIMAAL 2 artikelen.
+2. Gebruik maximaal 2 artikelen.
 3. Gebruik alleen de meest relevante artikelen.
-4. Voeg GEEN extra artikelen toe voor context.
-5. Als een artikel niet direct nodig is: niet noemen.
-6. Als je twijfelt: niet noemen.
-7. Gebruik zo veel mogelijk formuleringen die dicht bij de wetstekst blijven.
+4. Voeg geen extra artikelen toe voor context.
+5. Als je twijfelt: niet noemen.
+6. Gebruik zo veel mogelijk formuleringen die dicht bij de wetstekst blijven.
 
 ANTWOORDSTRUCTUUR:
 - Begin met een kort en duidelijk antwoord.
@@ -300,7 +376,8 @@ Schrijf in het Nederlands.
           { role: "system", content: answerSystem },
           {
             role: "user",
-            content: `Vraag: ${rawQuestion}
+            content:
+`Vraag: ${rawQuestion}
 
 Zoekquery: ${searchQuery}
 
