@@ -4,14 +4,6 @@ function safeJsonParse(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
 
-function stripModelLeakage(text) {
-  return (text || "")
-    .replace(/you are trained on data up to.*$/gmi, "")
-    .replace(/as an ai language model.*$/gmi, "")
-    .replace(/als (een )?ai(-| )?taalmodel.*$/gmi, "")
-    .trim();
-}
-
 function cleanLegalText(text) {
   return (text || "")
     .replace(/Toon relaties in LiDO/gi, "")
@@ -54,14 +46,18 @@ function isFollowUpQuestion(text) {
   ].some(p => q.includes(p));
 }
 
+// 🔥 NIEUWE CONTEXT FIX
 function extractLastContext(history) {
   const reversed = [...history].reverse();
 
   for (const msg of reversed) {
-    if (msg.role === "assistant" && msg.content.includes("Artikel")) {
-      return msg.content;
+    if (msg.role === "assistant" && msg.content.includes("Bronnen:")) {
+      const parts = msg.content.split("Bronnen:");
+      const mainText = parts[0].trim();
+      return mainText;
     }
   }
+
   return null;
 }
 
@@ -83,7 +79,7 @@ module.exports = async (req, res) => {
     const lawInQuestion = detectLaw(rawQuestion);
     const lastContext = extractLastContext(safeHistory);
 
-    // ✅ 1. FOLLOW-UP FIRST (FIX)
+    // ✅ 1. FOLLOW-UP (geen nieuwe search)
     if (followUp && lastContext) {
       const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
@@ -98,7 +94,22 @@ module.exports = async (req, res) => {
           messages: [
             {
               role: "system",
-              content: "Gebruik alleen de gegeven tekst. Voeg geen nieuwe artikelen toe."
+              content: `
+Je krijgt een artikeltekst.
+
+Regels:
+1. Gebruik alleen deze tekst
+2. Voeg geen nieuwe artikelen toe
+3. Verzin geen informatie
+4. Als iets niet in de tekst staat, zeg dat
+
+Taken:
+- samenvatten → kort
+- uitleggen → simpel
+- praktijk → begrijpelijk uitleggen
+
+Blijf altijd bij deze tekst.
+`
             },
             {
               role: "user",
@@ -130,7 +141,6 @@ module.exports = async (req, res) => {
     );
 
     const searchJson = await searchResp.json();
-
     const results = searchJson?.results || [];
 
     if (!results.length) {
