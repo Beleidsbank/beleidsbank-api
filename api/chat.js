@@ -1,4 +1,4 @@
-const ALLOW_ORIGIN = "https://app.beleidsbank.nl";
+const ALLOW_ORIGIN = "*";
 
 function safeJsonParse(s) {
   try { return JSON.parse(s); } catch { return null; }
@@ -9,8 +9,6 @@ function cleanLegalText(text) {
     .replace(/Toon relaties in LiDO/gi, "")
     .replace(/Maak een permanente link/gi, "")
     .replace(/Toon wetstechnische informatie/gi, "")
-    .replace(/Druk het regelingonderdeel af/gi, "")
-    .replace(/Sla het regelingonderdeel op/gi, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -46,15 +44,13 @@ function isFollowUpQuestion(text) {
   ].some(p => q.includes(p));
 }
 
-// 🔥 NIEUWE CONTEXT FIX
 function extractLastContext(history) {
   const reversed = [...history].reverse();
 
   for (const msg of reversed) {
     if (msg.role === "assistant" && msg.content.includes("Bronnen:")) {
       const parts = msg.content.split("Bronnen:");
-      const mainText = parts[0].trim();
-      return mainText;
+      return parts[0].trim();
     }
   }
 
@@ -62,6 +58,16 @@ function extractLastContext(history) {
 }
 
 module.exports = async (req, res) => {
+  // ✅ CORS FIX
+  const origin = req.headers.origin || "";
+  res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
   try {
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
@@ -79,7 +85,7 @@ module.exports = async (req, res) => {
     const lawInQuestion = detectLaw(rawQuestion);
     const lastContext = extractLastContext(safeHistory);
 
-    // ✅ 1. FOLLOW-UP (geen nieuwe search)
+    // ✅ 1. FOLLOW-UP (GEEN SEARCH)
     if (followUp && lastContext) {
       const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
@@ -95,20 +101,16 @@ module.exports = async (req, res) => {
             {
               role: "system",
               content: `
-Je krijgt een artikeltekst.
+Gebruik alleen de gegeven tekst.
+Voeg geen nieuwe artikelen toe.
+Verzin niets.
 
-Regels:
-1. Gebruik alleen deze tekst
-2. Voeg geen nieuwe artikelen toe
-3. Verzin geen informatie
-4. Als iets niet in de tekst staat, zeg dat
+Als iets niet in de tekst staat, zeg dat.
 
 Taken:
 - samenvatten → kort
 - uitleggen → simpel
-- praktijk → begrijpelijk uitleggen
-
-Blijf altijd bij deze tekst.
+- praktijk → begrijpelijk
 `
             },
             {
@@ -121,15 +123,15 @@ Blijf altijd bij deze tekst.
 
       const json = await aiResp.json();
 
-      return res.json({
+      return res.status(200).json({
         answer: json?.choices?.[0]?.message?.content || "",
         sources: []
       });
     }
 
-    // ✅ 2. Onduidelijke artikelvraag
+    // ✅ 2. ONDUIDELIJK ARTIKEL
     if (hasArticleReference(rawQuestion) && !lawInQuestion) {
-      return res.json({
+      return res.status(200).json({
         answer: "Over welke wet gaat het? Bijvoorbeeld Awb, Omgevingswet of Bal.",
         sources: []
       });
@@ -144,7 +146,7 @@ Blijf altijd bij deze tekst.
     const results = searchJson?.results || [];
 
     if (!results.length) {
-      return res.json({
+      return res.status(200).json({
         answer: "Ik heb geen relevante artikelen gevonden.",
         sources: []
       });
@@ -152,7 +154,7 @@ Blijf altijd bij deze tekst.
 
     const top = results[0];
 
-    return res.json({
+    return res.status(200).json({
       answer: `Ik heb het relevante artikel gevonden.\n\n${cleanLegalText(top.text)}`,
       sources: [
         {
