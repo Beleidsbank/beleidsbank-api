@@ -25,8 +25,6 @@ function cleanLegalText(text) {
     .replace(/\n[ \t]+/g, "\n")
     .replace(/[ \t]{2,}/g, " ")
     .replace(/\n{3,}/g, "\n\n")
-    .replace(/\n([a-z])\.\n/g, "\n$1. ")
-    .replace(/\n([0-9]+°?)\.\n/g, "\n$1. ")
     .trim();
 }
 
@@ -44,7 +42,7 @@ function pickHighlight(text) {
     l.toLowerCase().includes("schriftelijke beslissing")
   );
 
-  return (preferred || lines[0] || raw).slice(0, 220);
+  return (preferred || lines[0] || raw).slice(0, 240);
 }
 
 module.exports = async (req, res) => {
@@ -81,7 +79,6 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: "Missing message" });
     }
 
-    // Alleen veilige history doorlaten
     const safeHistory = history
       .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
       .slice(-12)
@@ -90,16 +87,19 @@ module.exports = async (req, res) => {
         content: String(m.content).slice(0, 1200)
       }));
 
-    // 1) AI maakt context-aware zoekquery
+    // 1) Zoekquery maken
     const rewriteSystem = `
 Je zet een gebruikersvraag plus korte chatgeschiedenis om naar één korte juridische zoekquery.
+
 Regels:
 1. Geef alleen de zoekquery terug, geen uitleg.
-2. Als de gebruiker alleen een wetnaam antwoordt op een eerdere artikelvraag, combineer die context.
-3. Voorbeelden:
+2. Als de gebruiker alleen een wetnaam antwoordt op een eerdere vraag, combineer die context.
+3. Houd de zoekquery kort en bruikbaar voor wetgeving.
+4. Voorbeelden:
 - "Artikel 3:40" + "Awb" -> "artikel 3:40 awb"
-- "Wat is een besluit?" -> "besluit"
-- "Wanneer treedt een besluit in werking?" -> "besluit in werking bekendgemaakt"
+- "Wat is een besluit?" + "Awb" -> "besluit awb"
+- "Wanneer is bezwaar mogelijk?" -> "bezwaar mogelijk awb"
+- "Artikel 5.1" + "Omgevingswet" -> "artikel 5.1 omgevingswet"
 `.trim();
 
     const rewriteMessages = [
@@ -143,30 +143,22 @@ Regels:
       });
     }
 
-    // 3) Ambigue artikelvraag -> doorvragen
-    if (searchJson?.ambiguous && searchJson?.question) {
-      return res.status(200).json({
-        answer: searchJson.question,
-        sources: []
-      });
-    }
-
-    const results = (searchJson.results || []).slice(0, 12);
+    const results = (searchJson.results || []).slice(0, 10);
 
     if (!results.length) {
       return res.status(200).json({
-        answer: "Ik heb nog geen relevante wetgeving in de database gevonden.",
+        answer: "Ik heb geen relevante artikelen gevonden in de huidige wetgeving.",
         sources: []
       });
     }
 
-    // 4) Artikelvraag: direct artikel tonen, geen AI samenvatting
+    // 3) Bij directe artikelvraag: artikel tonen + korte intro
     if (/artikel\s+[0-9]/i.test(searchQuery)) {
       const r = results[0];
       const cleaned = cleanLegalText(r.text || "");
 
       return res.status(200).json({
-        answer: cleaned,
+        answer: `Ik heb het relevante artikel gevonden.\n\n${cleaned}`,
         sources: [{
           n: 1,
           id: r.id,
@@ -177,25 +169,38 @@ Regels:
       });
     }
 
-    // 5) Context opbouwen
+    // 4) Context opbouwen
     const context = results
       .map((r, i) => {
-        const txt = cleanLegalText((r.excerpt || r.text || "").slice(0, 700));
-        return `[${i + 1}] ${txt}`;
+        const txt = cleanLegalText((r.excerpt || r.text || "").slice(0, 900));
+        return `[${i + 1}] ${r.label}\n${txt}`;
       })
       .join("\n\n");
 
+    // 5) Antwoord prompt
     const answerSystem = `
-Je bent Beleidsbank.
+Je bent Beleidsbank, een juridische AI-assistent voor Nederlandse wetgeving.
+
+Doel:
+Geef een duidelijk, behulpzaam en natuurlijk antwoord, maar uitsluitend op basis van de aangeleverde bronpassages.
 
 Regels:
 1. Gebruik alleen informatie uit de bronpassages.
-2. Gebruik alleen passages die direct relevant zijn voor de vraag.
-3. Elke inhoudelijke zin eindigt met een bronverwijzing zoals [1].
-4. Als het antwoord niet direct uit de passages volgt, zeg exact:
-"Dit staat niet in de beschikbare wetstekst."
-5. Voeg geen eigen interpretatie toe.
-6. Antwoord compact en juridisch.
+2. Voeg geen eigen juridische kennis, aannames of interpretaties toe buiten de passages.
+3. Schrijf natuurlijk en behulpzaam, alsof je een professionele assistent bent.
+4. Wees iets uitgebreider dan een kale zoekmachine, maar blijf compact.
+5. Als de vraag niet direct uit de passages te beantwoorden is, zeg exact:
+"Ik kan dit niet goed beantwoorden op basis van de gevonden artikelen."
+6. Gebruik bronverwijzingen in de tekst, zoals [1] of [2].
+7. Eindig niet elke zin geforceerd met een bron; gebruik bronnen logisch per bewering of alinea.
+8. Structuur:
+   - begin met een kort antwoord
+   - geef daarna indien relevant een korte toelichting
+   - noem daarna de belangrijkste relevante artikelen
+9. Gebruik geen markdown koppen met #.
+10. Noem nooit dat je een AI-model bent.
+
+Schrijf in het Nederlands.
 `.trim();
 
     // 6) AI antwoord
@@ -207,13 +212,18 @@ Regels:
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        temperature: 0.1,
-        max_tokens: 450,
+        temperature: 0.2,
+        max_tokens: 550,
         messages: [
           { role: "system", content: answerSystem },
           {
             role: "user",
-            content: `Vraag: ${rawQuestion}\n\nZoekquery: ${searchQuery}\n\nBronpassages:\n${context}`
+            content: `Vraag: ${rawQuestion}
+
+Zoekquery: ${searchQuery}
+
+Bronpassages:
+${context}`
           }
         ]
       })
@@ -222,11 +232,10 @@ Regels:
     const aiText = await aiResp.text();
     const aiJson = safeJsonParse(aiText);
 
-    // 7) Fallback als OpenAI faalt
     if (!aiResp.ok || !aiJson?.choices?.[0]?.message?.content) {
       const fallback = pickHighlight(results[0].excerpt || results[0].text || "");
       return res.status(200).json({
-        answer: fallback ? `${fallback} [1]` : "Dit staat niet in de beschikbare wetstekst.",
+        answer: fallback || "Ik kan dit niet goed beantwoorden op basis van de gevonden artikelen.",
         sources: [{
           n: 1,
           id: results[0].id,
@@ -237,13 +246,12 @@ Regels:
       });
     }
 
-    let answer = stripModelLeakage(aiJson.choices[0].message.content || "");
+    let answer = stripModelLeakage(aiJson.choices[0].message.content || "").trim();
 
-    if (!/\[\d+\]/.test(answer)) {
-      answer = answer + " [1]";
+    if (!answer) {
+      answer = "Ik kan dit niet goed beantwoorden op basis van de gevonden artikelen.";
     }
 
-    // 8) Alleen gebruikte bronnen tonen
     const used = [...answer.matchAll(/\[(\d+)\]/g)].map(m => parseInt(m[1], 10));
     const filtered = results.filter((r, i) => used.includes(i + 1));
 
