@@ -77,7 +77,6 @@ module.exports = async (req, res) => {
     let keywordResults = [];
     let vectorResults = [];
 
-    // 1. DIRECTE ARTIKELZOEKING
     if (article) {
       try {
         let url =
@@ -98,7 +97,6 @@ module.exports = async (req, res) => {
       } catch {}
     }
 
-    // 2. KEYWORD SEARCH
     try {
       for (const word of keywords.slice(0, 5)) {
         let url =
@@ -119,7 +117,6 @@ module.exports = async (req, res) => {
       }
     } catch {}
 
-    // 3. VECTOR SEARCH
     try {
       if (OPENAI_KEY) {
         const embedResp = await fetch("https://api.openai.com/v1/embeddings", {
@@ -158,7 +155,6 @@ module.exports = async (req, res) => {
       }
     } catch {}
 
-    // 4. COMBINEREN + DEDUPEN
     const seen = new Set();
     const combined = [...articleResults, ...keywordResults, ...vectorResults].filter(r => {
       const key = `${r.doc_id || ""}-${r.label || ""}`;
@@ -188,13 +184,27 @@ module.exports = async (req, res) => {
         if (label.includes(word)) score += 2;
       }
 
-      // generieke definitie-signalen, niet hardcoded op specifieke wetten/artikelen
       if (txt.includes("wordt verstaan")) score += 5;
       if (txt.includes("onder ") && txt.includes("wordt verstaan")) score += 3;
       if (txt.includes("schriftelijke beslissing")) score += 4;
-      if (txt.includes("aanvraag")) score += 1;
-      if (txt.includes("bezwaar")) score += 2;
-      if (txt.includes("beroep")) score += 1;
+
+      if (q.includes("bezwaar")) {
+        if (txt.includes("bezwaar")) score += 8;
+        if (txt.includes("besluit")) score += 4;
+        if (txt.includes("beroep")) score += 2;
+      }
+
+      if (q.includes("belanghebbende")) {
+        if (txt.includes("belanghebbende")) score += 8;
+        if (txt.includes("degene wiens belang")) score += 4;
+      }
+
+      if (q.includes("handhaven") || q.includes("handhaving")) {
+        if (txt.includes("last onder bestuursdwang")) score += 4;
+        if (txt.includes("last onder dwangsom")) score += 4;
+        if (txt.includes("bestuursdwang")) score += 3;
+        if (txt.includes("dwangsom")) score += 3;
+      }
 
       if ((r.similarity || 0) > 0.7) score += 4;
       if ((r.similarity || 0) > 0.8) score += 4;
@@ -206,7 +216,7 @@ module.exports = async (req, res) => {
       .map(r => ({ ...r, _score: scoreResult(r) }))
       .sort((a, b) => b._score - a._score);
 
-    const results = sorted.slice(0, 6).map(r => ({
+    const results = sorted.slice(0, 4).map(r => ({
       id: r.id,
       label: r.label,
       text: clean(r.text),
