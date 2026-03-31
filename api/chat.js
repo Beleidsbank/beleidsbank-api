@@ -143,7 +143,7 @@ Regels:
       });
     }
 
-    const results = (searchJson.results || []).slice(0, 10);
+    const results = (searchJson.results || []).slice(0, 4);
 
     if (!results.length) {
       return res.status(200).json({
