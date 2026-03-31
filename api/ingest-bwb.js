@@ -74,10 +74,6 @@ module.exports = async (req, res) => {
     const htmlResp = await fetch(sourceUrl);
     const html = await htmlResp.text();
 
-    if (!htmlResp.ok) {
-      return res.status(500).json({ error: "wetten.overheid fetch failed", details: html.slice(0, 300) });
-    }
-
     const plain = htmlToText(html);
     const articles = splitArticles(plain);
 
@@ -88,6 +84,9 @@ module.exports = async (req, res) => {
     const batch = articles.slice(offset, offset + limit);
     const lawName = getLawName(id);
 
+    // 👉 FIX: veilige input
+    const safeBatch = batch.map(t => (t || "").slice(0, 8000)).filter(Boolean);
+
     const embResp = await fetch("https://api.openai.com/v1/embeddings", {
       method: "POST",
       headers: {
@@ -96,50 +95,25 @@ module.exports = async (req, res) => {
       },
       body: JSON.stringify({
         model: "text-embedding-3-small",
-        input: batch
+        input: safeBatch
       })
     });
 
-    const embText = await embResp.text();
-    if (!embResp.ok) {
-      return res.status(500).json({ error: "embedding failed", details: embText.slice(0, 500) });
-    }
-
-    const embJson = JSON.parse(embText);
+    const embJson = await embResp.json();
     const embeddings = embJson.data.map(d => d.embedding);
 
-    const docResp = await fetch(`${SUPABASE_URL}/rest/v1/documents?on_conflict=id`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: SERVICE_KEY,
-        Authorization: `Bearer ${SERVICE_KEY}`,
-        Prefer: "resolution=merge-duplicates"
-      },
-      body: JSON.stringify([{
-        id,
-        title: lawName,
-        source_url: sourceUrl
-      }])
-    });
-
-    const docText = await docResp.text();
-    if (!docResp.ok) {
-      return res.status(500).json({ error: "documents insert failed", details: docText.slice(0, 500) });
-    }
-
-    for (let i = 0; i < batch.length; i++) {
-      const raw = batch[i];
+    for (let i = 0; i < safeBatch.length; i++) {
+      const raw = safeBatch[i];
       const text = cleanText(raw);
       const article = getArticle(text);
 
-      const chunkResp = await fetch(`${SUPABASE_URL}/rest/v1/chunks`, {
+      await fetch(`${SUPABASE_URL}/rest/v1/chunks?on_conflict=doc_id,label`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           apikey: SERVICE_KEY,
           Authorization: `Bearer ${SERVICE_KEY}`,
-          Prefer: "return=representation"
+          Prefer: "resolution=merge-duplicates"
         },
         body: JSON.stringify({
           doc_id: id,
@@ -151,25 +125,15 @@ module.exports = async (req, res) => {
           embedding: embeddings[i]
         })
       });
-
-      const chunkText = await chunkResp.text();
-      if (!chunkResp.ok) {
-        return res.status(500).json({
-          error: "chunk insert failed",
-          article,
-          details: chunkText.slice(0, 500)
-        });
-      }
     }
 
     return res.json({
       ok: true,
-      total_articles: articles.length,
-      processed: batch.length,
+      processed: safeBatch.length,
       next: `/api/ingest-bwb?id=${id}&offset=${offset + limit}`
     });
 
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    return res.status(500).json({ error: String(e) });
   }
 };
