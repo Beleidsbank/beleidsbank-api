@@ -87,7 +87,6 @@ module.exports = async (req, res) => {
         content: String(m.content).slice(0, 1200)
       }));
 
-    // 1) Zoekquery maken
     const rewriteSystem = `
 Je zet een gebruikersvraag plus korte chatgeschiedenis om naar één korte juridische zoekquery.
 
@@ -98,7 +97,7 @@ Regels:
 4. Voorbeelden:
 - "Artikel 3:40" + "Awb" -> "artikel 3:40 awb"
 - "Wat is een besluit?" + "Awb" -> "besluit awb"
-- "Wanneer is bezwaar mogelijk?" -> "bezwaar mogelijk awb"
+- "Wanneer is bezwaar mogelijk?" -> "bezwaar awb"
 - "Artikel 5.1" + "Omgevingswet" -> "artikel 5.1 omgevingswet"
 `.trim();
 
@@ -127,7 +126,6 @@ Regels:
     const searchQuery =
       rewriteJson?.choices?.[0]?.message?.content?.trim() || rawQuestion;
 
-    // 2) Search
     const searchResp = await fetch(
       `https://beleidsbank-api.vercel.app/api/search?q=` + encodeURIComponent(searchQuery),
       { method: "GET" }
@@ -143,7 +141,7 @@ Regels:
       });
     }
 
-    const results = (searchJson.results || []).slice(0, 4);
+    const results = (searchJson.results || []).slice(0, 2);
 
     if (!results.length) {
       return res.status(200).json({
@@ -152,7 +150,6 @@ Regels:
       });
     }
 
-    // 3) Bij directe artikelvraag: artikel tonen + korte intro
     if (/artikel\s+[0-9]/i.test(searchQuery)) {
       const r = results[0];
       const cleaned = cleanLegalText(r.text || "");
@@ -169,7 +166,6 @@ Regels:
       });
     }
 
-    // 4) Context opbouwen
     const context = results
       .map((r, i) => {
         const txt = cleanLegalText((r.excerpt || r.text || "").slice(0, 900));
@@ -177,7 +173,6 @@ Regels:
       })
       .join("\n\n");
 
-    // 5) Antwoord prompt
     const answerSystem = `
 Je bent Beleidsbank, een juridische AI-assistent voor Nederlandse wetgeving.
 
@@ -186,30 +181,33 @@ Geef een correct en betrouwbaar antwoord op basis van de bronpassages.
 
 BELANGRIJK:
 1. Gebruik alleen informatie die letterlijk of direct logisch uit de bronpassages volgt.
-2. Gebruik MAXIMAAL 2 tot 3 artikelen.
-3. Gebruik alleen de meest relevante artikelen (geen extra).
-4. Voeg GEEN extra artikelen toe "voor context".
-5. Als een artikel niet direct nodig is → NIET noemen.
-6. Als je twijfelt → NIET noemen.
+2. Gebruik MAXIMAAL 2 artikelen.
+3. Gebruik alleen de meest relevante artikelen.
+4. Voeg GEEN extra artikelen toe voor context.
+5. Als een artikel niet direct nodig is: niet noemen.
+6. Als je twijfelt: niet noemen.
 
 ANTWOORDSTRUCTUUR:
-- Begin met een kort en duidelijk antwoord
-- Geef daarna 1 korte toelichting
-- Houd het compact
+- Begin met een kort en duidelijk antwoord.
+- Geef daarna 1 korte toelichting.
+- Houd het compact en natuurlijk.
 
-VERBODEN:
-- Artikelen verzinnen
-- Artikelen combineren die niet direct nodig zijn
-- Uitleg geven die niet uit de tekst volgt
+BRONNEN:
+- Gebruik bronverwijzingen zoals [1] en [2].
+- Gebruik alleen bronnen die echt nodig zijn.
 
 FALLBACK:
-Als het antwoord niet direct uit de passages volgt:
+Als het antwoord niet direct uit de passages volgt, zeg exact:
 "Ik kan dit niet goed beantwoorden op basis van de gevonden artikelen."
 
-Schrijf in het Nederlands.
-`;
+VERBODEN:
+- Artikelen verzinnen.
+- Artikelen combineren die niet direct nodig zijn.
+- Uitleg geven die niet uit de tekst volgt.
 
-    // 6) AI antwoord
+Schrijf in het Nederlands.
+`.trim();
+
     const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -218,8 +216,8 @@ Schrijf in het Nederlands.
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
-        temperature: 0.2,
-        max_tokens: 550,
+        temperature: 0.1,
+        max_tokens: 400,
         messages: [
           { role: "system", content: answerSystem },
           {
@@ -263,7 +261,7 @@ ${context}`
 
     return res.status(200).json({
       answer,
-      sources: (filtered.length ? filtered : results.slice(0, 3)).map((r, i) => ({
+      sources: (filtered.length ? filtered : results.slice(0, 2)).map((r, i) => ({
         n: i + 1,
         id: r.id,
         title: r.label,
