@@ -49,7 +49,6 @@ module.exports = async (req, res) => {
         text.match(/artikel\s+([0-9a-zA-Z:.\-]+)/i) ||
         text.match(/\bart\.?\s*([0-9a-zA-Z:.\-]+)/i) ||
         text.match(/\b([0-9]+(?::|\.)[0-9a-zA-Z.\-]+)\b/);
-
       return m?.[1] || null;
     }
 
@@ -57,7 +56,7 @@ module.exports = async (req, res) => {
     const articleRaw = detectArticle(q);
     const article = articleRaw ? articleRaw.replace(/\.$/, "") : null;
 
-    // 1. DIRECTE ARTIKELZOEKING
+    // 1) DIRECTE ARTIKELZOEKING
     if (article) {
       let url =
         `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id,law_name,article_number` +
@@ -88,38 +87,43 @@ module.exports = async (req, res) => {
       }
     }
 
-    // 2. KEYWORD SEARCH BINNEN GEDETECTEERDE WET
+    // 2) KEYWORDS UIT VRAAG HALEN
+    const stopwords = new Set([
+      "wat","is","een","de","het","van","volgens","wanneer","mag","kan",
+      "zijn","er","over","volgt","uit","op","in","voor","volgens","bij","als"
+    ]);
+
+    const words = q
+      .split(/\s+/)
+      .map(s => s.trim())
+      .filter(Boolean)
+      .filter(s => !stopwords.has(s))
+      .filter(s => s.length >= 3);
+
+    // 3) KEYWORD SEARCH PER WOORD
     let keywordResults = [];
 
     try {
-      const words = q
-        .split(/\s+/)
-        .map(s => s.trim())
-        .filter(Boolean)
-        .filter(s => !["wat", "is", "een", "de", "het", "van", "volgens", "wanneer"].includes(s));
+      for (const word of words.slice(0, 5)) {
+        let url =
+          `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id,law_name,article_number` +
+          `&or=(text.ilike.*${encodeURIComponent(word)}*,label.ilike.*${encodeURIComponent(word)}*)` +
+          `&limit=10`;
 
-      let url =
-        `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id,law_name,article_number` +
-        `&limit=20`;
+        if (lawName) {
+          url += `&law_name=eq.${encodeURIComponent(lawName)}`;
+        }
 
-      if (lawName) {
-        url += `&law_name=eq.${encodeURIComponent(lawName)}`;
-      }
+        const resp = await fetch(url, { headers });
+        const rows = await resp.json();
 
-      if (words.length) {
-        const searchPart = words.join("*");
-        url += `&or=(text.ilike.*${encodeURIComponent(searchPart)}*,label.ilike.*${encodeURIComponent(searchPart)}*)`;
-      }
-
-      const resp = await fetch(url, { headers });
-      const rows = await resp.json();
-
-      if (Array.isArray(rows)) {
-        keywordResults = rows;
+        if (Array.isArray(rows) && rows.length) {
+          keywordResults.push(...rows);
+        }
       }
     } catch {}
 
-    // 3. VECTOR SEARCH
+    // 4) VECTOR SEARCH
     let vectorResults = [];
 
     try {
@@ -152,17 +156,31 @@ module.exports = async (req, res) => {
 
         if (Array.isArray(rows)) {
           vectorResults = lawName
-            ? rows.filter(r =>
-                (r.label || "").toLowerCase().includes(lawName.toLowerCase())
-              )
+            ? rows.filter(r => (r.label || "").toLowerCase().includes(lawName.toLowerCase()))
             : rows;
         }
       }
     } catch {}
 
-    // 4. COMBINEREN + DEDUPEN
+    // 5) ALS ER EEN WET IS, GEEF OOK WET-FALLBACK
+    let lawFallback = [];
+
+    if (lawName) {
+      try {
+        const resp = await fetch(
+          `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id,law_name,article_number&law_name=eq.${encodeURIComponent(lawName)}&limit=10`,
+          { headers }
+        );
+        const rows = await resp.json();
+        if (Array.isArray(rows)) {
+          lawFallback = rows;
+        }
+      } catch {}
+    }
+
+    // 6) COMBINEREN + DEDUPEN
     const seen = new Set();
-    const combined = [...keywordResults, ...vectorResults].filter(r => {
+    const combined = [...keywordResults, ...vectorResults, ...lawFallback].filter(r => {
       const key = `${r.doc_id || ""}-${r.label || ""}`;
       if (seen.has(key)) return false;
       seen.add(key);
