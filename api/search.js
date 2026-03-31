@@ -35,12 +35,13 @@ module.exports = async (req, res) => {
     }
 
     function detectLaw(text) {
-      if (text.includes("awb")) return "Awb";
-      if (text.includes("omgevingswet")) return "Omgevingswet";
-      if (text.includes("bal")) return "Bal";
-      if (text.includes("bbl")) return "Bbl";
-      if (text.includes("bkl")) return "Bkl";
-      if (text.includes("wkb")) return "Wkb";
+      const s = (text || "").toLowerCase();
+      if (s.includes("awb")) return "Awb";
+      if (s.includes("omgevingswet")) return "Omgevingswet";
+      if (s.includes("bal")) return "Bal";
+      if (s.includes("bbl")) return "Bbl";
+      if (s.includes("bkl")) return "Bkl";
+      if (s.includes("wkb")) return "Wkb";
       return null;
     }
 
@@ -48,16 +49,30 @@ module.exports = async (req, res) => {
       const m =
         text.match(/artikel\s+([0-9a-zA-Z:.\-]+)/i) ||
         text.match(/\bart\.?\s*([0-9a-zA-Z:.\-]+)/i) ||
-        text.match(/\b([0-9]+(?::|\.)[0-9a-zA-Z.\-]+)\b/);
+        text.match(/\b([0-9]+(?::|\.)[0-9a-zA-Z.\-]+)\b/i);
 
       return m?.[1] ? m[1].replace(/\.$/, "") : null;
+    }
+
+    function normalizeArticle(article, lawName) {
+      if (!article) return null;
+      let a = article.trim();
+
+      // Awb gebruikt meestal dubbele punten, zoals 1:3 en 2:1
+      if (lawName === "Awb" && /^\d+\.\d+[a-zA-Z]?$/.test(a)) {
+        a = a.replace(".", ":");
+      }
+
+      return a;
     }
 
     function extractKeywords(text) {
       const stopwords = new Set([
         "wat","is","een","de","het","van","volgens","wanneer","mag","kan",
         "zijn","er","over","volgt","uit","op","in","voor","bij","als","tegen",
-        "door","met","dat","dit","dan","om","tot","of","en","te","mogelijk"
+        "door","met","dat","dit","dan","om","tot","of","en","te","mogelijk",
+        "geef","samenvatting","samenvat","leg","uit","simpele","taal","korter",
+        "regels","deze","dit","artikel"
       ]);
 
       return text
@@ -70,19 +85,21 @@ module.exports = async (req, res) => {
     }
 
     const lawName = detectLaw(q);
-    const article = detectArticle(q);
+    const articleRaw = detectArticle(q);
+    const article = normalizeArticle(articleRaw, lawName);
     const keywords = extractKeywords(q);
 
     let articleResults = [];
     let keywordResults = [];
     let vectorResults = [];
 
+    // 1. DIRECTE ARTIKELZOEKING
     if (article) {
       try {
         let url =
           `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id,law_name,article_number` +
-          `&or=(article_number.ilike.*${encodeURIComponent(article)}*,label.ilike.*${encodeURIComponent(article)}*)` +
-          `&limit=10`;
+          `&article_number=eq.${encodeURIComponent(article)}` +
+          `&limit=5`;
 
         if (lawName) {
           url += `&law_name=eq.${encodeURIComponent(lawName)}`;
@@ -91,12 +108,30 @@ module.exports = async (req, res) => {
         const resp = await fetch(url, { headers });
         const rows = await resp.json();
 
-        if (Array.isArray(rows)) {
+        if (Array.isArray(rows) && rows.length) {
           articleResults = rows;
+        } else {
+          // fallback: label exact-ish match
+          let fallbackUrl =
+            `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id,law_name,article_number` +
+            `&label=ilike.*${encodeURIComponent(article)}*` +
+            `&limit=5`;
+
+          if (lawName) {
+            fallbackUrl += `&law_name=eq.${encodeURIComponent(lawName)}`;
+          }
+
+          const fallbackResp = await fetch(fallbackUrl, { headers });
+          const fallbackRows = await fallbackResp.json();
+
+          if (Array.isArray(fallbackRows)) {
+            articleResults = fallbackRows;
+          }
         }
       } catch {}
     }
 
+    // 2. KEYWORD SEARCH
     try {
       for (const word of keywords.slice(0, 5)) {
         let url =
@@ -117,6 +152,7 @@ module.exports = async (req, res) => {
       }
     } catch {}
 
+    // 3. VECTOR SEARCH
     try {
       if (OPENAI_KEY) {
         const embedResp = await fetch("https://api.openai.com/v1/embeddings", {
@@ -148,13 +184,16 @@ module.exports = async (req, res) => {
 
           if (Array.isArray(rows)) {
             vectorResults = lawName
-              ? rows.filter(r => (r.law_name || r.label || "").toLowerCase().includes(lawName.toLowerCase()))
+              ? rows.filter(r =>
+                  (r.law_name || r.label || "").toLowerCase().includes(lawName.toLowerCase())
+                )
               : rows;
           }
         }
       }
     } catch {}
 
+    // 4. COMBINEREN + DEDUPEN
     const seen = new Set();
     const combined = [...articleResults, ...keywordResults, ...vectorResults].filter(r => {
       const key = `${r.doc_id || ""}-${r.label || ""}`;
@@ -171,39 +210,41 @@ module.exports = async (req, res) => {
       const rowLaw = (r.law_name || "").toLowerCase();
       const rowArticle = (r.article_number || "").toLowerCase();
 
-      if (lawName && rowLaw === lawName.toLowerCase()) score += 8;
+      if (lawName && rowLaw === lawName.toLowerCase()) score += 10;
       if (lawName && label.includes(lawName.toLowerCase())) score += 4;
 
       if (article) {
-        if (rowArticle.includes(article.toLowerCase())) score += 20;
-        if (label.includes(article.toLowerCase())) score += 10;
+        if (rowArticle === article.toLowerCase()) score += 30;
+        else if (rowArticle.includes(article.toLowerCase())) score += 10;
+
+        if (label.includes(article.toLowerCase())) score += 8;
       }
 
       for (const word of keywords) {
-        if (txt.includes(word)) score += 3;
+        if (txt.includes(word)) score += 4;
         if (label.includes(word)) score += 2;
       }
 
+      // generieke definitie-signalen
       if (txt.includes("wordt verstaan")) score += 5;
       if (txt.includes("onder ") && txt.includes("wordt verstaan")) score += 3;
       if (txt.includes("schriftelijke beslissing")) score += 4;
 
+      // generieke themasignalen
       if (q.includes("bezwaar")) {
         if (txt.includes("bezwaar")) score += 8;
-        if (txt.includes("besluit")) score += 4;
-        if (txt.includes("beroep")) score += 2;
+        if (txt.includes("besluit")) score += 3;
       }
 
       if (q.includes("belanghebbende")) {
         if (txt.includes("belanghebbende")) score += 8;
-        if (txt.includes("degene wiens belang")) score += 4;
+        if (txt.includes("rechtstreeks")) score += 2;
       }
 
       if (q.includes("handhaven") || q.includes("handhaving")) {
-        if (txt.includes("last onder bestuursdwang")) score += 4;
-        if (txt.includes("last onder dwangsom")) score += 4;
-        if (txt.includes("bestuursdwang")) score += 3;
-        if (txt.includes("dwangsom")) score += 3;
+        if (txt.includes("bestuursdwang")) score += 5;
+        if (txt.includes("dwangsom")) score += 5;
+        if (txt.includes("last onder")) score += 3;
       }
 
       if ((r.similarity || 0) > 0.7) score += 4;
