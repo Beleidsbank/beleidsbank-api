@@ -103,29 +103,39 @@ module.exports = async (req, res) => {
     const embeddings = embJson.data.map(d => d.embedding);
 
     for (let i = 0; i < safeBatch.length; i++) {
-      const raw = safeBatch[i];
-      const text = cleanText(raw);
-      const article = getArticle(text);
+  const raw = safeBatch[i];
+  const text = cleanText(raw);
+  const article = getArticle(text);
 
-      await fetch(`${SUPABASE_URL}/rest/v1/chunks?on_conflict=doc_id,label`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SERVICE_KEY,
-          Authorization: `Bearer ${SERVICE_KEY}`,
-          Prefer: "resolution=merge-duplicates"
-        },
-        body: JSON.stringify({
-          doc_id: id,
-          law_name: lawName,
-          article_number: article,
-          label: `${lawName} — Artikel ${article}`,
-          text,
-          source_url: sourceUrl,
-          embedding: embeddings[i]
-        })
-      });
-    }
+  const chunkResp = await fetch(`${SUPABASE_URL}/rest/v1/chunks?on_conflict=doc_id,label`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: SERVICE_KEY,
+      Authorization: `Bearer ${SERVICE_KEY}`,
+      Prefer: "resolution=merge-duplicates,return=representation"
+    },
+    body: JSON.stringify([{
+      doc_id: id,
+      law_name: lawName,
+      article_number: article,
+      label: `${lawName} — Artikel ${article}`,
+      text,
+      source_url: sourceUrl,
+      embedding: embeddings[i]
+    }])
+  });
+
+  const chunkText = await chunkResp.text();
+
+  if (!chunkResp.ok) {
+    return res.status(500).json({
+      error: "chunk insert failed",
+      article,
+      details: chunkText
+    });
+  }
+}
 
     return res.json({
       ok: true,
