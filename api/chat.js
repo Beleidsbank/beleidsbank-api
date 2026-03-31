@@ -8,7 +8,6 @@ function cleanLegalText(text) {
   return (text || "")
     .replace(/Toon relaties in LiDO/gi, "")
     .replace(/Maak een permanente link/gi, "")
-    .replace(/Toon wetstechnische informatie/gi, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -58,8 +57,7 @@ function extractLastContext(history) {
 }
 
 module.exports = async (req, res) => {
-  // ✅ CORS FIX
-  const origin = req.headers.origin || "";
+  // ✅ CORS
   res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -85,7 +83,7 @@ module.exports = async (req, res) => {
     const lawInQuestion = detectLaw(rawQuestion);
     const lastContext = extractLastContext(safeHistory);
 
-    // ✅ 1. FOLLOW-UP (GEEN SEARCH)
+    // ✅ 1. FOLLOW-UP (geen nieuwe search)
     if (followUp && lastContext) {
       const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
@@ -152,7 +150,34 @@ Taken:
       });
     }
 
-    const top = results[0];
+    // 🔥 FIX: EXACT MATCH
+    let top = results[0];
+
+    const articleMatch = rawQuestion.match(/artikel\s+([0-9a-z:.\-]+)/i);
+    const articleRaw = articleMatch?.[1];
+    const article = articleRaw?.replace(".", ":");
+    const law = detectLaw(rawQuestion);
+
+    if (article) {
+      const exact = results.find(r => {
+        const art = (r.article_number || "").toLowerCase();
+        const lawName = (r.law_name || "").toLowerCase();
+
+        return (
+          art === article.toLowerCase() &&
+          (!law || lawName === law.toLowerCase())
+        );
+      });
+
+      if (exact) {
+        top = exact;
+      } else {
+        return res.status(200).json({
+          answer: `Ik kan artikel ${article} niet vinden in deze wet.`,
+          sources: []
+        });
+      }
+    }
 
     return res.status(200).json({
       answer: `Ik heb het relevante artikel gevonden.\n\n${cleanLegalText(top.text)}`,
