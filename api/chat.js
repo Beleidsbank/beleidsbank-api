@@ -16,7 +16,7 @@ function cleanLegalText(text) {
 }
 
 function detectLaw(text) {
-  const q = (text || "").toLowerCase();
+  const q = (text || "").toLowerCase().trim();
   if (q.includes("awb")) return "Awb";
   if (q.includes("omgevingswet")) return "Omgevingswet";
   if (q.includes("bal")) return "Bal";
@@ -26,13 +26,29 @@ function detectLaw(text) {
   return null;
 }
 
-function hasArticleReference(text) {
-  const q = text || "";
-  return (
-    /artikel\s+[0-9a-z:.\-]+/i.test(q) ||
-    /\bart\.?\s*[0-9a-z:.\-]+/i.test(q) ||
-    /\b[0-9]+(?::|\.)[0-9a-z.-]+\b/i.test(q)
-  );
+function isLawOnlyMessage(text) {
+  const q = (text || "").toLowerCase().trim();
+  return ["awb", "omgevingswet", "bal", "bbl", "bkl", "wkb"].includes(q);
+}
+
+function extractArticleRef(text) {
+  const q = (text || "").trim();
+  const m =
+    q.match(/artikel\s+([0-9a-zA-Z:.\-]+)/i) ||
+    q.match(/\bart\.?\s*([0-9a-zA-Z:.\-]+)/i) ||
+    q.match(/\b([0-9]+(?::|\.)[0-9a-zA-Z.\-]+)\b/i);
+
+  if (!m?.[1]) return null;
+  return m[1].replace(/\.$/, "");
+}
+
+function normalizeArticle(article, lawName) {
+  if (!article) return null;
+  let a = article.trim();
+  if (lawName === "Awb" && /^\d+\.\d+[a-zA-Z]?$/.test(a)) {
+    a = a.replace(".", ":");
+  }
+  return a;
 }
 
 function isFollowUpQuestion(text) {
@@ -55,20 +71,32 @@ function isFollowUpQuestion(text) {
   ].some(p => q.includes(p));
 }
 
-function extractLastContext(history) {
+function extractLastArticleContext(history) {
   const reversed = [...history].reverse();
 
   for (const msg of reversed) {
     if (
+      msg &&
       msg.role === "assistant" &&
       typeof msg.content === "string" &&
       msg.content.includes("Ik heb het relevante artikel gevonden")
     ) {
-      const parts = msg.content.split("Bronnen:");
-      return (parts[0] || "").trim();
+      const main = msg.content.split("Bronnen:")[0]?.trim() || "";
+      if (main) return main;
     }
   }
 
+  return null;
+}
+
+function extractLastUserArticle(history) {
+  const reversed = [...history].reverse();
+  for (const msg of reversed) {
+    if (msg?.role === "user" && typeof msg.content === "string") {
+      const art = extractArticleRef(msg.content);
+      if (art) return art;
+    }
+  }
   return null;
 }
 
@@ -101,14 +129,13 @@ module.exports = async (req, res) => {
 
     const safeHistory = history
       .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
-      .slice(-16);
+      .slice(-20);
 
     const followUp = isFollowUpQuestion(rawQuestion);
-    const lawInQuestion = detectLaw(rawQuestion);
-    const lastContext = extractLastContext(safeHistory);
+    const lastArticleContext = extractLastArticleContext(safeHistory);
 
-    // 1. Follow-up: gebruik bestaande context, geen nieuwe search
-    if (followUp && lastContext) {
+    // 1. Follow-up op eerder artikel: geen nieuwe search
+    if (followUp && lastArticleContext) {
       const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -141,7 +168,10 @@ Schrijf in het Nederlands.
             },
             {
               role: "user",
-              content: `Vraag: ${rawQuestion}\n\nTekst:\n${lastContext}`
+              content: `Vraag: ${rawQuestion}
+
+Tekst:
+${lastArticleContext}`
             }
           ]
         })
@@ -155,17 +185,43 @@ Schrijf in het Nederlands.
       });
     }
 
-    // 2. Onduidelijke artikelvraag
-    if (hasArticleReference(rawQuestion) && !lawInQuestion) {
+    // 2. Context-aware zoekquery bouwen
+    const currentLaw = detectLaw(rawQuestion);
+    const currentArticle = extractArticleRef(rawQuestion);
+
+    let searchQuery = rawQuestion;
+
+    // Case A: gebruiker noemt artikel zonder wet -> doorvragen
+    if (currentArticle && !currentLaw) {
       return res.status(200).json({
         answer: "Over welke wet gaat het? Bijvoorbeeld Awb, Omgevingswet of Bal.",
         sources: []
       });
     }
 
-    // 3. Normale search
+    // Case B: gebruiker antwoordt alleen met wetnaam op eerdere artikelvraag
+    if (isLawOnlyMessage(rawQuestion)) {
+      const previousArticle = extractLastUserArticle(safeHistory);
+      if (previousArticle) {
+        const normalized = normalizeArticle(previousArticle, currentLaw);
+        searchQuery = `artikel ${normalized} ${currentLaw}`;
+      } else {
+        return res.status(200).json({
+          answer: "Op welk artikel doel je precies?",
+          sources: []
+        });
+      }
+    }
+
+    // Case C: normale artikelvraag met wet
+    if (currentArticle && currentLaw) {
+      const normalized = normalizeArticle(currentArticle, currentLaw);
+      searchQuery = `artikel ${normalized} ${currentLaw}`;
+    }
+
+    // 3. Search
     const searchResp = await fetch(
-      `https://beleidsbank-api.vercel.app/api/search?q=${encodeURIComponent(rawQuestion)}`
+      `https://beleidsbank-api.vercel.app/api/search?q=${encodeURIComponent(searchQuery)}`
     );
 
     const searchJson = await searchResp.json();
@@ -180,27 +236,23 @@ Schrijf in het Nederlands.
 
     let top = results[0];
 
-    // 4. Exacte artikelmatch op label
-    const articleMatch =
-      rawQuestion.match(/artikel\s+([0-9a-z:.\-]+)/i) ||
-      rawQuestion.match(/\bart\.?\s*([0-9a-z:.\-]+)/i);
+    // 4. Als het om een artikelvraag gaat: exacte match zoeken binnen resultaten
+    const searchLaw = detectLaw(searchQuery);
+    const searchArticleRaw = extractArticleRef(searchQuery);
+    const searchArticle = normalizeArticle(searchArticleRaw, searchLaw);
 
-    const articleRaw = articleMatch?.[1]?.replace(/\.$/, "");
-    const law = detectLaw(rawQuestion);
-
-    if (articleRaw) {
-      const normalizedArticle =
-        law === "Awb" && /^\d+\.\d+[a-zA-Z]?$/.test(articleRaw)
-          ? articleRaw.replace(".", ":")
-          : articleRaw;
-
+    if (searchArticle) {
       const exact = results.find(r => {
         const label = (r.label || "").toLowerCase();
         const lawName = (r.law_name || "").toLowerCase();
+        const articleNumber = (r.article_number || "").toLowerCase();
 
         return (
-          label.includes(`artikel ${normalizedArticle.toLowerCase()}`) &&
-          (!law || lawName === law.toLowerCase())
+          (!searchLaw || lawName === searchLaw.toLowerCase()) &&
+          (
+            articleNumber === searchArticle.toLowerCase() ||
+            label.includes(`artikel ${searchArticle.toLowerCase()}`)
+          )
         );
       });
 
@@ -208,20 +260,73 @@ Schrijf in het Nederlands.
         top = exact;
       } else {
         return res.status(200).json({
-          answer: `Ik kan artikel ${normalizedArticle} niet goed vinden. Controleer het artikelnummer.`,
+          answer: `Ik kan artikel ${searchArticle} niet goed vinden. Controleer het artikelnummer.`,
           sources: []
         });
       }
+
+      return res.status(200).json({
+        answer: `Ik heb het relevante artikel gevonden.\n\n${cleanLegalText(top.text)}`,
+        sources: [
+          {
+            title: top.label,
+            link: top.source_url
+          }
+        ]
+      });
     }
 
+    // 5. Niet-artikelvraag: gewone AI-uitleg op basis van topresultaten
+    const limited = results.slice(0, 2);
+    const context = limited
+      .map((r, i) => `[${i + 1}] ${r.label}\n${cleanLegalText(r.text || r.excerpt || "")}`)
+      .join("\n\n");
+
+    const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENAI_KEY}`
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0.1,
+        max_tokens: 300,
+        messages: [
+          {
+            role: "system",
+            content: `
+Je bent Beleidsbank, een juridische assistent.
+
+Regels:
+1. Gebruik alleen de bronpassages.
+2. Voeg geen nieuwe wetsartikelen toe.
+3. Houd het antwoord kort en duidelijk.
+4. Als het niet direct uit de bron volgt, zeg dat.
+
+Schrijf in het Nederlands.
+`.trim()
+          },
+          {
+            role: "user",
+            content: `Vraag: ${rawQuestion}
+
+Bronnen:
+${context}`
+          }
+        ]
+      })
+    });
+
+    const aiJson = await aiResp.json();
+    const answer = aiJson?.choices?.[0]?.message?.content || "Ik kan dit niet goed beantwoorden op basis van de gevonden artikelen.";
+
     return res.status(200).json({
-      answer: `Ik heb het relevante artikel gevonden.\n\n${cleanLegalText(top.text)}`,
-      sources: [
-        {
-          title: top.label,
-          link: top.source_url
-        }
-      ]
+      answer,
+      sources: limited.map(r => ({
+        title: r.label,
+        link: r.source_url
+      }))
     });
 
   } catch (e) {
