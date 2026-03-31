@@ -8,6 +8,9 @@ function cleanLegalText(text) {
   return (text || "")
     .replace(/Toon relaties in LiDO/gi, "")
     .replace(/Maak een permanente link/gi, "")
+    .replace(/Toon wetstechnische informatie/gi, "")
+    .replace(/Druk het regelingonderdeel af/gi, "")
+    .replace(/Sla het regelingonderdeel op/gi, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -24,7 +27,12 @@ function detectLaw(text) {
 }
 
 function hasArticleReference(text) {
-  return /artikel\s+[0-9a-z:.\-]+/i.test(text || "");
+  const q = text || "";
+  return (
+    /artikel\s+[0-9a-z:.\-]+/i.test(q) ||
+    /\bart\.?\s*[0-9a-z:.\-]+/i.test(q) ||
+    /\b[0-9]+(?::|\.)[0-9a-z.-]+\b/i.test(q)
+  );
 }
 
 function isFollowUpQuestion(text) {
@@ -36,10 +44,14 @@ function isFollowUpQuestion(text) {
     "in simpele taal",
     "korter",
     "in 2 regels",
+    "in twee regels",
     "wat betekent dit",
     "wanneer geldt dit niet",
     "herschrijf",
-    "voor een rapport"
+    "voor een rapport",
+    "in bullets",
+    "in 3 bullets",
+    "kort samen"
   ].some(p => q.includes(p));
 }
 
@@ -47,9 +59,13 @@ function extractLastContext(history) {
   const reversed = [...history].reverse();
 
   for (const msg of reversed) {
-    if (msg.role === "assistant" && msg.content.includes("Bronnen:")) {
+    if (
+      msg.role === "assistant" &&
+      typeof msg.content === "string" &&
+      msg.content.includes("Ik heb het relevante artikel gevonden")
+    ) {
       const parts = msg.content.split("Bronnen:");
-      return parts[0].trim();
+      return (parts[0] || "").trim();
     }
   }
 
@@ -57,7 +73,6 @@ function extractLastContext(history) {
 }
 
 module.exports = async (req, res) => {
-  // ✅ CORS
   res.setHeader("Access-Control-Allow-Origin", ALLOW_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -68,6 +83,9 @@ module.exports = async (req, res) => {
 
   try {
     const OPENAI_KEY = process.env.OPENAI_API_KEY;
+    if (!OPENAI_KEY) {
+      return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
+    }
 
     const body =
       typeof req.body === "string"
@@ -77,13 +95,19 @@ module.exports = async (req, res) => {
     const rawQuestion = (body.message || "").toString().trim();
     const history = Array.isArray(body.history) ? body.history : [];
 
-    const safeHistory = history.slice(-10);
+    if (!rawQuestion) {
+      return res.status(400).json({ error: "Missing message" });
+    }
+
+    const safeHistory = history
+      .filter(m => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+      .slice(-16);
 
     const followUp = isFollowUpQuestion(rawQuestion);
     const lawInQuestion = detectLaw(rawQuestion);
     const lastContext = extractLastContext(safeHistory);
 
-    // ✅ 1. FOLLOW-UP (geen nieuwe search)
+    // 1. Follow-up: gebruik bestaande context, geen nieuwe search
     if (followUp && lastContext) {
       const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
@@ -94,22 +118,26 @@ module.exports = async (req, res) => {
         body: JSON.stringify({
           model: "gpt-4o-mini",
           temperature: 0.2,
-          max_tokens: 200,
+          max_tokens: 220,
           messages: [
             {
               role: "system",
               content: `
-Gebruik alleen de gegeven tekst.
-Voeg geen nieuwe artikelen toe.
-Verzin niets.
+Je krijgt een artikeltekst.
 
-Als iets niet in de tekst staat, zeg dat.
+Regels:
+1. Gebruik alleen deze tekst.
+2. Voeg geen nieuwe artikelen of nieuwe juridische informatie toe.
+3. Verzin niets.
+4. Als iets niet in de tekst staat, zeg dat.
 
 Taken:
 - samenvatten → kort
 - uitleggen → simpel
-- praktijk → begrijpelijk
-`
+- praktijk → begrijpelijk uitleggen
+
+Schrijf in het Nederlands.
+`.trim()
             },
             {
               role: "user",
@@ -127,7 +155,7 @@ Taken:
       });
     }
 
-    // ✅ 2. ONDUIDELIJK ARTIKEL
+    // 2. Onduidelijke artikelvraag
     if (hasArticleReference(rawQuestion) && !lawInQuestion) {
       return res.status(200).json({
         answer: "Over welke wet gaat het? Bijvoorbeeld Awb, Omgevingswet of Bal.",
@@ -135,7 +163,7 @@ Taken:
       });
     }
 
-    // ✅ 3. SEARCH
+    // 3. Normale search
     const searchResp = await fetch(
       `https://beleidsbank-api.vercel.app/api/search?q=${encodeURIComponent(rawQuestion)}`
     );
@@ -150,21 +178,28 @@ Taken:
       });
     }
 
-    // 🔥 FIX: EXACT MATCH
     let top = results[0];
 
-    const articleMatch = rawQuestion.match(/artikel\s+([0-9a-z:.\-]+)/i);
-    const articleRaw = articleMatch?.[1];
-    const article = articleRaw?.replace(".", ":");
+    // 4. Exacte artikelmatch op label
+    const articleMatch =
+      rawQuestion.match(/artikel\s+([0-9a-z:.\-]+)/i) ||
+      rawQuestion.match(/\bart\.?\s*([0-9a-z:.\-]+)/i);
+
+    const articleRaw = articleMatch?.[1]?.replace(/\.$/, "");
     const law = detectLaw(rawQuestion);
 
-    if (article) {
+    if (articleRaw) {
+      const normalizedArticle =
+        law === "Awb" && /^\d+\.\d+[a-zA-Z]?$/.test(articleRaw)
+          ? articleRaw.replace(".", ":")
+          : articleRaw;
+
       const exact = results.find(r => {
-        const art = (r.article_number || "").toLowerCase();
+        const label = (r.label || "").toLowerCase();
         const lawName = (r.law_name || "").toLowerCase();
 
         return (
-          art === article.toLowerCase() &&
+          label.includes(`artikel ${normalizedArticle.toLowerCase()}`) &&
           (!law || lawName === law.toLowerCase())
         );
       });
@@ -173,7 +208,7 @@ Taken:
         top = exact;
       } else {
         return res.status(200).json({
-          answer: `Ik kan artikel ${article} niet vinden in deze wet.`,
+          answer: `Ik kan artikel ${normalizedArticle} niet goed vinden. Controleer het artikelnummer.`,
           sources: []
         });
       }
@@ -192,7 +227,7 @@ Taken:
   } catch (e) {
     return res.status(500).json({
       error: "chat crashed",
-      details: String(e)
+      details: String(e?.message || e)
     });
   }
 };
