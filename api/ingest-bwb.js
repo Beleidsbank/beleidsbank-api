@@ -5,10 +5,7 @@ module.exports = async (req, res) => {
       process.env.SUPABASE_SERVICE_KEY ||
       process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-    if (!SUPABASE_URL) return res.status(500).json({ error: "SUPABASE_URL missing" });
-    if (!SERVICE_KEY) return res.status(500).json({ error: "SERVICE_KEY missing" });
-
-    const resp = await fetch(`${SUPABASE_URL}/rest/v1/documents`, {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/chunks`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -17,9 +14,12 @@ module.exports = async (req, res) => {
         Prefer: "return=representation"
       },
       body: JSON.stringify([{
-        id: "TEST123",
-        title: "test",
-        source_url: "https://test.nl"
+        doc_id: "BWBR0005537",
+        law_name: "Awb",
+        article_number: "1:3",
+        label: "Awb — Artikel 1:3",
+        text: "Artikel 1:3 testtekst",
+        source_url: "https://wetten.overheid.nl/BWBR0005537"
       }])
     });
 
@@ -27,7 +27,6 @@ module.exports = async (req, res) => {
 
     return res.status(200).json({
       ok: resp.ok,
-      supabase_url: SUPABASE_URL,
       response: text
     });
   } catch (e) {
