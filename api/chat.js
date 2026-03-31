@@ -88,18 +88,24 @@ module.exports = async (req, res) => {
       }));
 
     const rewriteSystem = `
-Je zet een gebruikersvraag plus korte chatgeschiedenis om naar één korte juridische zoekquery.
+Je zet een gebruikersvraag plus chatgeschiedenis om naar één korte juridische zoekquery.
+
+BELANGRIJK:
+1. Combineer context uit eerdere berichten.
+2. Als gebruiker eerst een artikel noemt en daarna een wet → combineer die.
+3. Als gebruiker alleen een wet noemt → combineer met laatste artikel.
+4. Als gebruiker zegt "deze" of "dit" → gebruik vorige context.
+
+Voorbeelden:
+- "artikel 1:3" + "Awb" -> "artikel 1:3 awb"
+- "artikel 1:3" + "Omgevingswet" -> "artikel 1:3 omgevingswet"
+- "wat is een besluit?" + "Awb" -> "besluit awb"
+- "deze samenvatten" -> gebruik vorige tekst
 
 Regels:
-1. Geef alleen de zoekquery terug, geen uitleg.
-2. Als de gebruiker alleen een wetnaam antwoordt op een eerdere vraag, combineer die context.
-3. Houd de zoekquery kort en bruikbaar voor wetgeving.
-4. Voorbeelden:
-- "Artikel 3:40" + "Awb" -> "artikel 3:40 awb"
-- "Wat is een besluit?" + "Awb" -> "besluit awb"
-- "Wanneer is bezwaar mogelijk?" -> "bezwaar awb"
-- "Artikel 5.1" + "Omgevingswet" -> "artikel 5.1 omgevingswet"
-`.trim();
+- Geef alleen de zoekquery
+- Geen uitleg
+`;
 
     const rewriteMessages = [
       { role: "system", content: rewriteSystem },
