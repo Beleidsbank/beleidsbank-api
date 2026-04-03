@@ -6,9 +6,15 @@ module.exports = async (req, res) => {
       process.env.SUPABASE_SERVICE_ROLE_KEY;
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-    if (!SUPABASE_URL) return res.status(500).json({ error: "SUPABASE_URL missing" });
-    if (!SERVICE_KEY) return res.status(500).json({ error: "SUPABASE_SERVICE_KEY missing" });
-    if (!OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY missing" });
+    if (!SUPABASE_URL) {
+      return res.status(500).json({ error: "SUPABASE_URL missing" });
+    }
+    if (!SERVICE_KEY) {
+      return res.status(500).json({ error: "SUPABASE_SERVICE_KEY missing" });
+    }
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OPENAI_API_KEY missing" });
+    }
 
     const id = (req.query.id || "").toString().trim();
     if (!/^BWBR/i.test(id)) {
@@ -24,7 +30,10 @@ module.exports = async (req, res) => {
         .replace(/Toon relaties in LiDO/gi, "")
         .replace(/Maak een permanente link/gi, "")
         .replace(/Toon wetstechnische informatie/gi, "")
-        .replace(/\.\.\./g, "")
+        .replace(/Druk het regelingonderdeel af/gi, "")
+        .replace(/Sla het regelingonderdeel op/gi, "")
+        .replace(/Vergelijk met andere versie/gi, "")
+        .replace(/Geraadpleegd op .*? heden\./gi, "")
         .replace(/\s+/g, " ")
         .trim();
     }
@@ -33,25 +42,15 @@ module.exports = async (req, res) => {
       return (html || "")
         .replace(/<script[\s\S]*?<\/script>/gi, "")
         .replace(/<style[\s\S]*?<\/style>/gi, "")
-        .replace(/<\/(p|div|li|br|h1|h2|h3|h4|h5|h6)>/gi, "\n")
+        .replace(/<\/(p|div|li|br|h1|h2|h3|h4|h5|h6|section|article|tr|td)>/gi, "\n")
         .replace(/<[^>]+>/g, "\n")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&amp;/gi, "&")
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/gi, "'")
+        .replace(/\r/g, "")
         .replace(/\n{3,}/g, "\n\n")
         .trim();
-    }
-
-    function splitArticles(text) {
-      const re = /Artikel\s+\d+[a-zA-Z]?(?::\d+[a-zA-Z]?)?/g;
-      const matches = [...text.matchAll(re)];
-      const blocks = [];
-
-      for (let i = 0; i < matches.length; i++) {
-        const start = matches[i].index;
-        const end = i + 1 < matches.length ? matches[i + 1].index : text.length;
-        const block = text.slice(start, end).trim();
-        if (block.length > 100) blocks.push(block);
-      }
-
-      return blocks;
     }
 
     function getLawName(id) {
@@ -66,9 +65,43 @@ module.exports = async (req, res) => {
       return map[id] || id;
     }
 
-    function getArticle(block) {
-      const m = block.match(/^Artikel\s+([0-9A-Za-z:.\-]+)/);
-      return m?.[1] || "";
+    function splitArticles(text) {
+      const re = /(^|\n)\s*(Artikel\s+[0-9]+(?:[.:][0-9]+)?[a-zA-Z]?)/g;
+      const matches = [...text.matchAll(re)];
+      const blocks = [];
+
+      for (let i = 0; i < matches.length; i++) {
+        const start = matches[i].index + (matches[i][1] ? matches[i][1].length : 0);
+        const end = i + 1 < matches.length ? matches[i + 1].index : text.length;
+        const block = text.slice(start, end).trim();
+
+        if (!block || block.length < 80) continue;
+
+        // paragrafen / hoofdstukken / titels wegfilteren
+        const firstPart = block.slice(0, 250);
+        if (/^§\s*\d+/i.test(firstPart)) continue;
+        if (/Titel\s+\d+/i.test(firstPart) && !/^Artikel/i.test(firstPart)) continue;
+        if (/Afdeling\s+\d+/i.test(firstPart) && !/^Artikel/i.test(firstPart)) continue;
+        if (/Hoofdstuk\s+\d+/i.test(firstPart) && !/^Artikel/i.test(firstPart)) continue;
+
+        blocks.push(block);
+      }
+
+      return blocks;
+    }
+
+    function getArticle(block, lawName) {
+      const m = (block || "").match(/^Artikel\s+([0-9]+(?:[.:][0-9]+)?[a-zA-Z]?)/i);
+      if (!m?.[1]) return "";
+
+      let article = m[1].trim();
+
+      // Awb gebruikt dubbele punt
+      if (lawName === "Awb" && /^\d+\.\d+[a-zA-Z]?$/.test(article)) {
+        article = article.replace(".", ":");
+      }
+
+      return article;
     }
 
     const htmlResp = await fetch(sourceUrl);
@@ -77,19 +110,27 @@ module.exports = async (req, res) => {
     if (!htmlResp.ok) {
       return res.status(500).json({
         error: "wetten.overheid fetch failed",
-        details: html.slice(0, 300)
+        details: html.slice(0, 400)
       });
     }
 
     const plain = htmlToText(html);
-    const articles = splitArticles(plain);
+    const allArticles = splitArticles(plain);
 
-    if (!articles.length) {
+    if (!allArticles.length) {
       return res.status(500).json({ error: "geen artikelen gevonden" });
     }
 
-    const batch = articles.slice(offset, offset + limit);
     const lawName = getLawName(id);
+    const batch = allArticles.slice(offset, offset + limit);
+
+    if (!batch.length) {
+      return res.status(200).json({
+        ok: true,
+        processed: 0,
+        done: true
+      });
+    }
 
     const docResp = await fetch(`${SUPABASE_URL}/rest/v1/documents?on_conflict=id`, {
       method: "POST",
@@ -107,7 +148,6 @@ module.exports = async (req, res) => {
     });
 
     const docText = await docResp.text();
-
     if (!docResp.ok) {
       return res.status(500).json({
         error: "documents insert failed",
@@ -115,7 +155,26 @@ module.exports = async (req, res) => {
       });
     }
 
-    const safeBatch = batch.map(t => (t || "").slice(0, 8000)).filter(Boolean);
+    const prepared = batch
+      .map(raw => {
+        const text = cleanText(raw);
+        const article = getArticle(text, lawName);
+        if (!text || !article) return null;
+
+        return {
+          text: text.slice(0, 8000),
+          article
+        };
+      })
+      .filter(Boolean);
+
+    if (!prepared.length) {
+      return res.status(200).json({
+        ok: true,
+        processed: 0,
+        next: `/api/ingest-bwb?id=${id}&offset=${offset + limit}`
+      });
+    }
 
     const embResp = await fetch("https://api.openai.com/v1/embeddings", {
       method: "POST",
@@ -125,12 +184,11 @@ module.exports = async (req, res) => {
       },
       body: JSON.stringify({
         model: "text-embedding-3-small",
-        input: safeBatch
+        input: prepared.map(x => x.text)
       })
     });
 
     const embText = await embResp.text();
-
     if (!embResp.ok) {
       return res.status(500).json({
         error: "embedding failed",
@@ -141,49 +199,46 @@ module.exports = async (req, res) => {
     const embJson = JSON.parse(embText);
     const embeddings = embJson.data.map(d => d.embedding);
 
-    for (let i = 0; i < safeBatch.length; i++) {
-      const raw = safeBatch[i];
-      const text = cleanText(raw);
-      const article = getArticle(text);
+    const rows = prepared.map((item, i) => ({
+      doc_id: id,
+      law_name: lawName,
+      article_number: item.article,
+      label: `${lawName} — Artikel ${item.article}`,
+      text: item.text,
+      source_url: sourceUrl,
+      embedding: embeddings[i]
+    }));
 
-      const chunkResp = await fetch(`${SUPABASE_URL}/rest/v1/chunks?on_conflict=doc_id,label`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          apikey: SERVICE_KEY,
-          Authorization: `Bearer ${SERVICE_KEY}`,
-          Prefer: "resolution=merge-duplicates,return=representation"
-        },
-        body: JSON.stringify([{
-          doc_id: id,
-          law_name: lawName,
-          article_number: article,
-          label: `${lawName} — Artikel ${article}`,
-          text,
-          source_url: sourceUrl,
-          embedding: embeddings[i]
-        }])
-      });
-
-      const chunkText = await chunkResp.text();
-
-      if (!chunkResp.ok) {
-        return res.status(500).json({
-          error: "chunk insert failed",
-          article,
-          details: chunkText
-        });
-      }
-    }
-
-    return res.json({
-      ok: true,
-      total_articles: articles.length,
-      processed: safeBatch.length,
-      next: `/api/ingest-bwb?id=${id}&offset=${offset + limit}`
+    const chunkResp = await fetch(`${SUPABASE_URL}/rest/v1/chunks?on_conflict=doc_id,label`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SERVICE_KEY,
+        Authorization: `Bearer ${SERVICE_KEY}`,
+        Prefer: "resolution=merge-duplicates,return=representation"
+      },
+      body: JSON.stringify(rows)
     });
 
+    const chunkText = await chunkResp.text();
+    if (!chunkResp.ok) {
+      return res.status(500).json({
+        error: "chunk insert failed",
+        details: chunkText
+      });
+    }
+
+    return res.status(200).json({
+      ok: true,
+      law: lawName,
+      total_found: allArticles.length,
+      processed: rows.length,
+      next: `/api/ingest-bwb?id=${id}&offset=${offset + limit}`
+    });
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message || e) });
+    return res.status(500).json({
+      error: "ingest-bwb crashed",
+      details: String(e?.message || e)
+    });
   }
 };
