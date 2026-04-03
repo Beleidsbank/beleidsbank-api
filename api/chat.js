@@ -45,9 +45,11 @@ function extractArticleRef(text) {
 function normalizeArticle(article, lawName) {
   if (!article) return null;
   let a = article.trim();
+
   if (lawName === "Awb" && /^\d+\.\d+[a-zA-Z]?$/.test(a)) {
     a = a.replace(".", ":");
   }
+
   return a;
 }
 
@@ -67,7 +69,12 @@ function isFollowUpQuestion(text) {
     "voor een rapport",
     "in bullets",
     "in 3 bullets",
-    "kort samen"
+    "kort samen",
+    "leg dit uit",
+    "leg dit simpeler uit",
+    "geef voorbeeld",
+    "geef een voorbeeld",
+    "maak samenvatting"
   ].some(p => q.includes(p));
 }
 
@@ -91,12 +98,14 @@ function extractLastArticleContext(history) {
 
 function extractLastUserArticle(history) {
   const reversed = [...history].reverse();
+
   for (const msg of reversed) {
     if (msg?.role === "user" && typeof msg.content === "string") {
       const art = extractArticleRef(msg.content);
       if (art) return art;
     }
   }
+
   return null;
 }
 
@@ -134,7 +143,7 @@ module.exports = async (req, res) => {
     const followUp = isFollowUpQuestion(rawQuestion);
     const lastArticleContext = extractLastArticleContext(safeHistory);
 
-    // 1. Follow-up op eerder artikel: geen nieuwe search
+    // 1) Follow-up op eerder artikel: geen nieuwe search
     if (followUp && lastArticleContext) {
       const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
@@ -145,7 +154,7 @@ module.exports = async (req, res) => {
         body: JSON.stringify({
           model: "gpt-4o-mini",
           temperature: 0.2,
-          max_tokens: 220,
+          max_tokens: 260,
           messages: [
             {
               role: "system",
@@ -162,6 +171,7 @@ Taken:
 - samenvatten → kort
 - uitleggen → simpel
 - praktijk → begrijpelijk uitleggen
+- voorbeeld → alleen een eenvoudig voorbeeld geven als dat logisch direct uit de tekst volgt
 
 Schrijf in het Nederlands.
 `.trim()
@@ -185,13 +195,13 @@ ${lastArticleContext}`
       });
     }
 
-    // 2. Context-aware zoekquery bouwen
+    // 2) Context-aware zoekquery bouwen
     const currentLaw = detectLaw(rawQuestion);
     const currentArticle = extractArticleRef(rawQuestion);
 
     let searchQuery = rawQuestion;
 
-    // Case A: gebruiker noemt artikel zonder wet -> doorvragen
+    // Artikel zonder wet -> doorvragen
     if (currentArticle && !currentLaw) {
       return res.status(200).json({
         answer: "Over welke wet gaat het? Bijvoorbeeld Awb, Omgevingswet of Bal.",
@@ -199,9 +209,10 @@ ${lastArticleContext}`
       });
     }
 
-    // Case B: gebruiker antwoordt alleen met wetnaam op eerdere artikelvraag
+    // Alleen wetnaam als antwoord op eerdere artikelvraag
     if (isLawOnlyMessage(rawQuestion)) {
       const previousArticle = extractLastUserArticle(safeHistory);
+
       if (previousArticle) {
         const normalized = normalizeArticle(previousArticle, currentLaw);
         searchQuery = `artikel ${normalized} ${currentLaw}`;
@@ -213,13 +224,13 @@ ${lastArticleContext}`
       }
     }
 
-    // Case C: normale artikelvraag met wet
+    // Normale artikelvraag met wet
     if (currentArticle && currentLaw) {
       const normalized = normalizeArticle(currentArticle, currentLaw);
       searchQuery = `artikel ${normalized} ${currentLaw}`;
     }
 
-    // 3. Search
+    // 3) Search
     const searchResp = await fetch(
       `https://beleidsbank-api.vercel.app/api/search?q=${encodeURIComponent(searchQuery)}`
     );
@@ -236,7 +247,7 @@ ${lastArticleContext}`
 
     let top = results[0];
 
-    // 4. Als het om een artikelvraag gaat: exacte match zoeken binnen resultaten
+    // 4) Bij artikelvraag: exacte match kiezen
     const searchLaw = detectLaw(searchQuery);
     const searchArticleRaw = extractArticleRef(searchQuery);
     const searchArticle = normalizeArticle(searchArticleRaw, searchLaw);
@@ -276,7 +287,7 @@ ${lastArticleContext}`
       });
     }
 
-    // 5. Niet-artikelvraag: gewone AI-uitleg op basis van topresultaten
+    // 5) Niet-artikelvraag: korte AI-uitleg op basis van beste bronnen
     const limited = results.slice(0, 2);
     const context = limited
       .map((r, i) => `[${i + 1}] ${r.label}\n${cleanLegalText(r.text || r.excerpt || "")}`)
@@ -291,7 +302,7 @@ ${lastArticleContext}`
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0.1,
-        max_tokens: 300,
+        max_tokens: 320,
         messages: [
           {
             role: "system",
@@ -319,7 +330,9 @@ ${context}`
     });
 
     const aiJson = await aiResp.json();
-    const answer = aiJson?.choices?.[0]?.message?.content || "Ik kan dit niet goed beantwoorden op basis van de gevonden artikelen.";
+    const answer =
+      aiJson?.choices?.[0]?.message?.content ||
+      "Ik kan dit niet goed beantwoorden op basis van de gevonden artikelen.";
 
     return res.status(200).json({
       answer,
