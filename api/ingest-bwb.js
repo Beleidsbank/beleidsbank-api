@@ -77,8 +77,8 @@ module.exports = async (req, res) => {
 
         if (!block || block.length < 80) continue;
 
-        // paragrafen / hoofdstukken / titels wegfilteren
         const firstPart = block.slice(0, 250);
+
         if (/^§\s*\d+/i.test(firstPart)) continue;
         if (/Titel\s+\d+/i.test(firstPart) && !/^Artikel/i.test(firstPart)) continue;
         if (/Afdeling\s+\d+/i.test(firstPart) && !/^Artikel/i.test(firstPart)) continue;
@@ -96,12 +96,34 @@ module.exports = async (req, res) => {
 
       let article = m[1].trim();
 
-      // Awb gebruikt dubbele punt
       if (lawName === "Awb" && /^\d+\.\d+[a-zA-Z]?$/.test(article)) {
         article = article.replace(".", ":");
       }
 
       return article;
+    }
+
+    function dedupeRows(rows) {
+      const map = new Map();
+
+      for (const row of rows) {
+        const key = `${row.doc_id}||${row.label}`;
+        const prev = map.get(key);
+
+        if (!prev) {
+          map.set(key, row);
+          continue;
+        }
+
+        const prevLen = (prev.text || "").length;
+        const newLen = (row.text || "").length;
+
+        if (newLen > prevLen) {
+          map.set(key, row);
+        }
+      }
+
+      return Array.from(map.values());
     }
 
     const htmlResp = await fetch(sourceUrl);
@@ -162,8 +184,8 @@ module.exports = async (req, res) => {
         if (!text || !article) return null;
 
         return {
-          text: text.slice(0, 8000),
-          article
+          article,
+          text: text.slice(0, 8000)
         };
       })
       .filter(Boolean);
@@ -209,6 +231,8 @@ module.exports = async (req, res) => {
       embedding: embeddings[i]
     }));
 
+    const dedupedRows = dedupeRows(rows);
+
     const chunkResp = await fetch(`${SUPABASE_URL}/rest/v1/chunks?on_conflict=doc_id,label`, {
       method: "POST",
       headers: {
@@ -217,7 +241,7 @@ module.exports = async (req, res) => {
         Authorization: `Bearer ${SERVICE_KEY}`,
         Prefer: "resolution=merge-duplicates,return=representation"
       },
-      body: JSON.stringify(rows)
+      body: JSON.stringify(dedupedRows)
     });
 
     const chunkText = await chunkResp.text();
@@ -232,7 +256,7 @@ module.exports = async (req, res) => {
       ok: true,
       law: lawName,
       total_found: allArticles.length,
-      processed: rows.length,
+      processed: dedupedRows.length,
       next: `/api/ingest-bwb?id=${id}&offset=${offset + limit}`
     });
   } catch (e) {
