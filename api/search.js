@@ -45,11 +45,24 @@ module.exports = async (req, res) => {
       return null;
     }
 
+    function isFormattingRequest(text) {
+      const s = (text || "").toLowerCase();
+      return (
+        /\b\d+\s+regel(s)?\b/i.test(s) ||
+        /\b\d+\s+zin(nen)?\b/i.test(s) ||
+        /\b\d+\s+bullet(s)?\b/i.test(s)
+      );
+    }
+
     function detectArticle(text) {
+      const s = (text || "").trim();
+
+      if (isFormattingRequest(s)) return null;
+
       const m =
-        text.match(/artikel\s+([0-9a-zA-Z:.\-]+)/i) ||
-        text.match(/\bart\.?\s*([0-9a-zA-Z:.\-]+)/i) ||
-        text.match(/\b([0-9]+(?::|\.)[0-9a-zA-Z.\-]+)\b/i);
+        s.match(/artikel\s+([0-9a-zA-Z:.\-]+)/i) ||
+        s.match(/\bart\.?\s*([0-9a-zA-Z:.\-]+)/i) ||
+        s.match(/\b([0-9]+(?::|\.)[0-9]+[a-zA-Z]?)\b/i);
 
       return m?.[1] ? m[1].replace(/\.$/, "") : null;
     }
@@ -68,11 +81,12 @@ module.exports = async (req, res) => {
     function extractKeywords(text) {
       const stopwords = new Set([
         "wat", "is", "een", "de", "het", "van", "volgens", "wanneer", "mag", "kan",
-        "zijn", "er", "over", "volgt", "uit", "op", "in", "voor", "bij", "als",
-        "tegen", "door", "met", "dat", "dit", "dan", "om", "tot", "of", "en", "te",
+        "zijn", "er", "over", "uit", "op", "in", "voor", "bij", "als", "tegen",
+        "door", "met", "dat", "dit", "dan", "om", "tot", "of", "en", "te",
         "mogelijk", "geef", "samenvatting", "samenvat", "leg", "uitleg", "uit",
         "simpele", "taal", "korter", "regels", "deze", "artikel", "maak", "hier",
-        "nu", "simpeler", "voorbeeld"
+        "nu", "simpeler", "voorbeeld", "regel", "zinnen", "zin", "bullets", "bullet",
+        "vertel", "mij", "meer"
       ]);
 
       return text
@@ -93,7 +107,7 @@ module.exports = async (req, res) => {
     let keywordResults = [];
     let vectorResults = [];
 
-    // 1) Exacte artikelzoeking
+    // 1) Artikelzoeking
     if (article) {
       try {
         let url =
@@ -117,7 +131,28 @@ module.exports = async (req, res) => {
 
     // 2) Keyword search
     try {
-      for (const word of keywords.slice(0, 5)) {
+      const conceptMap = [
+        { terms: ["zorgvuldigheidsbeginsel", "zorgvuldigheid"], expand: ["zorgvuldig", "relevante", "feiten", "belangen"] },
+        { terms: ["beschikking"], expand: ["beschikking", "besluit"] },
+        { terms: ["belanghebbende"], expand: ["belanghebbende", "rechtstreeks"] },
+        { terms: ["bezwaar"], expand: ["bezwaar", "besluit"] },
+        { terms: ["handhaven", "handhaving"], expand: ["bestuursdwang", "dwangsom", "overtreding"] },
+        { terms: ["onvolledige", "aanvraag"], expand: ["onvolledig", "aanvraag", "aanvullen"] },
+        { terms: ["vergunning", "weigeren"], expand: ["weigeren", "vergunning"] },
+        { terms: ["beleid", "afwijken"], expand: ["beleidsregel", "bijzondere", "omstandigheden", "onevenredig"] }
+      ];
+
+      let expandedKeywords = [...keywords];
+
+      for (const row of conceptMap) {
+        if (row.terms.some(t => q.includes(t))) {
+          expandedKeywords.push(...row.expand);
+        }
+      }
+
+      expandedKeywords = [...new Set(expandedKeywords)].slice(0, 8);
+
+      for (const word of expandedKeywords) {
         let url =
           `${SUPABASE_URL}/rest/v1/chunks?select=id,label,text,source_url,doc_id,law_name,article_number` +
           `&or=(text.ilike.*${encodeURIComponent(word)}*,label.ilike.*${encodeURIComponent(word)}*)` +
@@ -179,7 +214,7 @@ module.exports = async (req, res) => {
       }
     } catch {}
 
-    // 4) Combineren + dedupen
+    // 4) Combine + dedupe
     const seen = new Set();
     const combined = [...articleResults, ...keywordResults, ...vectorResults].filter(r => {
       const key = `${r.doc_id || ""}-${r.label || ""}`;
@@ -196,45 +231,45 @@ module.exports = async (req, res) => {
       const rowLaw = (r.law_name || "").toLowerCase();
       const rowArticle = (r.article_number || "").toLowerCase();
 
-      // Exact artikel moet altijd winnen
       if (article) {
         if (rowArticle === article.toLowerCase()) score += 10000;
         if (label.includes(`artikel ${article.toLowerCase()}`)) score += 5000;
       }
 
-      // Wetmatch
-      if (lawName && rowLaw === lawName.toLowerCase()) score += 200;
-      if (lawName && label.includes(lawName.toLowerCase())) score += 50;
+      if (lawName && rowLaw === lawName.toLowerCase()) score += 300;
+      if (lawName && label.includes(lawName.toLowerCase())) score += 80;
 
-      // Keyword-match
       for (const word of keywords) {
-        if (txt.includes(word)) score += 10;
-        if (label.includes(word)) score += 5;
+        if (txt.includes(word)) score += 20;
+        if (label.includes(word)) score += 10;
       }
 
-      // Algemene definitie-signalen
-      if (txt.includes("wordt verstaan")) score += 15;
-      if (txt.includes("schriftelijke beslissing")) score += 10;
-      if (txt.includes("rechtstreeks")) score += 5;
+      if (q.includes("zorgvuldigheidsbeginsel") || q.includes("zorgvuldigheid")) {
+        if (rowLaw === "awb" && rowArticle === "3:2") score += 6000;
+      }
 
-      // Themasignalen
-      if (q.includes("bezwaar")) {
-        if (txt.includes("bezwaar")) score += 20;
-        if (txt.includes("besluit")) score += 5;
+      if (q.includes("beschikking")) {
+        if (rowLaw === "awb" && rowArticle === "1:3") score += 6000;
       }
 
       if (q.includes("belanghebbende")) {
-        if (txt.includes("belanghebbende")) score += 20;
+        if (rowLaw === "awb" && rowArticle === "1:2") score += 6000;
       }
 
-      if (q.includes("handhaven") || q.includes("handhaving")) {
-        if (txt.includes("bestuursdwang")) score += 15;
-        if (txt.includes("dwangsom")) score += 15;
-        if (txt.includes("last onder")) score += 10;
+      if (q.includes("bezwaar")) {
+        if (rowLaw === "awb" && rowArticle === "1:5") score += 5000;
+        if (rowLaw === "awb" && rowArticle === "7:1") score += 4500;
+        if (rowLaw === "awb" && rowArticle === "6:3") score += 3500;
       }
 
-      if ((r.similarity || 0) > 0.7) score += 10;
-      if ((r.similarity || 0) > 0.8) score += 10;
+      if (q.includes("beleid") && q.includes("afwijken")) {
+        if (rowLaw === "awb" && rowArticle === "4:84") score += 7000;
+      }
+
+      if (txt.includes("wordt verstaan")) score += 20;
+      if (txt.includes("schriftelijke beslissing")) score += 20;
+      if ((r.similarity || 0) > 0.7) score += 20;
+      if ((r.similarity || 0) > 0.8) score += 20;
 
       return score;
     }
