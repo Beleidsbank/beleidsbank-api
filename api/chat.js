@@ -31,12 +31,24 @@ function isLawOnlyMessage(text) {
   return ["awb", "omgevingswet", "bal", "bbl", "bkl", "wkb"].includes(q);
 }
 
+function isFormattingRequest(text) {
+  const q = (text || "").toLowerCase();
+  return (
+    /\b\d+\s+regel(s)?\b/i.test(q) ||
+    /\b\d+\s+zin(nen)?\b/i.test(q) ||
+    /\b\d+\s+bullet(s)?\b/i.test(q)
+  );
+}
+
 function extractArticleRef(text) {
   const q = (text || "").trim();
+
+  if (isFormattingRequest(q)) return null;
+
   const m =
     q.match(/artikel\s+([0-9a-zA-Z:.\-]+)/i) ||
     q.match(/\bart\.?\s*([0-9a-zA-Z:.\-]+)/i) ||
-    q.match(/\b([0-9]+(?::|\.)[0-9a-zA-Z.\-]+)\b/i);
+    q.match(/\b([0-9]+(?::|\.)[0-9]+[a-zA-Z]?)\b/i);
 
   if (!m?.[1]) return null;
   return m[1].replace(/\.$/, "");
@@ -58,9 +70,15 @@ function isFollowUpQuestion(text) {
   return [
     "samenvat",
     "samenvatten",
+    "vat dit samen",
     "leg uit",
+    "leg dit uit",
+    "vertel mij meer",
+    "vertel meer",
     "in simpele taal",
     "korter",
+    "in 1 regel",
+    "in 1 zin",
     "in 2 regels",
     "in twee regels",
     "wat betekent dit",
@@ -70,11 +88,10 @@ function isFollowUpQuestion(text) {
     "in bullets",
     "in 3 bullets",
     "kort samen",
-    "leg dit uit",
-    "leg dit simpeler uit",
     "geef voorbeeld",
     "geef een voorbeeld",
-    "maak samenvatting"
+    "maak samenvatting",
+    "maak hier een samenvatting"
   ].some(p => q.includes(p));
 }
 
@@ -143,7 +160,7 @@ module.exports = async (req, res) => {
     const followUp = isFollowUpQuestion(rawQuestion);
     const lastArticleContext = extractLastArticleContext(safeHistory);
 
-    // 1) Follow-up op eerder artikel: geen nieuwe search
+    // 1. Follow-up op eerder artikel: geen nieuwe search
     if (followUp && lastArticleContext) {
       const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
@@ -163,15 +180,16 @@ Je krijgt een artikeltekst.
 
 Regels:
 1. Gebruik alleen deze tekst.
-2. Voeg geen nieuwe artikelen of nieuwe juridische informatie toe.
+2. Voeg geen nieuwe artikelen of juridische informatie toe.
 3. Verzin niets.
 4. Als iets niet in de tekst staat, zeg dat.
+5. Als de gebruiker vraagt om "1 regel" of "2 zinnen", behandel dat als formaatwens, niet als artikelnummer.
 
 Taken:
 - samenvatten → kort
 - uitleggen → simpel
 - praktijk → begrijpelijk uitleggen
-- voorbeeld → alleen een eenvoudig voorbeeld geven als dat logisch direct uit de tekst volgt
+- voorbeeld → alleen als dat logisch direct uit de tekst volgt
 
 Schrijf in het Nederlands.
 `.trim()
@@ -195,13 +213,12 @@ ${lastArticleContext}`
       });
     }
 
-    // 2) Context-aware zoekquery bouwen
     const currentLaw = detectLaw(rawQuestion);
     const currentArticle = extractArticleRef(rawQuestion);
 
     let searchQuery = rawQuestion;
 
-    // Artikel zonder wet -> doorvragen
+    // 2. Artikel zonder wet -> doorvragen
     if (currentArticle && !currentLaw) {
       return res.status(200).json({
         answer: "Over welke wet gaat het? Bijvoorbeeld Awb, Omgevingswet of Bal.",
@@ -209,7 +226,7 @@ ${lastArticleContext}`
       });
     }
 
-    // Alleen wetnaam als antwoord op eerdere artikelvraag
+    // 3. Alleen wetnaam als antwoord op eerdere artikelvraag
     if (isLawOnlyMessage(rawQuestion)) {
       const previousArticle = extractLastUserArticle(safeHistory);
 
@@ -224,13 +241,13 @@ ${lastArticleContext}`
       }
     }
 
-    // Normale artikelvraag met wet
+    // 4. Normale artikelvraag met wet
     if (currentArticle && currentLaw) {
       const normalized = normalizeArticle(currentArticle, currentLaw);
       searchQuery = `artikel ${normalized} ${currentLaw}`;
     }
 
-    // 3) Search
+    // 5. Search
     const searchResp = await fetch(
       `https://beleidsbank-api.vercel.app/api/search?q=${encodeURIComponent(searchQuery)}`
     );
@@ -247,11 +264,11 @@ ${lastArticleContext}`
 
     let top = results[0];
 
-    // 4) Bij artikelvraag: exacte match kiezen
     const searchLaw = detectLaw(searchQuery);
     const searchArticleRaw = extractArticleRef(searchQuery);
     const searchArticle = normalizeArticle(searchArticleRaw, searchLaw);
 
+    // 6. Bij artikelvraag: exacte match
     if (searchArticle) {
       const exact = results.find(r => {
         const label = (r.label || "").toLowerCase();
@@ -287,7 +304,7 @@ ${lastArticleContext}`
       });
     }
 
-    // 5) Niet-artikelvraag: korte AI-uitleg op basis van beste bronnen
+    // 7. Niet-artikelvraag
     const limited = results.slice(0, 2);
     const context = limited
       .map((r, i) => `[${i + 1}] ${r.label}\n${cleanLegalText(r.text || r.excerpt || "")}`)
@@ -314,6 +331,7 @@ Regels:
 2. Voeg geen nieuwe wetsartikelen toe.
 3. Houd het antwoord kort en duidelijk.
 4. Als het niet direct uit de bron volgt, zeg dat.
+5. Noem alleen artikelen die echt nodig zijn.
 
 Schrijf in het Nederlands.
 `.trim()
